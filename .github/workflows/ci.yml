@@ -32,6 +32,13 @@ jobs:
           ./bin/gblog verify --all
           ./bin/gblog report --bot ci
           ./bin/gblog status
+          python3 - <<'PY'
+          import glob
+          f = glob.glob("$GBLOG_ROOT/logs/ci/*.jsonl")[0]
+          s = open(f).read().replace("echo hi", "rm -rf /")
+          open(f, "w").write(s)
+          PY
+          if ./bin/gblog verify --bot ci; then echo "tamper not detected"; exit 1; fi
 
   shellcheck:
     runs-on: ubuntu-latest

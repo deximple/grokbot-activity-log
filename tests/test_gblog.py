@@ -182,5 +182,22 @@ class CliTest(unittest.TestCase):
         self.assertIn("not pushed", out)
 
 
+class RedactionPatterns(unittest.TestCase):
+    def test_bearer_without_colon_and_query_params(self):
+        self.assertEqual(gblog.redact("Authorization: Bearer abcdef123456 x"), "Authorization: Bearer [REDACTED] x")
+        self.assertEqual(
+            gblog.redact("https://mail.google.com/inbox?token=abc&x=1&api_key=zzz"),
+            "https://mail.google.com/inbox?token=[REDACTED]&x=1&api_key=[REDACTED]",
+        )
+        self.assertEqual(gblog.redact("https://user:pa55word@h/x"), "https://[REDACTED]@h/x")
+        self.assertIn("[REDACTED]", gblog.redact("ghp_" + "a" * 36))
+        self.assertIn("[REDACTED]", gblog.redact("AKIAABCDEFGHIJKLMNOP"))
+        self.assertIn("[REDACTED]", gblog.redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop"))
+
+    def test_plain_text_untouched(self):
+        for s in ["git status", "open https://example.com/a/b", "token count was 12", "the key is under the mat"]:
+            self.assertEqual(gblog.redact(s), s)
+
+
 if __name__ == "__main__":
     unittest.main()

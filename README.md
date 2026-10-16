@@ -49,7 +49,7 @@ OK    ops                       5 records  head 3c4241c25eb5
   task with FAIL/DENIED markers; `gblog status` shows chain heads, open tasks and sync state.
 - **Backups you control.** `gblog sync` commits `logs/`, `reports/`, `state/` into a git repo at
   the ledger root and pushes to the remote you configured. Nothing leaves the computer unless
-  you set a remote.
+  you set a remote. Each sync is itself logged (under bot `system` unless `--bot` is given).
 - **Zero dependencies.** Grok Bot's docs warn that manually installed packages are replaceable;
   `gblog` is a single stdlib script and `install.sh` reinstalls it in seconds.
 

@@ -30,7 +30,7 @@ Grok Bot의 공식 로그(Action Recording, OpenTelemetry Export, Audit Logs)는
 - **디스크에 닿기 전에 시크릿 제거**: PEM 블록, GitHub/Slack/AWS/OpenAI/xAI/Google 키 형태, JWT, `Bearer …`,
   `password=…`, `?token=…` 쿼리 파라미터, `user:pass@` URL. (패턴 매칭이 전부를 잡지는 못하므로 봇에게도 자격증명을 붙이지 말라고 지시합니다.)
 - **사람이 읽는 출력.** `gblog report`는 봇·작업별로 묶인 Markdown 일일 리포트(FAIL/DENIED 표시), `gblog status`는 체인 헤드·열린 작업·동기화 상태.
-- **내가 통제하는 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않습니다.
+- **내가 통제하는 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않습니다. 동기화 자체도 기록됩니다(`--bot` 미지정 시 `system` 봇 체인).
 - **의존성 0.** Grok Bot 문서는 수동 설치 패키지는 사라질 수 있다고 경고합니다. `gblog`는 표준 라이브러리 단일 스크립트이고 `install.sh`로 몇 초 안에 재설치됩니다.
 
 ## Grok Bot 컴퓨터에 설치 (5분)
