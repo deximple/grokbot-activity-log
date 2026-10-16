@@ -33,8 +33,8 @@ jobs:
           ./bin/gblog report --bot ci
           ./bin/gblog status
           python3 - <<'PY'
-          import glob
-          f = glob.glob("$GBLOG_ROOT/logs/ci/*.jsonl")[0]
+          import glob, os
+          f = glob.glob(os.environ["GBLOG_ROOT"] + "/logs/ci/*.jsonl")[0]
           s = open(f).read().replace("echo hi", "rm -rf /")
           open(f, "w").write(s)
           PY
