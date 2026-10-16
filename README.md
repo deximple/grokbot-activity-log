@@ -68,7 +68,7 @@ OK    ops                       5 records  head 3c4241c25eb5
 ## Setup on a Grok Bot computer (5 minutes)
 
 1. Tell a Bot:
-   > Clone https://github.com/OWNER/grokbot-activity-log into /workspace and run `install.sh`. Then run `gblog status`.
+   > Clone https://github.com/deximple/grokbot-activity-log into /workspace and run `install.sh`. Then run `gblog status`.
 2. Save the skill: paste `skills/activity-log/SKILL.md` and ask the Bot to *"save this as a private skill called activity-log"*.
 3. For every Bot you want logged, add the snippet from `docs/bot-description.md` to its description (choose a short `<BOT_NAME>`).
 4. (Recommended) Create a **private** repo for backups and tell the Bot:

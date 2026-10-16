@@ -12,7 +12,7 @@
 set -euo pipefail
 
 PREFIX="${GBLOG_PREFIX:-$HOME/.local/bin}"
-REPO_RAW="${GBLOG_REPO:-https://raw.githubusercontent.com/OWNER/grokbot-activity-log/main}"
+REPO_RAW="${GBLOG_REPO:-https://raw.githubusercontent.com/deximple/grokbot-activity-log/main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }

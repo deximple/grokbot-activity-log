@@ -15,7 +15,7 @@ Remove anything private before sharing; a public template exposes identity, desc
 **Bot description (rules):** the snippet in `docs/bot-description.md` with `<BOT_NAME>` = `ledger`, plus:
 
 ```
-You own the ledger for this account. On first run: clone https://github.com/OWNER/grokbot-activity-log
+You own the ledger for this account. On first run: clone https://github.com/deximple/grokbot-activity-log
 to /workspace, run install.sh, ask the user for (1) a short name for each Bot they want logged and
 (2) the private git remote URL for backups (optional). Explain that their other Bots need the
 description snippet from docs/bot-description.md, and offer to draft it for each one.

@@ -36,7 +36,7 @@ Grok Bot의 공식 로그(Action Recording, OpenTelemetry Export, Audit Logs)는
 ## Grok Bot 컴퓨터에 설치 (5분)
 
 1. 봇에게:
-   > https://github.com/OWNER/grokbot-activity-log 를 /workspace에 clone하고 `install.sh`를 실행해. 그 다음 `gblog status`를 실행해.
+   > https://github.com/deximple/grokbot-activity-log 를 /workspace에 clone하고 `install.sh`를 실행해. 그 다음 `gblog status`를 실행해.
 2. 스킬 저장: `skills/activity-log/SKILL.md` 내용을 붙이고 *"이걸 activity-log라는 프라이빗 스킬로 저장해"*.
 3. 기록할 모든 봇의 description에 `docs/bot-description.md`의 한국어 스니펫을 추가 (`<BOT_NAME>`은 짧은 이름으로).
 4. (권장) 백업용 **프라이빗** 레포를 만들고 봇에게:

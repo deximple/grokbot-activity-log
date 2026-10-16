@@ -84,7 +84,7 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
 
 If `gblog` is not on PATH (computer was reset or updated):
 ```bash
-git clone https://github.com/OWNER/grokbot-activity-log /workspace/grokbot-activity-log 2>/dev/null || git -C /workspace/grokbot-activity-log pull
+git clone https://github.com/deximple/grokbot-activity-log /workspace/grokbot-activity-log 2>/dev/null || git -C /workspace/grokbot-activity-log pull
 bash /workspace/grokbot-activity-log/install.sh
 ```
 Log the recovery itself: `gblog log --bot "$BOT" --action shell --target "install.sh" --detail "reinstalled gblog after reset"`.
