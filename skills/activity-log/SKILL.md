@@ -26,6 +26,7 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
 1. **Open the task** before doing anything else:
    ```bash
    TID=$(gblog task-start --bot "$BOT" --task "<task title as given>")
+   export GBLOG_TASK="$TID"   # lets the shell hook attach auto-captured commands to this task
    ```
    Keep `$TID` for the rest of the task. If the task spans several turns, record
    the id in your reply so you can pick it up again (`--task-id "$TID"`).
@@ -88,6 +89,17 @@ git clone https://github.com/deximple/grokbot-activity-log /workspace/grokbot-ac
 bash /workspace/grokbot-activity-log/install.sh
 ```
 Log the recovery itself: `gblog log --bot "$BOT" --action shell --target "install.sh" --detail "reinstalled gblog after reset"`.
+
+## Automatic evidence (do this once per computer)
+
+Your self-report is checked against evidence collected without you. Install it once and never disable it:
+```bash
+gblog capture shell-hook --bot "$BOT" --install      # every shell command -> ledger (source=auto)
+gblog capture browser --bot "$BOT"                    # new Chrome visits -> ledger; run from the daily routine
+gblog capture files --bot "$BOT" --path /workspace    # changed files -> ledger; run from the daily routine
+gblog coverage                                        # % of observed actions you also reported
+```
+A coverage below 80% for an action kind means you are forgetting that kind; the `bot-tune` skill turns that into a rule change.
 
 ## Limits you must disclose
 

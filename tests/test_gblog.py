@@ -74,7 +74,8 @@ class LedgerTest(unittest.TestCase):
             self.ledger.append("ops", {"type": "note", "detail": str(i)})
         path = self._log_path("ops")
         lines = open(path, encoding="utf-8").read().splitlines()
-        open(path, "w", encoding="utf-8").write("\n".join(lines[:2]) + "\n")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines[:2]) + "\n")
         res = self.ledger.verify("ops")
         self.assertFalse(res["ok"])
         self.assertIn("head does not match", res["problems"][0])
@@ -197,6 +198,104 @@ class RedactionPatterns(unittest.TestCase):
     def test_plain_text_untouched(self):
         for s in ["git status", "open https://example.com/a/b", "token count was 12", "the key is under the mat"]:
             self.assertEqual(gblog.redact(s), s)
+
+
+class CaptureCoverageTuneTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gblog-v02-")
+        self.ledger = gblog.Ledger(self.root)
+        self.work = tempfile.mkdtemp(prefix="gblog-work-")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def test_shell_hook_mentions_bot_and_installs_once(self):
+        hook = gblog.shell_hook("ops")
+        self.assertIn('GBLOG_BOT:-ops', hook)
+        self.assertIn("--source auto", hook)
+        rc = os.path.join(self.work, "bashrc")
+        self.assertTrue(gblog.install_shell_hook("ops", rc))
+        self.assertFalse(gblog.install_shell_hook("ops", rc))
+        self.assertEqual(open(rc).read().count(">>> gblog shell hook >>>"), 1)
+
+    def test_capture_files_diff(self):
+        open(os.path.join(self.work, "a.txt"), "w").write("1")
+        res = gblog.capture_files(self.ledger, "ops", self.work)
+        self.assertEqual(res["changes"], 0)
+        open(os.path.join(self.work, "a.txt"), "w").write("22")
+        open(os.path.join(self.work, "b.txt"), "w").write("x")
+        res = gblog.capture_files(self.ledger, "ops", self.work)
+        self.assertEqual(res["changes"], 2)
+        recs = self.ledger.records("ops")
+        self.assertEqual(sorted((r["target"], r["detail"]) for r in recs), [("a.txt", "modified"), ("b.txt", "created")])
+        self.assertTrue(all(r["source"] == "auto" and r["action"] == "file" for r in recs))
+        self.assertTrue(self.ledger.verify("ops")["ok"])
+
+    def test_coverage_matches_within_window(self):
+        L = self.ledger
+        L.append("ops", {"type": "action", "action": "browser", "target": "https://www.github.com/x/y", "ts": "2026-01-01T10:00:00Z"})
+        L.append("ops", {"type": "action", "action": "browser", "target": "https://github.com/x/y/pulls", "source": "auto", "ts": "2026-01-01T10:05:00Z"})
+        L.append("ops", {"type": "action", "action": "browser", "target": "https://example.org/", "source": "auto", "ts": "2026-01-01T10:06:00Z"})
+        L.append("ops", {"type": "action", "action": "shell", "target": "git status", "ts": "2026-01-01T10:07:00Z"})
+        L.append("ops", {"type": "action", "action": "shell", "target": "sudo git -C /x status", "source": "auto", "ts": "2026-01-01T10:08:00Z"})
+        L.append("ops", {"type": "action", "action": "shell", "target": "rm -rf build", "source": "auto", "ts": "2026-01-01T12:00:00Z"})
+        cov = gblog.coverage(L.records("ops"))
+        self.assertEqual((cov["auto"], cov["matched"], cov["pct"]), (4, 2, 50.0))
+        self.assertEqual(sorted(r["target"] for r in cov["unmatched"]), ["https://example.org/", "rm -rf build"])
+        self.assertIn("50.0%", gblog.render_coverage(cov, "t"))
+
+    def test_tune_proposals_apply_and_effect(self):
+        L = self.ledger
+        now = gblog._dt.datetime.utcnow()
+        def ts(days_ago, hour=9, minute=0):
+            return (now - gblog._dt.timedelta(days=days_ago)).replace(hour=hour, minute=minute, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for d in (6, 5, 4):
+            tid = "t%d" % d
+            L.append("ops", {"type": "task_start", "task_id": tid, "task": "Reconcile invoices %d" % d, "ts": ts(d)})
+            L.append("ops", {"type": "action", "task_id": tid, "action": "connector", "target": "quickbooks.sync", "outcome": "fail", "detail": "401", "ts": ts(d, 9, 5)})
+            L.append("ops", {"type": "approval", "task_id": tid, "target": "send email to vendor", "decision": "denied", "outcome": "denied", "ts": ts(d, 9, 6)})
+            L.append("ops", {"type": "task_end", "task_id": tid, "outcome": "fail", "ts": ts(d, 9, 30)})
+        L.append("ops", {"type": "note", "detail": "Lesson: always export the CSV before syncing", "ts": ts(4, 10)})
+        recs = L.records("ops")
+        analysis = gblog.analyze(recs, 28, gblog.coverage(recs))
+        cats = {p["category"]: p for p in analysis["proposals"]}
+        self.assertIn("skill", cats)      # repeated quickbooks.sync failure
+        self.assertIn("approval", cats)   # repeatedly denied
+        self.assertIn("routine", cats)    # same task 3 days in a row
+        self.assertIn("memory", cats)     # lesson in a note
+        self.assertEqual(cats["skill"]["baseline"], 3.0)
+        self.assertEqual(analysis["metrics"]["ops"]["tasks"], 3)
+        text = gblog.render_tune(analysis, "T")
+        self.assertIn("quickbooks.sync", text)
+        self.assertIn("--apply %s" % cats["skill"]["id"], text)
+        # CLI: write proposals, apply one, see the effect table
+        rc, out, _ = run(["tune", "--days", "28"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "tuning", "proposals.json")))
+        rc, out, _ = run(["tune", "--apply", cats["skill"]["id"], "--detail", "added re-auth step to skill"], self.root)
+        self.assertEqual(rc, 0, out)
+        tune_rec = L.records("ops")[-1]
+        self.assertEqual((tune_rec["type"], tune_rec["outcome"], tune_rec["target"]), ("tune", "ok", cats["skill"]["id"]))
+        self.assertEqual(tune_rec["proposal"]["metric"]["kind"], "fail")
+        rc, out, _ = run(["tune", "--days", "28", "--stdout"], self.root)
+        self.assertIn("Effect of applied changes", out)
+        self.assertIn("too early", out)
+        rc, out, _ = run(["tune", "--reject", cats["approval"]["id"], "--detail", "intended"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertTrue(L.verify("ops")["ok"])
+        rc, out, _ = run(["tune", "--apply", "nope"], self.root)
+        self.assertNotEqual(rc, 0)
+
+    def test_log_source_and_env_task(self):
+        os.environ["GBLOG_TASK"] = "envtask"
+        try:
+            rc, out, _ = run(["log", "--bot", "ops", "--action", "shell", "--target", "ls", "--source", "auto"], self.root)
+        finally:
+            del os.environ["GBLOG_TASK"]
+        self.assertEqual(rc, 0)
+        rec = self.ledger.records("ops")[-1]
+        self.assertEqual((rec["task_id"], rec["source"]), ("envtask", "auto"))
 
 
 if __name__ == "__main__":

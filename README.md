@@ -26,12 +26,15 @@ OK    ops                       5 records  head 3c4241c25eb5
 
 | Piece | Where | Purpose |
 |---|---|---|
-| `gblog.py` | repo root | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export` |
-| Skill | `skills/activity-log/SKILL.md` | Tells the Bot exactly when and how to log; save it as a private skill |
+| `gblog.py` | repo root | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export`, **`capture`, `coverage`, `tune`** |
+| Skill: activity-log | `skills/activity-log/SKILL.md` | Tells the Bot exactly when and how to log; save it as a private skill |
+| Skill: bot-tune | `skills/bot-tune/SKILL.md` | Weekly loop that turns the ledger into approved edits to Bot descriptions, skills, routines, Auto-review rules and memory — and measures the effect |
 | Description rule | `docs/bot-description.md` | Paste into each Bot's description so logging stays on across sessions |
 | Daily audit routine | `docs/routine-daily-audit.md` | verify → report → commit/push → post summary, every day |
+| Weekly tune routine | `docs/routine-weekly-tune.md` | capture → coverage → tune → ask → apply → record, every week |
+| Marketplace kit | `docs/marketplace.md` | Ready-to-paste listing, operating instructions, skills/routines/memories for a shareable "Ledger" Bot |
 | Bot template | `docs/bot-template.md` | A shareable "Ledger" Bot for x.ai/bot, and a comparison with existing note-taking Bots |
-| Tests + CI | `tests/`, `.github/workflows/ci.yml` | 13 unit tests incl. tamper detection; Python 3.8/3.10/3.12; shellcheck |
+| Tests + CI | `tests/`, `.github/workflows/ci.yml` | 20 unit tests incl. tamper detection, coverage matching and the tune loop; Python 3.8/3.10/3.12; shellcheck |
 
 ## How it works
 
@@ -53,6 +56,42 @@ OK    ops                       5 records  head 3c4241c25eb5
 - **Zero dependencies.** Grok Bot's docs warn that manually installed packages are replaceable;
   `gblog` is a single stdlib script and `install.sh` reinstalls it in seconds.
 
+### Evidence the Bot cannot forget: `capture` and `coverage`
+
+Self-reporting is only as good as the Bot's discipline, so v0.2 also collects evidence *without* it:
+
+```bash
+gblog capture shell-hook --bot ops --install   # bash PROMPT_COMMAND hook: every command -> ledger, source=auto
+gblog capture browser --bot ops                 # new visits from the computer's Chrome History (host/path only)
+gblog capture files --bot ops --path /workspace # created/modified/deleted files since the last snapshot
+gblog coverage                                  # % of observed actions the Bot also reported, per Bot and kind
+```
+
+Auto records carry `source: "auto"` and are matched to self-reports by Bot, kind, normalised target
+(host / command name / file name) and a ±30 min window. Low coverage for a kind is a concrete, measurable
+logging gap — and the input for tuning.
+
+### Tuning the Bots from their own ledger: `tune`
+
+Model weights can't be fine-tuned on an individual plan; everything else about a Bot can. `gblog tune`
+reads the last 28 days and writes `tuning/<date>.md` with evidence-backed proposals:
+
+| Signal in the ledger | Proposal |
+|---|---|
+| same action/target failing ≥ 2× | `skill` — add a step or fallback |
+| same approval denied ≥ 2× / approved ≥ 3× with no denial | `approval` — Always-deny + description rule / Allow-automatically rule |
+| same task started manually on ≥ 3 days | `routine` — with the typical start hour |
+| same 3-step action sequence in ≥ 3 tasks | `skill` — write it down as a skill |
+| tasks > 2× median duration | `description` — checkpoints, ask early |
+| notes containing lessons ("always/never/다음부터…") | `memory` |
+| coverage < 80% for a kind, tasks never closed | `logging` |
+| an applied change whose metric got worse after 7 days | `revert` |
+
+Each proposal has an id, evidence record refs, and a metric with its baseline. The Bot drafts the exact edit,
+the user approves, and the change is recorded: `gblog tune --apply <id> --detail "..."` (or `--reject`).
+Next week's report compares the metric before/after each applied change (`too early` / `improving` /
+`not helping`), closing the loop. The `bot-tune` skill and weekly routine run this end to end.
+
 ### Record schema (v1)
 
 ```json
@@ -61,7 +100,7 @@ OK    ops                       5 records  head 3c4241c25eb5
  "prev":"851cc7d8…","hash":"3866d105…"}
 ```
 
-`type` ∈ `task_start | action | approval | task_end | note | sync | verify` ·
+`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune` · optional `source` ∈ `self | auto | routine` ·
 `action` ∈ `shell | browser | connector | file | message | computer_use | delegation | memory | routine | other` ·
 `outcome` ∈ `ok | fail | denied | pending | skipped | n/a`. Timestamps are UTC.
 
@@ -74,7 +113,7 @@ OK    ops                       5 records  head 3c4241c25eb5
 4. (Recommended) Create a **private** repo for backups and tell the Bot:
    > Run `gblog sync --remote <git-url> --no-push` once, then sign in to GitHub in the computer's browser / `gh auth login` when asked.
    Use a fine-grained token scoped to that one repo and enter it through the secure secret request, never in chat.
-5. Create the daily audit routine from `docs/routine-daily-audit.md`.
+5. Create the daily audit routine from `docs/routine-daily-audit.md` and the weekly tune routine from `docs/routine-weekly-tune.md`; save `skills/bot-tune/SKILL.md` as a skill too.
 6. Add an Auto-review *Allow automatically* rule for `gblog` commands in `/workspace/activity-log` so routine runs don't stall on approvals.
 
 Run it anywhere else (laptop, CI, another agent) with `GBLOG_ROOT=/path ./bin/gblog …`.

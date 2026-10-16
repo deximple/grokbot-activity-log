@@ -10,6 +10,7 @@ Layout under GBLOG_ROOT (default: /workspace/activity-log):
     state/<bot>.json              chain head (seq, hash) + sync marker
     state/<bot>.lock              flock() so parallel Bots never interleave writes
     reports/YYYY-MM-DD[-<bot>].md rendered daily reports
+    tuning/YYYY-MM-DD.md          improvement proposals derived from the ledger (`gblog tune`)
 
 Every record carries ``prev`` (hash of the previous record of that bot, or
 "genesis") and ``hash`` (sha256 over the canonical JSON of the record without
@@ -34,11 +35,12 @@ try:  # POSIX only; on other platforms we degrade to no locking.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 SCHEMA_VERSION = 1
 GENESIS = "genesis"
 
-RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify")
+RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune")
+SOURCES = ("self", "auto", "routine")
 ACTION_KINDS = (
     "shell",
     "browser",
@@ -121,10 +123,11 @@ class Ledger:
         self.logs_dir = os.path.join(self.root, "logs")
         self.state_dir = os.path.join(self.root, "state")
         self.reports_dir = os.path.join(self.root, "reports")
+        self.tuning_dir = os.path.join(self.root, "tuning")
 
     # -- filesystem helpers
     def init(self) -> None:
-        for d in (self.logs_dir, self.state_dir, self.reports_dir):
+        for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir):
             os.makedirs(d, exist_ok=True)
         marker = os.path.join(self.root, "README.md")
         if not os.path.exists(marker):
@@ -135,7 +138,7 @@ class Ledger:
                 )
 
     def ensure(self) -> None:
-        if not os.path.isdir(self.logs_dir):
+        if not all(os.path.isdir(d) for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir)):
             self.init()
 
     def bots(self) -> List[str]:
@@ -399,7 +402,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     status = _git(root, "status", "--porcelain").stdout
     pending = [l for l in status.splitlines() if l.strip()]
     ledger.append(bot, {"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
-    _git(root, "add", "-A", "logs", "reports", "state", "README.md")
+    _git(root, "add", "-A", "logs", "reports", "state", "tuning", "README.md")
     commit_msg = message or "gblog sync %s" % now_iso()
     env_ok = True
     try:
@@ -422,6 +425,573 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         st["last_sync"] = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
         ledger.write_state(b, st)
     return result
+
+
+# --------------------------------------------------------------------------- capture (automatic evidence)
+# Records with ``source: "auto"`` are collected without the Bot's cooperation
+# (shell hook, browser history, file snapshots).  They are used by ``coverage``
+# to measure how much of the Bot's real activity it reported itself.
+
+SHELL_HOOK = r'''# >>> gblog shell hook >>>
+# Logs every interactive shell command to the gblog ledger (source=auto).
+# Set GBLOG_TASK=<task id> after `gblog task-start` so commands attach to the task.
+__gblog_last=""
+__gblog_hook() {
+  local rc=$? cmd
+  cmd=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null | sed 's/^ *[0-9]* *//')
+  if [ -z "$cmd" ] || [ "$cmd" = "$__gblog_last" ]; then return 0; fi
+  __gblog_last="$cmd"
+  case "$cmd" in gblog*|*" gblog "*|__gblog*) return 0;; esac
+  command -v gblog >/dev/null 2>&1 || return 0
+  local outcome=ok
+  [ "$rc" -eq 0 ] || outcome=fail
+  gblog log --bot "${GBLOG_BOT:-%s}" --task-id "${GBLOG_TASK:-}" --action shell --target "$cmd" \
+    --outcome "$outcome" --source auto >/dev/null 2>&1 || true
+  return 0
+}
+case ";$PROMPT_COMMAND;" in *"__gblog_hook"*) ;; *) PROMPT_COMMAND="__gblog_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac
+# <<< gblog shell hook <<<
+'''
+
+BROWSER_HISTORY_GLOBS = (
+    "~/.config/google-chrome/*/History",
+    "~/.config/chromium/*/History",
+    "~/.config/BraveSoftware/Brave-Browser/*/History",
+    "~/.config/microsoft-edge/*/History",
+    "~/snap/chromium/common/chromium/*/History",
+    "~/Library/Application Support/Google/Chrome/*/History",
+    "~/Library/Application Support/Chromium/*/History",
+)
+_WEBKIT_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
+
+
+def shell_hook(bot: str) -> str:
+    return SHELL_HOOK % safe_name(bot)
+
+
+def install_shell_hook(bot: str, rc_path: str) -> bool:
+    rc_path = os.path.expanduser(rc_path)
+    existing = ""
+    if os.path.exists(rc_path):
+        with open(rc_path, encoding="utf-8", errors="replace") as fh:
+            existing = fh.read()
+    if ">>> gblog shell hook >>>" in existing:
+        return False
+    with open(rc_path, "a", encoding="utf-8") as fh:
+        fh.write(("\n" if existing and not existing.endswith("\n") else "") + shell_hook(bot))
+    return True
+
+
+def find_browser_histories() -> List[str]:
+    import glob
+    found: List[str] = []
+    for pattern in BROWSER_HISTORY_GLOBS:
+        found.extend(glob.glob(os.path.expanduser(pattern)))
+    return sorted(set(found))
+
+
+def _url_target(url: str) -> Optional[str]:
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    host = parts.hostname or parts.netloc
+    return "%s://%s%s" % (parts.scheme, host, parts.path or "/")
+
+
+def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str]] = None, hours: int = 24) -> Dict:
+    import shutil
+    import sqlite3
+    import tempfile
+    bot = safe_name(bot)
+    paths = history_paths or find_browser_histories()
+    state = ledger.read_state(bot)
+    marker = int(state.get("capture_browser_last", 0))
+    cutoff_epoch = _dt.datetime.utcnow().timestamp() - hours * 3600
+    cutoff_webkit = int((cutoff_epoch + _WEBKIT_EPOCH_OFFSET) * 1_000_000)
+    since = max(marker, cutoff_webkit)
+    added, newest = 0, marker
+    for path in paths:
+        tmp = tempfile.mkdtemp(prefix="gblog-hist-")
+        try:
+            copy = os.path.join(tmp, "History")
+            shutil.copyfile(path, copy)  # Chrome keeps the live DB locked; read a copy
+            conn = sqlite3.connect(copy)
+            try:
+                rows = conn.execute(
+                    "SELECT v.visit_time, u.url, u.title FROM visits v JOIN urls u ON u.id = v.url "
+                    "WHERE v.visit_time > ? ORDER BY v.visit_time",
+                    (since,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            continue
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        last_target = None
+        for visit_time, url, title in rows:
+            target = _url_target(url or "")
+            if not target or target == last_target:
+                continue
+            last_target = target
+            observed = _dt.datetime.utcfromtimestamp(visit_time / 1_000_000 - _WEBKIT_EPOCH_OFFSET).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ledger.append(bot, {"type": "action", "action": "browser", "target": target, "outcome": "ok",
+                                "detail": (title or "")[:120], "source": "auto", "capture": "browser", "observed": observed})
+            added += 1
+            newest = max(newest, int(visit_time))
+    if newest != marker:
+        state = ledger.read_state(bot)
+        state["capture_browser_last"] = newest
+        ledger.write_state(bot, state)
+    return {"histories": paths, "added": added}
+
+
+def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] = (), limit: int = 200) -> Dict:
+    bot = safe_name(bot)
+    path = os.path.abspath(os.path.expanduser(path))
+    skip_names = set(exclude) | {".git", "__pycache__", "node_modules", ".cache", ".venv"}
+    snap_path = os.path.join(ledger.state_dir, "capture-files-%s.json" % bot)
+    current: Dict[str, List[float]] = {}
+    for dirpath, dirnames, filenames in os.walk(path):
+        if os.path.abspath(dirpath).startswith(ledger.root):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in skip_names]
+        for name in filenames:
+            if name in skip_names:
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            current[os.path.relpath(full, path)] = [round(st.st_mtime, 3), st.st_size]
+    previous: Optional[Dict[str, List[float]]] = None
+    if os.path.exists(snap_path):
+        with open(snap_path, encoding="utf-8") as fh:
+            previous = json.load(fh).get("files", {})
+    ledger.ensure()
+    with open(snap_path, "w", encoding="utf-8") as fh:
+        json.dump({"path": path, "taken": now_iso(), "files": current}, fh)
+    if previous is None:
+        return {"baseline": len(current), "changes": 0}
+    changes: List[Tuple[str, str]] = []
+    for rel, meta in current.items():
+        if rel not in previous:
+            changes.append(("created", rel))
+        elif previous[rel] != meta:
+            changes.append(("modified", rel))
+    for rel in previous:
+        if rel not in current:
+            changes.append(("deleted", rel))
+    changes.sort(key=lambda c: c[1])
+    for kind, rel in changes[:limit]:
+        ledger.append(bot, {"type": "action", "action": "file", "target": rel, "outcome": "ok", "detail": kind,
+                            "source": "auto", "capture": "files"})
+    if len(changes) > limit:
+        ledger.append(bot, {"type": "note", "detail": "%d more file changes not listed individually" % (len(changes) - limit),
+                            "source": "auto", "capture": "files"})
+    return {"baseline": len(previous), "changes": len(changes)}
+
+
+# --------------------------------------------------------------------------- coverage (self-report vs. auto)
+def _ts_epoch(ts: Optional[str]) -> float:
+    if not ts:
+        return 0.0
+    try:
+        return _dt.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_dt.timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _shell_name(cmd: str) -> str:
+    tokens = cmd.strip().split()
+    while tokens and (("=" in tokens[0] and not tokens[0].startswith("-")) or tokens[0] in ("sudo", "env", "nohup", "time")):
+        tokens.pop(0)
+    return os.path.basename(tokens[0]) if tokens else ""
+
+
+def norm_target(kind: Optional[str], target: Optional[str]) -> str:
+    t = (target or "").strip()
+    if kind == "browser":
+        from urllib.parse import urlsplit
+        host = (urlsplit(t if "://" in t else "//" + t).hostname or t).lower()
+        return host[4:] if host.startswith("www.") else host
+    if kind == "shell":
+        return _shell_name(t)
+    if kind == "file":
+        return os.path.basename(t.rstrip("/"))
+    return t.lower()
+
+
+def coverage(records: List[Dict], window_minutes: int = 30) -> Dict:
+    auto = [r for r in records if r.get("type") == "action" and r.get("source") == "auto"]
+    self_recs = [r for r in records if r.get("type") == "action" and r.get("source") != "auto"]
+    window = window_minutes * 60
+    by_key: Dict[Tuple[str, str], Dict] = {}
+    unmatched: List[Dict] = []
+    used = set()
+    for a in auto:
+        key = (a.get("bot", "?"), a.get("action", "other"))
+        slot = by_key.setdefault(key, {"auto": 0, "matched": 0})
+        slot["auto"] += 1
+        t_a = _ts_epoch(a.get("observed") or a.get("ts"))
+        want = norm_target(a.get("action"), a.get("target"))
+        hit = None
+        for i, s in enumerate(self_recs):
+            if i in used or s.get("bot") != a.get("bot") or s.get("action") != a.get("action"):
+                continue
+            if abs(_ts_epoch(s.get("ts")) - t_a) > window:
+                continue
+            if want and norm_target(s.get("action"), s.get("target")) == want:
+                hit = i
+                break
+        if hit is None:
+            unmatched.append(a)
+        else:
+            used.add(hit)
+            slot["matched"] += 1
+    rows = []
+    for (bot, kind), slot in sorted(by_key.items()):
+        rows.append({"bot": bot, "action": kind, "auto": slot["auto"], "matched": slot["matched"],
+                     "pct": round(100.0 * slot["matched"] / slot["auto"], 1) if slot["auto"] else None})
+    total_auto = sum(r["auto"] for r in rows)
+    total_matched = sum(r["matched"] for r in rows)
+    return {"rows": rows, "unmatched": unmatched, "self_only": len(self_recs) - len(used),
+            "auto": total_auto, "matched": total_matched,
+            "pct": round(100.0 * total_matched / total_auto, 1) if total_auto else None}
+
+
+def render_coverage(cov: Dict, title: str) -> str:
+    lines = ["# %s" % title, ""]
+    if not cov["auto"]:
+        lines.append("_No automatically captured records yet. Install the shell hook (`gblog capture shell-hook --install`) "
+                     "and run `gblog capture browser` / `gblog capture files` from a routine._")
+        return "\n".join(lines) + "\n"
+    lines += ["Overall: **%s%%** of %d automatically observed actions were also reported by the Bot "
+              "(%d self-reported actions had no automatic counterpart, which is expected for connectors/messages)." %
+              (cov["pct"], cov["auto"], cov["self_only"]), "",
+              "| Bot | Action | Observed | Reported | Coverage |", "|---|---|---|---|---|"]
+    for r in cov["rows"]:
+        lines.append("| %s | %s | %d | %d | %s%% |" % (r["bot"], r["action"], r["auto"], r["matched"], r["pct"]))
+    if cov["unmatched"]:
+        lines += ["", "## Observed but not reported (latest %d)" % min(len(cov["unmatched"]), 25), ""]
+        for r in cov["unmatched"][-25:]:
+            lines.append("- %s %s `%s` %s" % ((r.get("observed") or r.get("ts", ""))[:19], r.get("bot"), r.get("action"), r.get("target", "")))
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- tune (improve the Bots from their own ledger)
+TUNE_CATEGORIES = ("skill", "routine", "approval", "description", "memory", "logging", "revert")
+_LESSON_RE = re.compile(r"(?i)\b(lesson|learned|next time|from now on|should (?:always|never)|always|never|remember)\b|교훈|다음부터|항상|절대|기억")
+_NORM_TITLE_RE = re.compile(r"[0-9]+|[#\[\](){}:;,.!?\"'`]+|\b(?:on|for|the|a|an|of|to)\b", re.I)
+
+
+def _norm_title(title: Optional[str]) -> str:
+    return " ".join(_NORM_TITLE_RE.sub(" ", title or "").lower().split())
+
+
+def _ref(r: Dict) -> str:
+    return "%s#%s" % (r.get("ts", "")[:10], r.get("seq"))
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _proposal_id(bot: str, category: str, key: str) -> str:
+    return hashlib.sha1(("%s|%s|%s" % (bot, category, key)).encode("utf-8")).hexdigest()[:8]
+
+
+def _tasks_of(recs: List[Dict]) -> Dict[str, Dict]:
+    tasks: Dict[str, Dict] = {}
+    for r in recs:
+        tid = r.get("task_id")
+        if not tid:
+            continue
+        t = tasks.setdefault(tid, {"title": "", "start": None, "end": None, "outcome": None, "actions": [], "approvals": []})
+        if r.get("task") and not t["title"]:
+            t["title"] = r["task"]
+        if r.get("type") == "task_start":
+            t["start"] = r.get("ts")
+        elif r.get("type") == "task_end":
+            t["end"], t["outcome"] = r.get("ts"), r.get("outcome")
+        elif r.get("type") == "action":
+            t["actions"].append(r)
+        elif r.get("type") == "approval":
+            t["approvals"].append(r)
+    return tasks
+
+
+def compute_metric(records: List[Dict], metric: Dict, since: Optional[str] = None, until: Optional[str] = None) -> Optional[float]:
+    recs = [r for r in records if r.get("bot") == metric.get("bot")
+            and (not since or r.get("ts", "") >= since) and (not until or r.get("ts", "") < until)]
+    kind = metric.get("kind")
+    if kind == "fail":
+        return float(sum(1 for r in recs if r.get("type") == "action" and r.get("outcome") == "fail"
+                         and r.get("action") == metric.get("action") and norm_target(r.get("action"), r.get("target")) == metric.get("key")))
+    if kind == "denied":
+        return float(sum(1 for r in recs if r.get("type") == "approval" and r.get("decision") == "denied"
+                         and _norm_title(r.get("target")) == metric.get("key")))
+    if kind == "approvals":
+        return float(sum(1 for r in recs if r.get("type") == "approval" and _norm_title(r.get("target")) == metric.get("key")))
+    if kind == "manual_tasks":
+        return float(sum(1 for r in recs if r.get("type") == "task_start" and r.get("source") != "routine"
+                         and _norm_title(r.get("task")) == metric.get("key")))
+    if kind == "slow":
+        tasks = _tasks_of(recs)
+        durations = [(_ts_epoch(t["end"]) - _ts_epoch(t["start"])) / 60 for t in tasks.values() if t["start"] and t["end"]]
+        threshold = metric.get("threshold_min") or 0
+        return float(sum(1 for d in durations if d > threshold))
+    if kind == "open_tasks":
+        tasks = _tasks_of(recs)
+        return float(sum(1 for t in tasks.values() if t["start"] and not t["end"]))
+    if kind == "coverage":
+        cov = coverage(recs)
+        for row in cov["rows"]:
+            if row["action"] == metric.get("action"):
+                return row["pct"]
+        return None
+    return None
+
+
+def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -> Dict:
+    now = now_iso()
+    since = (_dt.datetime.utcnow() - _dt.timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    by_bot: Dict[str, List[Dict]] = {}
+    for r in records:
+        if r.get("type") in ("sync", "verify") or r.get("ts", "") < since:
+            continue
+        by_bot.setdefault(r.get("bot", "?"), []).append(r)
+    metrics: Dict[str, Dict] = {}
+    proposals: List[Dict] = []
+
+    def add(bot: str, category: str, key: str, title: str, suggestion: str, evidence: List[Dict], metric: Optional[Dict], better: str) -> None:
+        pid = _proposal_id(bot, category, key)
+        if any(p["id"] == pid for p in proposals):
+            return
+        baseline = compute_metric(records, metric, since=since) if metric else None
+        proposals.append({"id": pid, "bot": bot, "category": category, "key": key, "title": title, "suggestion": suggestion,
+                          "evidence": [_ref(r) for r in evidence[:8]], "count": len(evidence),
+                          "metric": metric, "baseline": baseline, "better": better, "window": {"since": since, "until": now}})
+
+    for bot, recs in sorted(by_bot.items()):
+        tasks = _tasks_of(recs)
+        durations = {tid: (_ts_epoch(t["end"]) - _ts_epoch(t["start"])) / 60 for tid, t in tasks.items() if t["start"] and t["end"]}
+        fails = [r for r in recs if r.get("type") == "action" and r.get("outcome") == "fail"]
+        denied = [r for r in recs if r.get("type") == "approval" and r.get("decision") == "denied"]
+        m = {"tasks": sum(1 for t in tasks.values() if t["start"]),
+             "closed": sum(1 for t in tasks.values() if t["end"]),
+             "succeeded": sum(1 for t in tasks.values() if t["outcome"] == "ok"),
+             "open": sum(1 for t in tasks.values() if t["start"] and not t["end"]),
+             "actions": sum(1 for r in recs if r.get("type") == "action" and r.get("source") != "auto"),
+             "auto_actions": sum(1 for r in recs if r.get("type") == "action" and r.get("source") == "auto"),
+             "failed_actions": len(fails), "approvals": sum(1 for r in recs if r.get("type") == "approval"),
+             "denied": len(denied), "median_minutes": round(_median(list(durations.values())), 1)}
+        metrics[bot] = m
+
+        # A. repeated failures -> skill fix
+        groups: Dict[Tuple[str, str], List[Dict]] = {}
+        for r in fails:
+            groups.setdefault((r.get("action", "other"), norm_target(r.get("action"), r.get("target"))), []).append(r)
+        for (kind, key), ev in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            if len(ev) < 2 or not key:
+                continue
+            titles = sorted({tasks[r["task_id"]]["title"] for r in ev if r.get("task_id") in tasks and tasks[r["task_id"]]["title"]})[:3]
+            add(bot, "skill", "fail:%s:%s" % (kind, key),
+                "`%s` %s failed %d times" % (key, kind, len(ev)),
+                "Add an explicit step or fallback for `%s` to the skill these tasks use%s. Last error: \"%s\". "
+                "If the cause is environmental (login expired, tool missing), put the fix in the Bot's setup instructions instead."
+                % (key, (" (%s)" % ", ".join(titles)) if titles else "", (ev[-1].get("detail") or "")[:140]),
+                ev, {"kind": "fail", "bot": bot, "action": kind, "key": key}, "lower")
+
+        # B/C. approvals -> auto-review rules
+        appr: Dict[str, List[Dict]] = {}
+        for r in recs:
+            if r.get("type") == "approval":
+                appr.setdefault(_norm_title(r.get("target")), []).append(r)
+        for key, ev in sorted(appr.items(), key=lambda kv: -len(kv[1])):
+            if not key:
+                continue
+            den = [r for r in ev if r.get("decision") == "denied"]
+            ok = [r for r in ev if r.get("decision") in ("allowed", "auto")]
+            if len(den) >= 2 and len(den) >= len(ok):
+                add(bot, "approval", "deny:" + key, "\"%s\" was denied %d of %d times" % (ev[0].get("target"), len(den), len(ev)),
+                    "Stop proposing it: add to the Bot description \"Do not %s; instead ...\" or an Auto-review *Always deny* rule, "
+                    "so the Bot takes the alternative path without asking." % ev[0].get("target"),
+                    den, {"kind": "denied", "bot": bot, "key": key}, "lower")
+            elif len(ok) >= 3 and not den:
+                add(bot, "approval", "allow:" + key, "\"%s\" was approved %d times without a single denial" % (ev[0].get("target"), len(ok)),
+                    "Add an Auto-review *Allow automatically* rule for this action (scoped as narrowly as possible) to remove the wait.",
+                    ok, {"kind": "approvals", "bot": bot, "key": key}, "lower")
+
+        # D. repeated manual tasks -> routine
+        titles: Dict[str, List[Dict]] = {}
+        for r in recs:
+            if r.get("type") == "task_start" and r.get("source") != "routine":
+                titles.setdefault(_norm_title(r.get("task")), []).append(r)
+        for key, ev in sorted(titles.items(), key=lambda kv: -len(kv[1])):
+            days = {r.get("ts", "")[:10] for r in ev}
+            if len(ev) >= 3 and len(days) >= 3 and key:
+                hours = sorted(int(r.get("ts", "T00")[11:13] or 0) for r in ev)
+                add(bot, "routine", "routine:" + key, "\"%s\" was started manually %d times on %d days" % (ev[0].get("task"), len(ev), len(days)),
+                    "Turn it into a routine (typical start %02d:00 UTC). Routine prompt: the task title, the data source, the expected result, "
+                    "what must not happen without approval, and what to report when the data is missing." % hours[len(hours) // 2],
+                    ev, {"kind": "manual_tasks", "bot": bot, "key": key}, "lower")
+
+        # E. repeated action sequences -> skill
+        grams: Dict[Tuple, List[str]] = {}
+        for tid, t in tasks.items():
+            seq = [(a.get("action"), norm_target(a.get("action"), a.get("target"))) for a in t["actions"] if a.get("source") != "auto"]
+            seen = set()
+            for i in range(len(seq) - 2):
+                g = tuple(seq[i:i + 3])
+                if len({x for x in g}) < 2 or g in seen:
+                    continue
+                seen.add(g)
+                grams.setdefault(g, []).append(tid)
+        for g, tids in sorted(grams.items(), key=lambda kv: -len(kv[1])):
+            if len(tids) < 3:
+                continue
+            key = " > ".join("%s:%s" % x for x in g)
+            if any(p["bot"] == bot and p["category"] == "skill" and p["key"].startswith("seq:") for p in proposals):
+                break
+            add(bot, "skill", "seq:" + key, "The sequence %s recurs in %d tasks" % (" → ".join("`%s %s`" % x for x in g), len(tids)),
+                "Write it down as a skill (name, when to use, the steps with exact commands/URLs, how to validate) so every run is identical "
+                "and shorter. Tasks: %s." % ", ".join(tids[:5]),
+                [tasks[t]["actions"][0] for t in tids if tasks[t]["actions"]], None, "info")
+
+        # F. slow tasks -> break down
+        if len(durations) >= 4:
+            med = _median(list(durations.values()))
+            threshold = max(2 * med, 15.0)
+            slow = [tid for tid, d in durations.items() if d > threshold]
+            if len(slow) >= 2:
+                ev = [r for r in recs if r.get("type") == "task_end" and r.get("task_id") in slow]
+                add(bot, "description", "slow", "%d tasks took more than %.0f min (median %.0f min)" % (len(slow), threshold, med),
+                    "Add to the description: break long tasks into checkpoints, report partial results, and ask early when input is missing. "
+                    "Slowest: %s." % ", ".join("%s (%.0f min)" % (tasks[t]["title"] or t, durations[t]) for t in sorted(slow, key=lambda x: -durations[x])[:3]),
+                    ev, {"kind": "slow", "bot": bot, "threshold_min": round(threshold, 1)}, "lower")
+
+        # G. lessons in notes -> memory / description
+        lessons = [r for r in recs if r.get("type") == "note" and r.get("source") != "auto" and _LESSON_RE.search(r.get("detail") or "")]
+        for r in lessons[-5:]:
+            add(bot, "memory", "note:%s" % r.get("hash", "")[:12], "Lesson noted on %s" % r.get("ts", "")[:10],
+                "Persist to Bot memory or description so it survives the conversation: \"%s\"" % (r.get("detail") or "")[:200], [r], None, "info")
+
+        # H. tasks never closed -> logging discipline
+        stale = [t for t in tasks.values() if t["start"] and not t["end"] and t["start"] < (_dt.datetime.utcnow() - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")]
+        if len(stale) >= 2:
+            add(bot, "logging", "open", "%d tasks were never closed with task-end" % len(stale),
+                "Re-state in the description: every reply that finishes work ends with `gblog task-end`. Close the stale ones with "
+                "`--outcome skipped --detail \"closed late\"`.", [r for r in recs if r.get("type") == "task_start" and r.get("task_id") in {k for k, t in tasks.items() if t in stale}],
+                {"kind": "open_tasks", "bot": bot}, "lower")
+
+    # I. coverage gaps -> logging rules
+    if cov:
+        for row in cov["rows"]:
+            if row["auto"] >= 3 and row["pct"] is not None and row["pct"] < 80:
+                add(row["bot"], "logging", "coverage:" + row["action"],
+                    "%s reported only %s%% of %d observed `%s` actions" % (row["bot"], row["pct"], row["auto"], row["action"]),
+                    "Strengthen the `%s` row of the activity-log skill for this Bot (give the exact command and say \"immediately after, not at the end\"); "
+                    "set `GBLOG_TASK` after task-start so auto records attach to the task." % row["action"],
+                    [r for r in cov["unmatched"] if r.get("bot") == row["bot"] and r.get("action") == row["action"]],
+                    {"kind": "coverage", "bot": row["bot"], "action": row["action"]}, "higher")
+
+    # J. effect of applied changes -> keep or revert
+    effects: List[Dict] = []
+    for r in records:
+        if r.get("type") != "tune" or r.get("outcome") != "ok" or not isinstance(r.get("proposal"), dict):
+            continue
+        p = r["proposal"]
+        metric = p.get("metric")
+        if not metric:
+            continue
+        after = compute_metric(records, metric, since=r.get("ts"))
+        days = max(1.0, (_ts_epoch(now) - _ts_epoch(r.get("ts"))) / 86400)
+        before = p.get("baseline")
+        window_days_before = max(1.0, (_ts_epoch(p.get("window", {}).get("until")) - _ts_epoch(p.get("window", {}).get("since"))) / 86400) if p.get("window") else float(window_days)
+        if metric.get("kind") == "coverage":
+            improved = (after is not None and before is not None and after > before) if p.get("better") == "higher" else None
+            rate_before, rate_after = before, after
+        else:
+            rate_before = (before or 0.0) / window_days_before
+            rate_after = (after or 0.0) / days
+            improved = rate_after < rate_before
+        effects.append({"id": r.get("target"), "bot": r.get("bot"), "title": p.get("title"), "applied": r.get("ts"), "days": round(days, 1),
+                        "before": before, "after": after, "rate_before": round(rate_before or 0, 2), "rate_after": round(rate_after or 0, 2), "improved": improved})
+        if days >= 7 and improved is False:
+            add(r.get("bot", "?"), "revert", "revert:" + str(r.get("target")), "Change %s did not help after %.0f days" % (r.get("target"), days),
+                "\"%s\" — metric went from %.2f to %.2f per day. Revert it or try a different fix. (%s)" % (p.get("title"), rate_before or 0, rate_after or 0, r.get("detail") or ""),
+                [r], None, "info")
+    order = {c: i for i, c in enumerate(TUNE_CATEGORIES)}
+    proposals.sort(key=lambda p: (order.get(p["category"], 9), -p["count"]))
+    return {"generated": now, "window_days": window_days, "since": since, "metrics": metrics, "proposals": proposals, "effects": effects,
+            "coverage": {k: v for k, v in (cov or {}).items() if k != "unmatched"} if cov else None}
+
+
+def render_tune(analysis: Dict, title: str) -> str:
+    lines = ["# %s" % title, "", "_Window: last %d days (since %s). Generated %s by gblog %s._" % (
+        analysis["window_days"], analysis["since"][:10], analysis["generated"], __version__), ""]
+    if not analysis["metrics"]:
+        lines.append("_No records in the window._")
+        return "\n".join(lines) + "\n"
+    lines += ["## Bots", "", "| Bot | Tasks | Closed | OK | Open | Actions | Failed | Approvals | Denied | Median min |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for bot, m in sorted(analysis["metrics"].items()):
+        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (bot, m["tasks"], m["closed"], m["succeeded"], m["open"], m["actions"],
+                                                                        m["failed_actions"], m["approvals"], m["denied"], m["median_minutes"]))
+    if analysis.get("coverage") and analysis["coverage"].get("auto"):
+        lines += ["", "Self-report coverage: **%s%%** of %d observed actions (see `gblog coverage`)." % (analysis["coverage"]["pct"], analysis["coverage"]["auto"])]
+    lines += ["", "## Proposals (%d)" % len(analysis["proposals"]), ""]
+    if not analysis["proposals"]:
+        lines.append("_Nothing to change: no repeated failures, denials, manual repeats, slow tasks or coverage gaps in the window._")
+    current = None
+    for p in analysis["proposals"]:
+        if p["category"] != current:
+            current = p["category"]
+            lines += ["### %s" % current, ""]
+        lines.append("- **[%s]** %s — %s" % (p["id"], p["bot"], p["title"]))
+        lines.append("  - %s" % p["suggestion"])
+        if p["metric"] and p["baseline"] is not None:
+            lines.append("  - Metric to watch: `%s` = %s (want %s)" % (p["metric"]["kind"], p["baseline"], p["better"]))
+        lines.append("  - Evidence: %s" % ", ".join(p["evidence"]))
+        lines.append("  - Apply: `gblog tune --apply %s --detail \"what you changed\"` · Reject: `gblog tune --reject %s --detail \"why\"`" % (p["id"], p["id"]))
+    if analysis["effects"]:
+        lines += ["", "## Effect of applied changes", "", "| Id | Bot | Change | Applied | Before/day | After/day | Verdict |", "|---|---|---|---|---|---|---|"]
+        for e in analysis["effects"]:
+            if e["improved"] is None:
+                verdict = "n/a"
+            elif e["days"] < 7:
+                verdict = "too early (%s so far)" % ("better" if e["improved"] else "no change")
+            else:
+                verdict = "improving" if e["improved"] else "**not helping**"
+            lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (e["id"], e["bot"], e["title"], e["applied"][:10], e["rate_before"], e["rate_after"], verdict))
+    lines += ["", "---", "_Proposals are derived from the Bot's own ledger. Apply them through the Bot's description, skills, routines, "
+              "Auto-review rules or memory — never by editing the ledger._"]
+    return "\n".join(lines) + "\n"
+
+
+def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool = False) -> Dict:
+    path = os.path.join(ledger.tuning_dir, "proposals.json")
+    if not os.path.exists(path):
+        raise ValueError("no proposals yet; run `gblog tune` first")
+    with open(path, encoding="utf-8") as fh:
+        proposals = json.load(fh).get("proposals", [])
+    match = [p for p in proposals if p["id"] == pid]
+    if not match:
+        raise ValueError("unknown proposal id %s (run `gblog tune` to list current ids)" % pid)
+    p = match[0]
+    keep = {k: p.get(k) for k in ("title", "category", "key", "metric", "baseline", "better", "window")}
+    return ledger.append(p["bot"], {"type": "tune", "action": "other", "target": pid, "outcome": "skipped" if reject else "ok",
+                                    "detail": detail or ("rejected" if reject else "applied"), "proposal": keep})
 
 
 # --------------------------------------------------------------------------- CLI
@@ -450,6 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--action", default="other", choices=ACTION_KINDS, help="kind of action")
     s.add_argument("--target", help="what was acted on: host/path, command, connector.tool, file, recipient")
     s.add_argument("--outcome", default="ok", choices=OUTCOMES)
+    s.add_argument("--source", choices=SOURCES, help="self (default), auto (captured without the Bot), routine")
 
     s = sub.add_parser("approval", help="record an approval request and its decision")
     _add_common(s)
@@ -491,6 +1062,37 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("export", help="dump records as JSON lines")
     s.add_argument("--bot")
     s.add_argument("--since")
+
+    cap = sub.add_parser("capture", help="collect evidence automatically (shell hook, browser history, file changes)")
+    caps = cap.add_subparsers(dest="what", required=True)
+    s = caps.add_parser("shell-hook", help="print (or --install) a bash hook that logs every command")
+    s.add_argument("--bot", required=True)
+    s.add_argument("--install", action="store_true", help="append the hook to --rc instead of printing it")
+    s.add_argument("--rc", default="~/.bashrc")
+    s = caps.add_parser("browser", help="import new visits from Chrome/Chromium history")
+    s.add_argument("--bot", required=True)
+    s.add_argument("--history", action="append", help="path to a History sqlite file (default: auto-detect)")
+    s.add_argument("--hours", type=int, default=24)
+    s = caps.add_parser("files", help="log files created/modified/deleted since the last snapshot")
+    s.add_argument("--bot", required=True)
+    s.add_argument("--path", default="/workspace")
+    s.add_argument("--exclude", action="append", default=[])
+    s.add_argument("--limit", type=int, default=200)
+
+    s = sub.add_parser("coverage", help="how much of the auto-captured activity the Bot reported itself")
+    s.add_argument("--bot")
+    s.add_argument("--days", type=int, default=7)
+    s.add_argument("--window", type=int, default=30, help="match window in minutes")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("tune", help="derive improvement proposals for the Bots from the ledger")
+    s.add_argument("--bot")
+    s.add_argument("--days", type=int, default=28)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--stdout", action="store_true", help="print only, do not write tuning/")
+    s.add_argument("--apply", metavar="ID", help="record that proposal ID was applied")
+    s.add_argument("--reject", metavar="ID", help="record that proposal ID was rejected")
+    s.add_argument("--detail", help="what was changed / why rejected")
     return p
 
 
@@ -511,8 +1113,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "log":
-        rec = ledger.append(args.bot, {"type": args.type, "task_id": args.task_id, "task": args.task, "action": args.action,
-                                       "target": args.target, "outcome": args.outcome, "detail": args.detail, "ts": args.ts})
+        rec = ledger.append(args.bot, {"type": args.type, "task_id": args.task_id or os.environ.get("GBLOG_TASK"), "task": args.task,
+                                       "action": args.action, "target": args.target, "outcome": args.outcome, "detail": args.detail,
+                                       "source": args.source if args.source != "self" else None, "ts": args.ts})
         out.write("%s #%d %s\n" % (rec["hash"][:12], rec["seq"], rec["type"]))
         return 0
 
@@ -632,6 +1235,63 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "export":
         for r in ledger.records(safe_name(args.bot) if args.bot else None, since=args.since):
             out.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+        return 0
+
+    if args.cmd == "capture":
+        if args.what == "shell-hook":
+            if args.install:
+                changed = install_shell_hook(args.bot, args.rc)
+                out.write("%s %s\n" % ("installed hook in" if changed else "hook already present in", os.path.expanduser(args.rc)))
+            else:
+                out.write(shell_hook(args.bot))
+            return 0
+        if args.what == "browser":
+            res = capture_browser(ledger, args.bot, args.history, args.hours)
+            if not res["histories"]:
+                sys.stderr.write("no browser history database found; pass --history PATH\n")
+                return 1
+            out.write("browser: %d new visit(s) from %d history file(s)\n" % (res["added"], len(res["histories"])))
+            return 0
+        if args.what == "files":
+            res = capture_files(ledger, args.bot, args.path, args.exclude, args.limit)
+            out.write("files: %d change(s) against a snapshot of %d file(s)\n" % (res["changes"], res["baseline"]))
+            return 0
+
+    if args.cmd == "coverage":
+        since = (_dt.datetime.utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
+        cov = coverage(ledger.records(safe_name(args.bot) if args.bot else None, since=since), args.window)
+        if args.json:
+            out.write(json.dumps({k: v for k, v in cov.items() if k != "unmatched"}, indent=2) + "\n")
+        else:
+            out.write(render_coverage(cov, "Self-report coverage, last %d days" % args.days))
+        return 0
+
+    if args.cmd == "tune":
+        if args.apply or args.reject:
+            try:
+                rec = tune_apply(ledger, args.apply or args.reject, args.detail, reject=bool(args.reject))
+            except ValueError as exc:
+                sys.stderr.write("%s\n" % exc)
+                return 2
+            out.write("%s #%d tune %s %s\n" % (rec["hash"][:12], rec["seq"], rec["target"], rec["outcome"]))
+            return 0
+        bot = safe_name(args.bot) if args.bot else None
+        since = (_dt.datetime.utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
+        recs = ledger.records(bot)
+        cov = coverage([r for r in recs if r.get("ts", "") >= since])
+        analysis = analyze(recs, args.days, cov)
+        if args.json:
+            out.write(json.dumps(analysis, indent=2, ensure_ascii=False) + "\n")
+        else:
+            out.write(render_tune(analysis, "Tuning proposals %s" % today()))
+        if not args.stdout:
+            ledger.ensure()
+            with open(os.path.join(ledger.tuning_dir, "proposals.json"), "w", encoding="utf-8") as fh:
+                json.dump({"generated": analysis["generated"], "proposals": analysis["proposals"]}, fh, indent=2, ensure_ascii=False)
+            path = os.path.join(ledger.tuning_dir, today() + ".md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(render_tune(analysis, "Tuning proposals %s" % today()))
+            sys.stderr.write("wrote %s\n" % os.path.relpath(path, ledger.root))
         return 0
 
     return 1
