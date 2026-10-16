@@ -13,7 +13,7 @@ set -euo pipefail
 
 PREFIX="${GBLOG_PREFIX:-$HOME/.local/bin}"
 REPO_RAW="${GBLOG_REPO:-https://raw.githubusercontent.com/deximple/grokbot-activity-log/main}"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HERE=""
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 mkdir -p "$PREFIX"
@@ -41,6 +41,7 @@ case ":$PATH:" in
   *)
     for rc in "$HOME/.bashrc" "$HOME/.profile"; do
       if [ -f "$rc" ] && ! grep -q 'gblog PATH' "$rc"; then
+        # shellcheck disable=SC2016  # literal $PATH is intended in the profile line
         printf '\n# gblog PATH\nexport PATH="%s:$PATH"\nexport GBLOG_ROOT="%s"\n' "$PREFIX" "$GBLOG_ROOT" >> "$rc"
       fi
     done
