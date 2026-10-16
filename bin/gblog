@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin launcher so the tool can be run from a checkout without installing.
+set -euo pipefail
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gblog.py" "$@"

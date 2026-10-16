@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Byte-compile
+        run: python -m compileall -q gblog.py tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Smoke test CLI
+        env:
+          GBLOG_ROOT: ${{ runner.temp }}/gblog-smoke
+        run: |
+          ./bin/gblog init
+          TID=$(./bin/gblog task-start --bot ci --task "smoke test")
+          ./bin/gblog log --bot ci --task-id "$TID" --action shell --target "echo hi" --outcome ok
+          ./bin/gblog task-end --bot ci --task-id "$TID" --outcome ok
+          ./bin/gblog verify --all
+          ./bin/gblog report --bot ci
+          ./bin/gblog status
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck install.sh bin/gblog
