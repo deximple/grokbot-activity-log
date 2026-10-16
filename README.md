@@ -26,7 +26,7 @@ OK    ops                       5 records  head 3c4241c25eb5
 
 | Piece | Where | Purpose |
 |---|---|---|
-| `gblog.py` | repo root | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export`, **`capture`, `coverage`, `tune`** |
+| `gblog.py` | repo root | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export`, **`capture`, `coverage`, `tune`, `archive`, `alias`** |
 | Skill: activity-log | `skills/activity-log/SKILL.md` | Tells the Bot exactly when and how to log; save it as a private skill |
 | Skill: bot-tune | `skills/bot-tune/SKILL.md` | Weekly loop that turns the ledger into approved edits to Bot descriptions, skills, routines, Auto-review rules and memory — and measures the effect |
 | Description rule | `docs/bot-description.md` | Paste into each Bot's description so logging stays on across sessions |
@@ -50,9 +50,10 @@ OK    ops                       5 records  head 3c4241c25eb5
   (Pattern matching cannot catch everything — Bots are also told never to paste credentials.)
 - **Human-readable output.** `gblog report` renders a Markdown day report grouped by Bot and
   task with FAIL/DENIED markers; `gblog status` shows chain heads, open tasks and sync state.
-- **Backups you control.** `gblog sync` commits `logs/`, `reports/`, `state/` into a git repo at
-  the ledger root and pushes to the remote you configured. Nothing leaves the computer unless
-  you set a remote. Each sync is itself logged (under bot `system` unless `--bot` is given).
+- **Backups you control — and private by policy.** `gblog sync` commits `logs/`, `reports/`, `state/`, `tuning/`, `archive/`
+  into a git repo at the ledger root and pushes to the remote you configured. Nothing leaves the computer unless
+  you set a remote, and `sync` **refuses to push to a public GitHub repository** (checked via `gh` or the public API;
+  override with `--allow-public`, unknown hosts only warn). Each sync is itself logged (under bot `system` unless `--bot` is given).
 - **Zero dependencies.** Grok Bot's docs warn that manually installed packages are replaceable;
   `gblog` is a single stdlib script and `install.sh` reinstalls it in seconds.
 
@@ -92,6 +93,42 @@ the user approves, and the change is recorded: `gblog tune --apply <id> --detail
 Next week's report compares the metric before/after each applied change (`too early` / `improving` /
 `not helping`), closing the loop. The `bot-tune` skill and weekly routine run this end to end.
 
+### Evidence files, not just claims: `archive`
+
+A ledger that only stores *claims* ("I read the transcript") is weak. `gblog archive` stores the thing
+itself — a conversation transcript, a message body, a produced file — content-addressed under
+`archive/<bot>/<date>/<sha256>.gz`, and chains its hash:
+
+```bash
+gblog archive --bot ledger --kind transcript --file transcripts/kim-biseo/2026-10-16.jsonl --task-id "$TID"
+cat body.txt | gblog archive --bot ops --kind message --stdin --name "reply to vendor"
+```
+
+Text is redacted *before* hashing (so the ledger never points at a file that still holds a secret; add
+`--no-redact` to store verbatim), identical content is stored once, and `gblog verify` now re-hashes every
+archived file: a modified or missing archive fails verification exactly like an edited log line.
+Grok Bot on an individual plan can read the other Bots' conversations on the same account, so the daily
+routine can archive each Bot's transcript and make the ledger a real record, not a diary.
+
+### One Bot, one name: `alias`
+
+Bots drift into name variants (`kim`, `kim-primary`, `KimBisunim`, …) and Korean display names are not valid
+chain keys. `alias` fixes both without rewriting any existing chain:
+
+```bash
+gblog alias add --slug kim-biseo --display 김비서님 --alias kim --alias kim-primary --alias KimBisunim
+gblog alias list            # slugs, display names, variants, chains on disk, unregistered chains
+gblog alias strict on       # refuse unknown names instead of warning
+```
+
+- The canonical key is a single ASCII slug; `report`, `status`, `tail`, `coverage` and `tune` merge all
+  variant chains under it and print `김비서님(kim-biseo)`.
+- New records written under any variant or the display name go to the slug's chain; old chains stay
+  byte-for-byte as they were (and still verify).
+- Unknown names log normally but warn on stderr (or are refused with `strict on`).
+- The report flags an open task whose twin (same title) was closed in another chain of the same Bot:
+  `outcome **open** — likely closed as `a2` in chain `kim-primary` (ok)`.
+
 ### Record schema (v1)
 
 ```json
@@ -100,7 +137,7 @@ Next week's report compares the metric before/after each applied change (`too ea
  "prev":"851cc7d8…","hash":"3866d105…"}
 ```
 
-`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune` · optional `source` ∈ `self | auto | routine` ·
+`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune | archive` · optional `source` ∈ `self | auto | routine` ·
 `action` ∈ `shell | browser | connector | file | message | computer_use | delegation | memory | routine | other` ·
 `outcome` ∈ `ok | fail | denied | pending | skipped | n/a`. Timestamps are UTC.
 
@@ -128,6 +165,14 @@ Run it anywhere else (laptop, CI, another agent) with `GBLOG_ROOT=/path ./bin/gb
   pre-approve `gblog sync` or it only commits locally.
 - If you are on **Enterprise**, turn on Action Recording + OpenTelemetry Export + conversation
   content export instead — that is the ground truth. Keep `gblog` for the *why* (notes, decisions).
+
+## Upgrading on a Grok Bot computer
+
+```bash
+git -C /workspace/grokbot-activity-log pull && bash /workspace/grokbot-activity-log/install.sh && gblog --version
+gblog verify --all                  # chains are format-compatible; nothing to migrate
+gblog alias add --slug <slug> --display <name> --alias <old-variant> ...   # once per Bot that has name variants
+```
 
 ## Development
 

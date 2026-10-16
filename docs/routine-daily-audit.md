@@ -10,7 +10,8 @@ pushing to the remote must be pre-approved (Auto-review *Allow automatically* ru
 ```
 Every day at 23:50 (my time zone), run the ledger audit:
 1. `gblog verify --all --record` — if anything prints FAIL, report the exact lines and stop; do not modify log files.
-2. `gblog report` for today and `gblog status`.
+2. For every Bot on this account, export today's conversation transcript (tool calls included) to `transcripts/<slug>/<date>.jsonl`
+   and run `gblog archive --bot ledger --kind transcript --file <that file> --detail "<slug> transcript"`. Then `gblog report` for today and `gblog status`.
 3. `gblog sync -m "daily ledger sync"` to commit and push the ledger to the configured remote.
    If the push fails, say so explicitly with the error; never retry by changing history.
 4. Post in this conversation: the metric table from the report, the list of tasks still open,
@@ -24,7 +25,8 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
 ```
 매일 23:50(내 시간대)에 원장 점검을 실행해:
 1. `gblog verify --all --record` — FAIL이 하나라도 있으면 해당 줄을 그대로 보고하고 중단해. 로그 파일을 수정하지 마.
-2. 오늘자 `gblog report` 와 `gblog status` 실행.
+2. 이 계정의 모든 봇에 대해 오늘 대화 원문(도구 호출 포함)을 `transcripts/<slug>/<날짜>.jsonl`로 내보내고
+   `gblog archive --bot ledger --kind transcript --file <그 파일> --detail "<slug> transcript"` 실행. 그 다음 오늘자 `gblog report` 와 `gblog status`.
 3. `gblog sync -m "daily ledger sync"` 로 원장을 커밋·푸시해. 푸시가 실패하면 오류를 그대로 알려주고, 히스토리를 바꿔서 재시도하지 마.
 4. 이 대화에 보고: 리포트의 지표 표, 아직 열려 있는 작업 목록, FAIL/DENIED/fail 결과, 동기화 결과(커밋 id, 푸시 여부).
 누구에게도 연락하지 말고, 루틴을 바꾸지 말고, 아무것도 삭제하지 마.

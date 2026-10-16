@@ -53,8 +53,10 @@ class LedgerTest(unittest.TestCase):
         self.ledger.append("ops", {"type": "action", "action": "shell", "target": "git status"})
         self.ledger.append("ops", {"type": "action", "action": "shell", "target": "ls"})
         path = self._log_path("ops")
-        text = open(path, encoding="utf-8").read().replace("git status", "git push --force")
-        open(path, "w", encoding="utf-8").write(text)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().replace("git status", "git push --force")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
         res = self.ledger.verify("ops")
         self.assertFalse(res["ok"])
         self.assertIn("hash mismatch", res["problems"][0])
@@ -63,7 +65,8 @@ class LedgerTest(unittest.TestCase):
         for i in range(3):
             self.ledger.append("ops", {"type": "note", "detail": str(i)})
         path = self._log_path("ops")
-        lines = open(path, encoding="utf-8").read().splitlines()
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
         open(path, "w", encoding="utf-8").write("\n".join([lines[0], lines[2]]) + "\n")
         res = self.ledger.verify("ops")
         self.assertFalse(res["ok"])
@@ -73,7 +76,8 @@ class LedgerTest(unittest.TestCase):
         for i in range(3):
             self.ledger.append("ops", {"type": "note", "detail": str(i)})
         path = self._log_path("ops")
-        lines = open(path, encoding="utf-8").read().splitlines()
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines[:2]) + "\n")
         res = self.ledger.verify("ops")
@@ -296,6 +300,179 @@ class CaptureCoverageTuneTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         rec = self.ledger.records("ops")[-1]
         self.assertEqual((rec["task_id"], rec["source"]), ("envtask", "auto"))
+
+
+class AliasArchiveSyncTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gblog-v03-")
+        self.ledger = gblog.Ledger(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _seed_variants(self):
+        L = self.ledger
+        L.append("kim", {"type": "task_start", "task_id": "a1", "task": "Reconcile invoices", "ts": "2026-02-01T09:00:00Z"})
+        L.append("KimBisunim", {"type": "action", "action": "shell", "target": "ls", "ts": "2026-02-01T09:05:00Z"})
+        L.append("kim-primary", {"type": "task_start", "task_id": "a2", "task": "Reconcile invoices", "ts": "2026-02-01T09:10:00Z"})
+        L.append("kim-primary", {"type": "task_end", "task_id": "a2", "outcome": "ok", "ts": "2026-02-01T09:20:00Z"})
+
+    def test_resolve_and_label_without_aliases_is_unchanged(self):
+        self.assertEqual(self.ledger.resolve("ops"), ("ops", True))
+        self.assertEqual(self.ledger.label("ops"), "ops")
+        with self.assertRaises(SystemExit):
+            self.ledger.resolve("김비서님")
+
+    def test_alias_merges_chains_without_rewriting_them(self):
+        self._seed_variants()
+        heads_before = {c: self.ledger.read_state(c)["head"] for c in self.ledger.bots()}
+        rc, out, _ = run(["alias", "add", "--slug", "kim-biseo", "--display", "김비서님", "--alias", "kim", "--alias", "KimBisunim",
+                          "--alias", "kim-primary"], self.root)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ledger.resolve("KimBisunim"), ("kim-biseo", True))
+        self.assertEqual(self.ledger.resolve("김비서님"), ("kim-biseo", True))
+        self.assertEqual(self.ledger.resolve("kim-biseo"), ("kim-biseo", True))
+        self.assertEqual(self.ledger.label("kim"), "김비서님(kim-biseo)")
+        self.assertEqual(sorted(self.ledger.chains_for("kim-biseo")), ["KimBisunim", "kim", "kim-primary"])
+        self.assertEqual(len(self.ledger.records("kim-biseo")), 4)
+        # new writes go to the canonical slug; old chains are untouched and still verify
+        rc, out, _ = run(["log", "--bot", "김비서님", "--action", "shell", "--target", "pwd"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.ledger.records("kim-biseo")[-1]["bot"], "kim-biseo")
+        self.assertEqual({c: self.ledger.read_state(c)["head"] for c in heads_before}, heads_before)
+        for c in self.ledger.bots():
+            self.assertTrue(self.ledger.verify(c)["ok"], c)
+        # unknown names warn (and are refused in strict mode)
+        rc, out, err = run(["log", "--bot", "lee", "--action", "shell", "--target", "ls"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("not registered", err)
+        run(["alias", "strict", "on"], self.root)
+        with self.assertRaises(SystemExit):
+            run(["log", "--bot", "park", "--action", "shell", "--target", "ls"], self.root)
+        rc, out, _ = run(["alias", "list"], self.root)
+        self.assertIn("kim-biseo", out)
+        self.assertIn("김비서님", out)
+        self.assertIn("unregistered chains: lee", out)
+
+    def test_report_status_tail_merge_and_detect_cross_chain_close(self):
+        self._seed_variants()
+        self.ledger.add_alias("kim-biseo", "김비서님", ["kim", "KimBisunim", "kim-primary"])
+        rc, out, _ = run(["report", "--date", "2026-02-01", "--stdout"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("## 김비서님(kim-biseo)", out)
+        self.assertIn("Chains merged by alias", out)
+        self.assertIn("likely closed as `a2` in chain `kim-primary` (ok)", out)
+        self.assertEqual(sum(1 for l in out.splitlines() if l.startswith("## ")), 1)
+        rc, out, _ = run(["status"], self.root)
+        self.assertIn("김비서님(kim-biseo)", out)
+        self.assertNotIn("KimBisunim", out)
+        rc, out, _ = run(["status", "--chains"], self.root)
+        self.assertIn("KimBisunim", out)
+        rc, out, _ = run(["tail", "-n", "1"], self.root)
+        self.assertIn("김비서님(kim-biseo)", out)
+        rc, out, _ = run(["coverage", "--bot", "kim", "--days", "100000"], self.root)
+        self.assertEqual(rc, 0)
+
+    def test_archive_roundtrip_dedup_redaction_and_verify(self):
+        src = os.path.join(self.root, "transcript.jsonl")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write('{"role":"user","text":"token=abcdef123456 please"}\n{"role":"bot","text":"done"}\n')
+        rc, out, _ = run(["archive", "--bot", "ops", "--file", src, "--kind", "transcript", "--task-id", "t1"], self.root)
+        self.assertEqual(rc, 0, out)
+        rec = self.ledger.records("ops")[-1]
+        self.assertEqual((rec["type"], rec["kind"], rec["target"], rec["redacted"]), ("archive", "transcript", "transcript.jsonl", True))
+        full = os.path.join(self.root, rec["path"])
+        self.assertTrue(os.path.exists(full))
+        import gzip
+        stored = gzip.open(full, "rb").read()
+        self.assertNotIn(b"abcdef123456", stored)
+        self.assertIn(b"[REDACTED]", stored)
+        self.assertEqual(rec["sha256"], gblog.hashlib.sha256(stored).hexdigest())
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["archives"], 1)
+        # same content again -> same path, "already stored"
+        rc, out, _ = run(["archive", "--bot", "ops", "--file", src], self.root)
+        self.assertIn("already stored", out)
+        self.assertEqual(len(os.listdir(os.path.dirname(full))), 1)
+        # tamper with the archived file -> verify fails, chain itself still fine
+        with gzip.open(full, "wb") as fh:
+            fh.write(b"something else")
+        res = self.ledger.verify("ops")
+        self.assertFalse(res["ok"])
+        self.assertIn("content hash mismatch", res["problems"][0])
+        os.remove(full)
+        self.assertIn("archived file missing", self.ledger.verify("ops")["problems"][0])
+        rc, out, _ = run(["verify", "--bot", "ops"], self.root)
+        self.assertEqual(rc, 1)
+        # binary via stdin is stored verbatim
+        rec = gblog.archive_file(self.ledger, "ops", b"\x00\x01\x02token=abcdef123456", "blob.bin", "artifact")
+        self.assertFalse(rec["redacted"])
+        self.assertEqual(rec["bytes"], 21)
+
+    def test_sync_refuses_public_remote(self):
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+        self.ledger.append("ops", {"type": "note", "detail": "x"})
+        calls = []
+        orig = gblog.remote_visibility
+        gblog.remote_visibility = lambda remote, timeout=6.0: calls.append(remote) or {"public": True, "reason": "test"}
+        try:
+            rc, out, err = run(["sync", "--remote", "https://github.com/someone/public-repo.git"], self.root)
+        finally:
+            gblog.remote_visibility = orig
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("PUBLIC", out)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].endswith("github.com/someone/public-repo.git"), calls)  # git may rewrite the URL via insteadOf
+        self.assertEqual(self.ledger.records("system")[-1]["outcome"], "denied")
+        # --no-push never contacts the network; --allow-public attempts the push
+        gblog.remote_visibility = lambda remote, timeout=6.0: calls.append("again") or {"public": True, "reason": "test"}
+        try:
+            rc, out, err = run(["sync", "--no-push"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            rc, out, err = run(["sync", "--allow-public"], self.root)
+        finally:
+            gblog.remote_visibility = orig
+        self.assertNotEqual(rc, 3)
+
+    def test_remote_visibility_parses_urls(self):
+        for url in ("git@github.com:deximple/grokledger.git", "https://github.com/deximple/grokledger", "https://github.com/deximple/grokledger.git/"):
+            m = gblog._GITHUB_REMOTE_RE.search(url)
+            self.assertEqual((m.group(1), m.group(2)), ("deximple", "grokledger"), url)
+        self.assertIsNone(gblog.remote_visibility("/srv/git/ledger.git")["public"])
+
+    def test_capture_browser_from_chrome_history_fixture(self):
+        import sqlite3
+        prof = os.path.join(self.root, "google-chrome-beta", "Profile 2")
+        os.makedirs(prof)
+        hist = os.path.join(prof, "History")
+        conn = sqlite3.connect(hist)
+        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
+                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
+        now_webkit = int((gblog._dt.datetime.utcnow().timestamp() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
+        conn.execute("INSERT INTO urls VALUES (1, 'https://mail.google.com/mail/u/0/?token=zzz#inbox', 'Inbox')")
+        conn.execute("INSERT INTO urls VALUES (2, 'chrome://newtab/', 'New tab')")
+        conn.execute("INSERT INTO visits VALUES (1, 1, ?)", (now_webkit - 60_000_000,))
+        conn.execute("INSERT INTO visits VALUES (2, 2, ?)", (now_webkit - 30_000_000,))
+        conn.execute("INSERT INTO visits VALUES (3, 1, ?)", (now_webkit - 1_000_000,))
+        conn.commit(); conn.close()
+        os.environ["GBLOG_BROWSER_HISTORY"] = os.path.join(self.root, "google-chrome*", "*", "History")
+        try:
+            found = gblog.find_browser_histories()
+            self.assertIn(os.path.realpath(hist), found)
+            res = gblog.capture_browser(self.ledger, "ops", None, hours=24)
+            self.assertEqual(res["added"], 1)
+            res = gblog.capture_browser(self.ledger, "ops", None, hours=24)
+            self.assertEqual(res["added"], 0)  # marker per history file
+        finally:
+            del os.environ["GBLOG_BROWSER_HISTORY"]
+        rec = self.ledger.records("ops")[-1]
+        self.assertEqual(rec["target"], "https://mail.google.com/mail/u/0/")
+        self.assertEqual(rec["profile"], "Profile 2")
+        self.assertEqual(rec["source"], "auto")
+        st = self.ledger.read_state("ops")
+        self.assertIsInstance(st["capture_browser_last"], dict)
 
 
 if __name__ == "__main__":

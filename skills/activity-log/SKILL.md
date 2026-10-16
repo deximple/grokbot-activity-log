@@ -18,7 +18,8 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
 
 ## Required inputs
 
-- `BOT`: your own Bot name, stable across sessions (ask the user once and keep it in memory).
+- `BOT`: your own Bot name. Use the registered slug (`gblog alias list`); if your name is not there, ask the user
+  to run `gblog alias add --slug <ascii-slug> --display <your name> --alias <variants>` once. Never invent a new variant.
 - The task title in the user's words.
 
 ## Sequence of work
@@ -55,17 +56,24 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
    gblog approval --bot "$BOT" --task-id "$TID" --target "<proposed action>" --decision allowed|denied|pending|expired|auto
    ```
 
-4. **Record decisions and reasoning** that a reader would not be able to infer from the actions:
+4. **Archive evidence, not just claims.** Any file you produced or read that matters (a transcript you
+   exported, a message body you sent, a report you generated) goes in content-addressed storage:
+   ```bash
+   gblog archive --bot "$BOT" --task-id "$TID" --kind transcript|message|artifact --file <path>
+   ```
+   Secrets are masked before the file is hashed; never pass `--no-redact` for anything that may contain credentials.
+
+5. **Record decisions and reasoning** that a reader would not be able to infer from the actions:
    ```bash
    gblog note --bot "$BOT" --task-id "$TID" --detail "chose vendor B because A's quote expired"
    ```
 
-5. **Close the task**:
+6. **Close the task**:
    ```bash
    gblog task-end --bot "$BOT" --task-id "$TID" --outcome ok|fail|skipped --detail "<one-line result>"
    ```
 
-6. **End your reply with a ledger footer** so the user can cross-check the transcript:
+7. **End your reply with a ledger footer** so the user can cross-check the transcript:
    `Ledger: <N> records, task <TID>, head <first 12 chars of last hash>` (take N and the head from `gblog status --json`).
 
 ## Validate

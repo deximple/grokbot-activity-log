@@ -11,6 +11,8 @@ Layout under GBLOG_ROOT (default: /workspace/activity-log):
     state/<bot>.lock              flock() so parallel Bots never interleave writes
     reports/YYYY-MM-DD[-<bot>].md rendered daily reports
     tuning/YYYY-MM-DD.md          improvement proposals derived from the ledger (`gblog tune`)
+    archive/<bot>/<date>/<sha256>.gz  content-addressed evidence files (`gblog archive`), hashes chained
+    state/aliases.json            canonical slug + display name + historical name variants per Bot
 
 Every record carries ``prev`` (hash of the previous record of that bot, or
 "genesis") and ``hash`` (sha256 over the canonical JSON of the record without
@@ -35,11 +37,11 @@ try:  # POSIX only; on other platforms we degrade to no locking.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 SCHEMA_VERSION = 1
 GENESIS = "genesis"
 
-RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune")
+RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune", "archive")
 SOURCES = ("self", "auto", "routine")
 ACTION_KINDS = (
     "shell",
@@ -124,10 +126,11 @@ class Ledger:
         self.state_dir = os.path.join(self.root, "state")
         self.reports_dir = os.path.join(self.root, "reports")
         self.tuning_dir = os.path.join(self.root, "tuning")
+        self.archive_dir = os.path.join(self.root, "archive")
 
     # -- filesystem helpers
     def init(self) -> None:
-        for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir):
+        for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir, self.archive_dir):
             os.makedirs(d, exist_ok=True)
         marker = os.path.join(self.root, "README.md")
         if not os.path.exists(marker):
@@ -138,7 +141,7 @@ class Ledger:
                 )
 
     def ensure(self) -> None:
-        if not all(os.path.isdir(d) for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir)):
+        if not all(os.path.isdir(d) for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir, self.archive_dir)):
             self.init()
 
     def bots(self) -> List[str]:
@@ -190,6 +193,94 @@ class Ledger:
         return Ledger._Lock(os.path.join(self.state_dir, bot + ".lock"))
 
     # -- iteration
+    # -- aliases (one canonical ASCII slug per Bot; display name + historical variants)
+    def aliases_path(self) -> str:
+        return os.path.join(self.state_dir, "aliases.json")
+
+    def aliases(self) -> Dict:
+        try:
+            with open(self.aliases_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        data.setdefault("bots", {})
+        data.setdefault("strict", False)
+        return data
+
+    def save_aliases(self, data: Dict) -> None:
+        self.ensure()
+        tmp = self.aliases_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True, ensure_ascii=False)
+        os.replace(tmp, self.aliases_path())
+
+    def add_alias(self, slug: str, display: Optional[str], variants: Iterable[str]) -> Dict:
+        slug = safe_name(slug).lower()
+        data = self.aliases()
+        entry = data["bots"].setdefault(slug, {"display": slug, "aliases": []})
+        if display:
+            entry["display"] = display.strip()
+        for v in variants:
+            v = v.strip()
+            if v and v != slug and v not in entry["aliases"]:
+                entry["aliases"].append(v)
+        for other, e in data["bots"].items():
+            if other != slug:
+                e["aliases"] = [a for a in e.get("aliases", []) if a not in entry["aliases"]]
+        self.save_aliases(data)
+        return entry
+
+    def resolve(self, name: str) -> Tuple[str, bool]:
+        """Map any Bot name (slug, display name, historical variant) to its canonical slug.
+
+        Returns (slug, known).  Unknown names fall back to safe_name(name) so old
+        behaviour is unchanged when no aliases are configured."""
+        data = self.aliases()
+        raw = (name or "").strip()
+        for slug, e in data["bots"].items():
+            if raw == slug or raw.lower() == slug or raw == e.get("display") or raw in e.get("aliases", []) \
+                    or raw.lower() in [a.lower() for a in e.get("aliases", [])]:
+                return slug, True
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")
+        if not cleaned:
+            raise SystemExit("error: '%s' has no ASCII letters or digits; register it first: "
+                             "gblog alias add --slug <ascii-slug> --display '%s'" % (raw, raw))
+        return cleaned, not data["bots"]
+
+    def canonical(self, chain: str) -> str:
+        slug, _ = self.resolve(chain)
+        return slug
+
+    def label(self, chain_or_slug: str) -> str:
+        slug = self.canonical(chain_or_slug)
+        display = self.aliases()["bots"].get(slug, {}).get("display")
+        return "%s(%s)" % (display, slug) if display and display != slug else slug
+
+    def chains_for(self, bot: str) -> List[str]:
+        slug = self.canonical(bot)
+        names = {slug} | set(self.aliases()["bots"].get(slug, {}).get("aliases", []))
+        existing = [c for c in self.bots() if c in names or self.canonical(c) == slug]
+        return existing or [slug]
+
+    def groups(self) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for chain in self.bots():
+            out.setdefault(self.canonical(chain), []).append(chain)
+        return dict(sorted(out.items()))
+
+    def canonicalize(self, records: List[Dict]) -> List[Dict]:
+        """Copies of records with ``bot`` replaced by the canonical slug (original chain kept in ``chain``)."""
+        cache: Dict[str, str] = {}
+        out = []
+        for r in records:
+            chain = r.get("bot", "?")
+            if chain not in cache:
+                cache[chain] = self.canonical(chain)
+            if cache[chain] != chain:
+                r = dict(r, bot=cache[chain], chain=chain)
+            out.append(r)
+        return out
+
     def iter_records(self, bot: str, files: Optional[Iterable[str]] = None) -> Iterator[Tuple[str, int, Dict]]:
         for path in files or self.log_files(bot):
             with open(path, encoding="utf-8") as fh:
@@ -284,12 +375,17 @@ class Ledger:
         state = self.read_state(bot)
         if not problems and count and state.get("head") not in (GENESIS, expected_prev):
             problems.append("state/%s.json: head does not match last record (state tampered or log truncated)" % bot)
-        return {"bot": bot, "records": count, "head": expected_prev, "ok": not problems, "problems": problems}
+        archives = 0
+        if not problems:
+            arch_recs = [r for _, _, r in self.iter_records(bot) if r.get("type") == "archive"]
+            archives = len(arch_recs)
+            problems.extend(verify_archives(self, arch_recs))
+        return {"bot": bot, "records": count, "head": expected_prev, "ok": not problems, "problems": problems, "archives": archives}
 
     # -- query
     def records(self, bot: Optional[str] = None, date: Optional[str] = None, since: Optional[str] = None) -> List[Dict]:
         out: List[Dict] = []
-        for b in ([bot] if bot else self.bots()):
+        for b in (self.chains_for(bot) if bot else self.bots()):
             files = self.log_files(b)
             if date:
                 files = [f for f in files if os.path.basename(f).startswith(date)]
@@ -306,7 +402,8 @@ class Ledger:
 
 
 # --------------------------------------------------------------------------- report
-def render_report(records: List[Dict], title: str) -> str:
+def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, str]] = None) -> str:
+    labels = labels or {}
     lines = ["# %s" % title, ""]
     if not records:
         lines.append("_No records._")
@@ -331,13 +428,17 @@ def render_report(records: List[Dict], title: str) -> str:
         "",
     ]
     for bot, recs in sorted(by_bot.items()):
-        lines += ["## %s" % bot, ""]
+        chains = sorted({r.get("chain") or r.get("bot", "?") for r in recs})
+        lines += ["## %s" % labels.get(bot, bot), ""]
+        if len(chains) > 1:
+            lines += ["_Chains merged by alias: %s_" % ", ".join("`%s`" % c for c in chains), ""]
         tasks: Dict[str, Dict] = {}
         order: List[str] = []
         for r in recs:
             tid = r.get("task_id") or "(no task)"
             if tid not in tasks:
-                tasks[tid] = {"title": r.get("task") or "", "actions": [], "start": None, "end": None, "outcome": None}
+                tasks[tid] = {"title": r.get("task") or "", "actions": [], "start": None, "end": None, "outcome": None,
+                              "chain": r.get("chain") or r.get("bot")}
                 order.append(tid)
             t = tasks[tid]
             if r.get("task") and not t["title"]:
@@ -347,6 +448,7 @@ def render_report(records: List[Dict], title: str) -> str:
             elif r.get("type") == "task_end":
                 t["end"] = r.get("ts")
                 t["outcome"] = r.get("outcome")
+                t["end_chain"] = r.get("chain") or r.get("bot")
             else:
                 t["actions"].append(r)
         for tid in order:
@@ -362,8 +464,21 @@ def render_report(records: List[Dict], title: str) -> str:
                 meta.append("end %s" % t["end"])
             if t["outcome"]:
                 meta.append("outcome **%s**" % t["outcome"])
+                if t.get("end_chain") and t["chain"] and t["end_chain"] != t["chain"]:
+                    meta.append("closed from chain `%s`" % t["end_chain"])
             elif tid != "(no task)":
-                meta.append("outcome **open**")
+                twin = None
+                if t["title"]:
+                    key = _norm_title(t["title"])
+                    for oid in order:
+                        o = tasks[oid]
+                        if oid != tid and o["end"] and o["title"] and _norm_title(o["title"]) == key and (o["start"] or o["end"]) >= (t["start"] or ""):
+                            twin = (oid, o)
+                            break
+                if twin:
+                    meta.append("outcome **open** — likely closed as `%s` in chain `%s` (%s)" % (twin[0], twin[1].get("end_chain") or twin[1]["chain"], twin[1]["outcome"]))
+                else:
+                    meta.append("outcome **open**")
             if meta:
                 lines.append("_%s_" % ", ".join(meta))
             lines.append("")
@@ -383,12 +498,123 @@ def render_report(records: List[Dict], title: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------- archive (content-addressed evidence files)
+ARCHIVE_KINDS = ("transcript", "message", "artifact", "other")
+
+
+def _is_text(data: bytes) -> bool:
+    if b"\x00" in data[:4096]:
+        return False
+    try:
+        data.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str = "other", task_id: Optional[str] = None,
+                 detail: Optional[str] = None, do_redact: bool = True, ts: Optional[str] = None) -> Dict:
+    """Store ``data`` as archive/<bot>/<date>/<sha256>.gz and chain its hash.
+
+    Text content is redacted before hashing so the ledger never references a
+    file that still contains a secret.  Identical content is stored once."""
+    import gzip
+    bot = safe_name(bot)
+    redacted = False
+    if do_redact and _is_text(data):
+        text = data.decode("utf-8")
+        clean = redact(text) or ""
+        redacted = clean != text
+        data = clean.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    day = today(ts)
+    rel = os.path.join("archive", bot, day, digest + ".gz")
+    full = os.path.join(ledger.root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    existed = os.path.exists(full)
+    if not existed:
+        tmp = full + ".tmp"
+        with gzip.open(tmp, "wb", compresslevel=6) as fh:
+            fh.write(data)
+        os.replace(tmp, full)
+    rec = ledger.append(bot, {"type": "archive", "action": "file", "target": os.path.basename(name) or "stdin", "outcome": "ok",
+                              "task_id": task_id, "kind": kind if kind in ARCHIVE_KINDS else "other", "sha256": digest,
+                              "bytes": len(data), "path": rel.replace(os.sep, "/"), "redacted": redacted,
+                              "detail": detail, "ts": ts})
+    rec["_dedup"] = existed
+    return rec
+
+
+def verify_archives(ledger: "Ledger", records: Iterable[Dict]) -> List[str]:
+    import gzip
+    problems: List[str] = []
+    seen = set()
+    for r in records:
+        if r.get("type") != "archive" or not r.get("path"):
+            continue
+        rel = r["path"]
+        if rel in seen:
+            continue
+        seen.add(rel)
+        full = os.path.join(ledger.root, rel)
+        if not os.path.exists(full):
+            problems.append("%s: archived file missing" % rel)
+            continue
+        h = hashlib.sha256()
+        try:
+            with gzip.open(full, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except (OSError, EOFError) as exc:
+            problems.append("%s: unreadable (%s)" % (rel, exc.__class__.__name__))
+            continue
+        if h.hexdigest() != r.get("sha256"):
+            problems.append("%s: content hash mismatch (file modified after archiving)" % rel)
+    return problems
+
+
+# --------------------------------------------------------------------------- remote visibility (backups must be private)
+_GITHUB_REMOTE_RE = re.compile(r"(?:github\.com[/:])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+
+
+def remote_visibility(remote: str, timeout: float = 6.0) -> Dict:
+    """Return {"public": True|False|None, "reason": str} for a git remote URL.
+
+    GitHub remotes are checked with `gh` when available, else with the public
+    REST API (a 200 without credentials means the repository is public)."""
+    m = _GITHUB_REMOTE_RE.search(remote or "")
+    if not m:
+        return {"public": None, "reason": "not a github.com remote; visibility unknown"}
+    owner, repo = m.group(1), m.group(2)
+    try:
+        res = subprocess.run(["gh", "api", "repos/%s/%s" % (owner, repo), "--jq", ".private"], text=True, capture_output=True, timeout=timeout)
+        if res.returncode == 0 and res.stdout.strip() in ("true", "false"):
+            return {"public": res.stdout.strip() == "false", "reason": "gh api"}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com/repos/%s/%s" % (owner, repo),
+                                 headers={"User-Agent": "gblog/" + __version__, "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return {"public": not body.get("private", False), "reason": "api.github.com"}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {"public": False, "reason": "api.github.com 404 (private or nonexistent)"}
+        return {"public": None, "reason": "api.github.com HTTP %d" % exc.code}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"public": None, "reason": "network: %s" % exc.__class__.__name__}
+
+
 # --------------------------------------------------------------------------- git sync
 def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", root, *args], check=check, text=True, capture_output=True)
 
 
-def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str], push: bool, message: Optional[str]) -> Dict:
+def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str], push: bool, message: Optional[str],
+         allow_public: bool = False) -> Dict:
     root = ledger.root
     ledger.ensure()
     if not os.path.isdir(os.path.join(root, ".git")):
@@ -402,7 +628,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     status = _git(root, "status", "--porcelain").stdout
     pending = [l for l in status.splitlines() if l.strip()]
     ledger.append(bot, {"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
-    _git(root, "add", "-A", "logs", "reports", "state", "tuning", "README.md")
+    _git(root, "add", "-A", "logs", "reports", "state", "tuning", "archive", "README.md")
     commit_msg = message or "gblog sync %s" % now_iso()
     env_ok = True
     try:
@@ -412,7 +638,17 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             raise
         env_ok = False
     sha = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
-    result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None}
+    result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None, "visibility": None}
+    if push:
+        origin = _git(root, "remote", "get-url", "origin", check=False).stdout.strip()
+        vis = remote_visibility(origin) if origin else {"public": None, "reason": "no origin configured"}
+        result["visibility"] = vis
+        if vis["public"] and not allow_public:
+            result["error"] = "refused: remote %s is PUBLIC (%s); backups must be private. Use --allow-public to override." % (origin, vis["reason"])
+            ledger.append(bot, {"type": "sync", "action": "other", "target": "git push", "outcome": "denied", "detail": result["error"][:300]})
+            push = False
+        elif vis["public"] is None:
+            sys.stderr.write("warning: could not confirm the remote is private (%s)\n" % vis["reason"])
     if push:
         cur_branch = branch or _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
         try:
@@ -454,13 +690,27 @@ case ";$PROMPT_COMMAND;" in *"__gblog_hook"*) ;; *) PROMPT_COMMAND="__gblog_hook
 '''
 
 BROWSER_HISTORY_GLOBS = (
-    "~/.config/google-chrome/*/History",
-    "~/.config/chromium/*/History",
-    "~/.config/BraveSoftware/Brave-Browser/*/History",
-    "~/.config/microsoft-edge/*/History",
+    # every profile ("Default", "Profile 1", ...) of every Chromium-family install; GBLOG_BROWSER_HISTORY adds more (colon-separated globs)
+    "~/.config/google-chrome*/*/History",
+    "~/.config/chromium*/*/History",
+    "~/.config/BraveSoftware/*/*/History",
+    "~/.config/microsoft-edge*/*/History",
+    "~/.config/vivaldi*/*/History",
     "~/snap/chromium/common/chromium/*/History",
-    "~/Library/Application Support/Google/Chrome/*/History",
+    "~/snap/brave/current/.config/BraveSoftware/*/*/History",
+    "~/.var/app/*/config/*/*/History",
+    "~/.cache/ms-playwright*/**/History",
+    "~/.mozilla/firefox/*/places.sqlite",
+    "~/Library/Application Support/Google/Chrome*/*/History",
     "~/Library/Application Support/Chromium/*/History",
+    "~/Library/Application Support/BraveSoftware/*/*/History",
+    "~/Library/Application Support/Microsoft Edge/*/History",
+    "/home/*/.config/google-chrome*/*/History",
+    "/home/*/.config/chromium*/*/History",
+    "/root/.config/google-chrome*/*/History",
+    "/root/.config/chromium*/*/History",
+    "/workspace/.config/google-chrome*/*/History",
+    "/workspace/.config/chromium*/*/History",
 )
 _WEBKIT_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
 
@@ -484,10 +734,14 @@ def install_shell_hook(bot: str, rc_path: str) -> bool:
 
 def find_browser_histories() -> List[str]:
     import glob
+    patterns = list(BROWSER_HISTORY_GLOBS) + [p for p in os.environ.get("GBLOG_BROWSER_HISTORY", "").split(":") if p]
     found: List[str] = []
-    for pattern in BROWSER_HISTORY_GLOBS:
-        found.extend(glob.glob(os.path.expanduser(pattern)))
-    return sorted(set(found))
+    for pattern in patterns:
+        try:
+            found.extend(p for p in glob.glob(os.path.expanduser(pattern), recursive=True) if os.path.isfile(p) and os.access(p, os.R_OK))
+        except OSError:
+            continue
+    return sorted(set(os.path.realpath(p) for p in found))
 
 
 def _url_target(url: str) -> Optional[str]:
@@ -509,43 +763,56 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
     bot = safe_name(bot)
     paths = history_paths or find_browser_histories()
     state = ledger.read_state(bot)
-    marker = int(state.get("capture_browser_last", 0))
+    markers = state.get("capture_browser_last", {})
+    if not isinstance(markers, dict):  # v0.2 kept a single marker
+        markers = {"*": int(markers)}
     cutoff_epoch = _dt.datetime.utcnow().timestamp() - hours * 3600
-    cutoff_webkit = int((cutoff_epoch + _WEBKIT_EPOCH_OFFSET) * 1_000_000)
-    since = max(marker, cutoff_webkit)
-    added, newest = 0, marker
+    added, changed = 0, False
     for path in paths:
+        firefox = path.endswith("places.sqlite")
+        # Chrome: microseconds since 1601; Firefox: microseconds since 1970
+        to_epoch = (lambda v: v / 1_000_000) if firefox else (lambda v: v / 1_000_000 - _WEBKIT_EPOCH_OFFSET)
+        from_epoch = (lambda e: int(e * 1_000_000)) if firefox else (lambda e: int((e + _WEBKIT_EPOCH_OFFSET) * 1_000_000))
+        since = max(int(markers.get(path, markers.get("*", 0))), from_epoch(cutoff_epoch))
         tmp = tempfile.mkdtemp(prefix="gblog-hist-")
         try:
             copy = os.path.join(tmp, "History")
-            shutil.copyfile(path, copy)  # Chrome keeps the live DB locked; read a copy
+            shutil.copyfile(path, copy)  # the browser keeps the live DB locked; read a copy
+            for suffix in ("-wal", "-journal"):
+                if os.path.exists(path + suffix):
+                    shutil.copyfile(path + suffix, copy + suffix)
             conn = sqlite3.connect(copy)
             try:
-                rows = conn.execute(
-                    "SELECT v.visit_time, u.url, u.title FROM visits v JOIN urls u ON u.id = v.url "
-                    "WHERE v.visit_time > ? ORDER BY v.visit_time",
-                    (since,),
-                ).fetchall()
+                if firefox:
+                    rows = conn.execute("SELECT v.visit_date, p.url, p.title FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id "
+                                        "WHERE v.visit_date > ? ORDER BY v.visit_date", (since,)).fetchall()
+                else:
+                    rows = conn.execute("SELECT v.visit_time, u.url, u.title FROM visits v JOIN urls u ON u.id = v.url "
+                                        "WHERE v.visit_time > ? ORDER BY v.visit_time", (since,)).fetchall()
             finally:
                 conn.close()
         except (sqlite3.Error, OSError):
             continue
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        last_target = None
+        last_target, newest = None, since
         for visit_time, url, title in rows:
+            newest = max(newest, int(visit_time))
             target = _url_target(url or "")
             if not target or target == last_target:
                 continue
             last_target = target
-            observed = _dt.datetime.utcfromtimestamp(visit_time / 1_000_000 - _WEBKIT_EPOCH_OFFSET).strftime("%Y-%m-%dT%H:%M:%SZ")
+            observed = _dt.datetime.utcfromtimestamp(to_epoch(visit_time)).strftime("%Y-%m-%dT%H:%M:%SZ")
             ledger.append(bot, {"type": "action", "action": "browser", "target": target, "outcome": "ok",
-                                "detail": (title or "")[:120], "source": "auto", "capture": "browser", "observed": observed})
+                                "detail": (title or "")[:120], "source": "auto", "capture": "browser", "observed": observed,
+                                "profile": os.path.basename(os.path.dirname(path))})
             added += 1
-            newest = max(newest, int(visit_time))
-    if newest != marker:
+        if newest != markers.get(path):
+            markers[path] = newest
+            changed = True
+    if changed:
         state = ledger.read_state(bot)
-        state["capture_browser_last"] = newest
+        state["capture_browser_last"] = {k: v for k, v in markers.items() if k != "*"}
         ledger.write_state(bot, state)
     return {"histories": paths, "added": added}
 
@@ -938,7 +1205,8 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -
             "coverage": {k: v for k, v in (cov or {}).items() if k != "unmatched"} if cov else None}
 
 
-def render_tune(analysis: Dict, title: str) -> str:
+def render_tune(analysis: Dict, title: str, labels: Optional[Dict[str, str]] = None) -> str:
+    labels = labels or {}
     lines = ["# %s" % title, "", "_Window: last %d days (since %s). Generated %s by gblog %s._" % (
         analysis["window_days"], analysis["since"][:10], analysis["generated"], __version__), ""]
     if not analysis["metrics"]:
@@ -946,7 +1214,7 @@ def render_tune(analysis: Dict, title: str) -> str:
         return "\n".join(lines) + "\n"
     lines += ["## Bots", "", "| Bot | Tasks | Closed | OK | Open | Actions | Failed | Approvals | Denied | Median min |", "|---|---|---|---|---|---|---|---|---|---|"]
     for bot, m in sorted(analysis["metrics"].items()):
-        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (bot, m["tasks"], m["closed"], m["succeeded"], m["open"], m["actions"],
+        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (labels.get(bot, bot), m["tasks"], m["closed"], m["succeeded"], m["open"], m["actions"],
                                                                         m["failed_actions"], m["approvals"], m["denied"], m["median_minutes"]))
     if analysis.get("coverage") and analysis["coverage"].get("auto"):
         lines += ["", "Self-report coverage: **%s%%** of %d observed actions (see `gblog coverage`)." % (analysis["coverage"]["pct"], analysis["coverage"]["auto"])]
@@ -958,7 +1226,7 @@ def render_tune(analysis: Dict, title: str) -> str:
         if p["category"] != current:
             current = p["category"]
             lines += ["### %s" % current, ""]
-        lines.append("- **[%s]** %s — %s" % (p["id"], p["bot"], p["title"]))
+        lines.append("- **[%s]** %s — %s" % (p["id"], labels.get(p["bot"], p["bot"]), p["title"]))
         lines.append("  - %s" % p["suggestion"])
         if p["metric"] and p["baseline"] is not None:
             lines.append("  - Metric to watch: `%s` = %s (want %s)" % (p["metric"]["kind"], p["baseline"], p["better"]))
@@ -1045,19 +1313,41 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--since", help="YYYY-MM-DD; report everything from this date")
     s.add_argument("--stdout", action="store_true", help="print only, do not write reports/")
 
-    s = sub.add_parser("status", help="per-bot summary")
+    s = sub.add_parser("status", help="per-bot summary (chains merged by alias; --chains for the raw per-chain view)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--chains", action="store_true")
 
     s = sub.add_parser("tail", help="show recent records")
     s.add_argument("--bot")
     s.add_argument("-n", type=int, default=20)
 
-    s = sub.add_parser("sync", help="commit (and push) the ledger with git")
+    s = sub.add_parser("sync", help="commit (and push) the ledger with git; refuses to push to a PUBLIC GitHub remote")
     s.add_argument("--bot", default="system", help="bot that performs the sync")
     s.add_argument("--remote", help="git remote URL to set as origin")
     s.add_argument("--branch", help="branch to push (default: current)")
     s.add_argument("--no-push", action="store_true")
+    s.add_argument("--allow-public", action="store_true", help="push even if the remote repository is public")
     s.add_argument("-m", "--message")
+
+    s = sub.add_parser("archive", help="store a file (transcript, message body, artifact) content-addressed and chain its sha256")
+    _add_common(s)
+    s.add_argument("--file", help="path to archive; use --stdin to read standard input")
+    s.add_argument("--stdin", action="store_true")
+    s.add_argument("--name", help="name recorded in the ledger (default: file basename)")
+    s.add_argument("--kind", default="other", choices=ARCHIVE_KINDS)
+    s.add_argument("--no-redact", action="store_true", help="store text verbatim (secrets are redacted by default)")
+
+    al = sub.add_parser("alias", help="canonical Bot names: one ASCII slug per Bot, a display name, and historical variants")
+    als = al.add_subparsers(dest="what", required=True)
+    s = als.add_parser("add", help="register or extend a Bot: --slug kim-biseo --display 김비서님 --alias kim --alias KimBisunim")
+    s.add_argument("--slug", required=True)
+    s.add_argument("--display")
+    s.add_argument("--alias", action="append", default=[], help="historical chain/name variant (repeatable)")
+    als.add_parser("list", help="show slugs, display names, variants and which chains exist on disk")
+    s = als.add_parser("strict", help="refuse (instead of warn about) names that are not registered")
+    s.add_argument("mode", choices=("on", "off"))
+    s = als.add_parser("resolve", help="print the canonical slug for a name")
+    s.add_argument("name")
 
     s = sub.add_parser("export", help="dump records as JSON lines")
     s.add_argument("--bot")
@@ -1096,10 +1386,23 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _resolve_bot(ledger: Ledger, name: str) -> str:
+    slug, known = ledger.resolve(name)
+    if not known:
+        data = ledger.aliases()
+        msg = "bot name '%s' is not registered in state/aliases.json (logging under '%s'); register it with: gblog alias add --slug <slug> --alias '%s'" % (name, slug, name)
+        if data.get("strict"):
+            raise SystemExit("error: " + msg)
+        sys.stderr.write("warning: " + msg + "\n")
+    return slug
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     ledger = Ledger(args.root)
     out = sys.stdout
+    if getattr(args, "bot", None) and args.cmd in ("task-start", "log", "approval", "task-end", "note", "archive", "capture"):
+        args.bot = _resolve_bot(ledger, args.bot)
 
     if args.cmd == "init":
         ledger.init()
@@ -1146,7 +1449,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for b in bots:
             res = ledger.verify(b)
             if res["ok"]:
-                out.write("OK    %-20s %6d records  head %s\n" % (b, res["records"], res["head"][:12]))
+                out.write("OK    %-20s %6d records  head %s%s\n" % (b, res["records"], res["head"][:12], "  (%d archived file(s) intact)" % res["archives"] if res.get("archives") else ""))
             else:
                 rc = 1
                 out.write("FAIL  %-20s %6d records verified before first problem\n" % (b, res["records"]))
@@ -1158,7 +1461,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return rc
 
     if args.cmd == "report":
-        bot = safe_name(args.bot) if args.bot else None
+        bot = ledger.canonical(args.bot) if args.bot else None
         if args.since:
             recs = ledger.records(bot, since=args.since)
             title = "Activity report since %s" % args.since
@@ -1169,9 +1472,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             title = "Activity report %s" % date
             fname = date
         if bot:
-            title += " — %s" % bot
+            title += " — %s" % ledger.label(bot)
             fname += "-" + bot
-        text = render_report(recs, title)
+        recs = ledger.canonicalize(recs)
+        labels = {b: ledger.label(b) for b in {r.get("bot", "?") for r in recs}}
+        text = render_report(recs, title, labels)
         out.write(text)
         if not args.stdout:
             ledger.ensure()
@@ -1183,35 +1488,42 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "status":
         rows = []
-        for b in ledger.bots():
-            st = ledger.read_state(b)
-            today_recs = ledger.records(b, date=today())
+        groups = {c: [c] for c in ledger.bots()} if args.chains else ledger.groups()
+        week = (_dt.date.today() - _dt.timedelta(days=7)).isoformat()
+        for key, chains in groups.items():
+            seq = sum(ledger.read_state(c).get("seq", 0) for c in chains)
+            updated = max((ledger.read_state(c).get("updated") or "" for c in chains), default="")
+            syncs = [ledger.read_state(c).get("last_sync") for c in chains if ledger.read_state(c).get("last_sync")]
+            last_sync = max(syncs, key=lambda s: s.get("ts", "")) if syncs else None
+            recent = [r for c in chains for r in ledger.records(c, since=week)]
             open_tasks = set()
-            for r in ledger.records(b, since=(_dt.date.today() - _dt.timedelta(days=7)).isoformat()):
+            for r in sorted(recent, key=lambda r: r.get("ts", "")):
                 if r.get("type") == "task_start":
                     open_tasks.add(r.get("task_id"))
                 elif r.get("type") == "task_end":
                     open_tasks.discard(r.get("task_id"))
-            rows.append({"bot": b, "seq": st.get("seq", 0), "head": st.get("head", GENESIS)[:12], "updated": st.get("updated"),
-                         "today": len(today_recs), "open_tasks": len(open_tasks), "last_sync": st.get("last_sync")})
+            today_n = sum(1 for r in recent if r.get("ts", "").startswith(today()))
+            head = ledger.read_state(key).get("head", GENESIS)[:12] if key in chains else "-"
+            rows.append({"bot": key, "label": ledger.label(key) if not args.chains else key, "chains": chains, "seq": seq, "head": head,
+                         "updated": updated or None, "today": today_n, "open_tasks": len(open_tasks), "last_sync": last_sync})
         if args.json:
-            out.write(json.dumps({"root": ledger.root, "bots": rows}, indent=2) + "\n")
+            out.write(json.dumps({"root": ledger.root, "bots": rows}, indent=2, ensure_ascii=False) + "\n")
             return 0
         out.write("root: %s\n" % ledger.root)
         if not rows:
             out.write("(no records yet)\n")
             return 0
-        out.write("%-20s %6s %8s %5s %20s  %s\n" % ("bot", "seq", "today", "open", "updated", "last sync"))
+        out.write("%-28s %6s %6s %8s %5s %20s  %s\n" % ("bot", "chains", "seq", "today", "open", "updated", "last sync"))
         for r in rows:
             ls = r["last_sync"]
             ls_txt = "%s (%s%s)" % (ls["ts"], ls["commit"], "" if ls["pushed"] else ", not pushed") if ls else "never"
-            out.write("%-20s %6d %8d %5d %20s  %s\n" % (r["bot"], r["seq"], r["today"], r["open_tasks"], r["updated"] or "-", ls_txt))
+            out.write("%-28s %6d %6d %8d %5d %20s  %s\n" % (r["label"], len(r["chains"]), r["seq"], r["today"], r["open_tasks"], r["updated"] or "-", ls_txt))
         return 0
 
     if args.cmd == "tail":
-        recs = ledger.records(safe_name(args.bot) if args.bot else None)[-args.n:]
+        recs = ledger.records(ledger.canonical(args.bot) if args.bot else None)[-args.n:]
         for r in recs:
-            bits = [r.get("ts", ""), r.get("bot", ""), "#%s" % r.get("seq"), r.get("type", "")]
+            bits = [r.get("ts", ""), ledger.label(r.get("bot", "")), "#%s" % r.get("seq"), r.get("type", "")]
             if r.get("action") and r.get("type") == "action":
                 bits.append(r["action"])
             if r.get("target"):
@@ -1225,17 +1537,66 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "sync":
         try:
-            res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message)
+            res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message, args.allow_public)
         except subprocess.CalledProcessError as exc:
             sys.stderr.write("git failed: %s\n" % (exc.stderr or exc.stdout).strip())
             return 2
         out.write("commit %s%s%s\n" % (res["commit"], " pushed" if res["pushed"] else " (not pushed)", "" if not res["error"] else "\n  push error: " + res["error"]))
+        if res["error"] and res["error"].startswith("refused:"):
+            return 3
         return 0 if (res["pushed"] or args.no_push) else 1
 
     if args.cmd == "export":
         for r in ledger.records(safe_name(args.bot) if args.bot else None, since=args.since):
             out.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
         return 0
+
+    if args.cmd == "archive":
+        if args.stdin:
+            data = sys.stdin.buffer.read()
+            name = args.name or "stdin"
+        elif args.file:
+            with open(args.file, "rb") as fh:
+                data = fh.read()
+            name = args.name or os.path.basename(args.file)
+        else:
+            sys.stderr.write("archive: give --file PATH or --stdin\n")
+            return 2
+        rec = archive_file(ledger, args.bot, data, name, args.kind, args.task_id or os.environ.get("GBLOG_TASK"), args.detail,
+                           do_redact=not args.no_redact, ts=args.ts)
+        out.write("%s #%d archive %s sha256=%s %d bytes%s%s\n" % (rec["hash"][:12], rec["seq"], rec["path"], rec["sha256"][:12], rec["bytes"],
+                                                                 " (redacted)" if rec.get("redacted") else "", " (already stored)" if rec.get("_dedup") else ""))
+        return 0
+
+    if args.cmd == "alias":
+        data = ledger.aliases()
+        if args.what == "add":
+            entry = ledger.add_alias(args.slug, args.display, args.alias)
+            out.write("%s: display=%s aliases=%s\n" % (safe_name(args.slug).lower(), entry["display"], ", ".join(entry["aliases"]) or "-"))
+            return 0
+        if args.what == "list":
+            if not data["bots"]:
+                out.write("(no aliases; every name is its own chain)%s\n" % (" strict" if data.get("strict") else ""))
+                return 0
+            chains = set(ledger.bots())
+            out.write("strict: %s\n" % ("on" if data.get("strict") else "off"))
+            for slug, e in sorted(data["bots"].items()):
+                on_disk = [c for c in [slug] + e.get("aliases", []) if c in chains]
+                out.write("%-20s %-16s aliases: %s\n%-20s %-16s chains on disk: %s\n" % (
+                    slug, e.get("display", slug), ", ".join(e.get("aliases", [])) or "-", "", "", ", ".join(on_disk) or "-"))
+            unmapped = [c for c in chains if c not in data["bots"] and ledger.canonical(c) == c]
+            if unmapped:
+                out.write("unregistered chains: %s\n" % ", ".join(unmapped))
+            return 0
+        if args.what == "strict":
+            data["strict"] = args.mode == "on"
+            ledger.save_aliases(data)
+            out.write("strict %s\n" % args.mode)
+            return 0
+        if args.what == "resolve":
+            slug, known = ledger.resolve(args.name)
+            out.write("%s%s\n" % (slug, "" if known else "  (unregistered)"))
+            return 0
 
     if args.cmd == "capture":
         if args.what == "shell-hook":
@@ -1259,7 +1620,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "coverage":
         since = (_dt.datetime.utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
-        cov = coverage(ledger.records(safe_name(args.bot) if args.bot else None, since=since), args.window)
+        cov = coverage(ledger.canonicalize(ledger.records(ledger.canonical(args.bot) if args.bot else None, since=since)), args.window)
         if args.json:
             out.write(json.dumps({k: v for k, v in cov.items() if k != "unmatched"}, indent=2) + "\n")
         else:
@@ -1275,22 +1636,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             out.write("%s #%d tune %s %s\n" % (rec["hash"][:12], rec["seq"], rec["target"], rec["outcome"]))
             return 0
-        bot = safe_name(args.bot) if args.bot else None
+        bot = ledger.canonical(args.bot) if args.bot else None
         since = (_dt.datetime.utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
-        recs = ledger.records(bot)
+        recs = ledger.canonicalize(ledger.records(bot))
         cov = coverage([r for r in recs if r.get("ts", "") >= since])
         analysis = analyze(recs, args.days, cov)
+        labels = {b: ledger.label(b) for b in analysis["metrics"]}
         if args.json:
             out.write(json.dumps(analysis, indent=2, ensure_ascii=False) + "\n")
         else:
-            out.write(render_tune(analysis, "Tuning proposals %s" % today()))
+            out.write(render_tune(analysis, "Tuning proposals %s" % today(), labels))
         if not args.stdout:
             ledger.ensure()
             with open(os.path.join(ledger.tuning_dir, "proposals.json"), "w", encoding="utf-8") as fh:
                 json.dump({"generated": analysis["generated"], "proposals": analysis["proposals"]}, fh, indent=2, ensure_ascii=False)
             path = os.path.join(ledger.tuning_dir, today() + ".md")
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(render_tune(analysis, "Tuning proposals %s" % today()))
+                fh.write(render_tune(analysis, "Tuning proposals %s" % today(), labels))
             sys.stderr.write("wrote %s\n" % os.path.relpath(path, ledger.root))
         return 0
 

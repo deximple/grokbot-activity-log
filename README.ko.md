@@ -14,7 +14,7 @@ Grok Bot의 공식 로그(Action Recording, OpenTelemetry Export, Audit Logs)는
 
 | 구성요소 | 위치 | 역할 |
 |---|---|---|
-| `gblog.py` | 레포 루트 | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export`, **`capture`, `coverage`, `tune`** |
+| `gblog.py` | 레포 루트 | CLI: `task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `report`, `status`, `tail`, `sync`, `export`, **`capture`, `coverage`, `tune`, `archive`, `alias`** |
 | 스킬: activity-log | `skills/activity-log/SKILL.md` | 봇이 언제·어떻게 기록할지 정확히 지시. 프라이빗 스킬로 저장 |
 | 스킬: bot-tune | `skills/bot-tune/SKILL.md` | 원장을 근거로 봇 description·스킬·루틴·Auto-review 규칙·메모리 수정안을 만들고, 승인 후 적용·기록·효과 측정하는 주간 루프 |
 | 설명 규칙 | `docs/bot-description.md` | 각 봇 description에 붙여 세션이 바뀌어도 기록 규칙 유지 (한/영) |
@@ -33,7 +33,7 @@ Grok Bot의 공식 로그(Action Recording, OpenTelemetry Export, Audit Logs)는
 - **디스크에 닿기 전에 시크릿 제거**: PEM 블록, GitHub/Slack/AWS/OpenAI/xAI/Google 키 형태, JWT, `Bearer …`,
   `password=…`, `?token=…` 쿼리 파라미터, `user:pass@` URL. (패턴 매칭이 전부를 잡지는 못하므로 봇에게도 자격증명을 붙이지 말라고 지시합니다.)
 - **사람이 읽는 출력.** `gblog report`는 봇·작업별로 묶인 Markdown 일일 리포트(FAIL/DENIED 표시), `gblog status`는 체인 헤드·열린 작업·동기화 상태.
-- **내가 통제하는 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않습니다. 동기화 자체도 기록됩니다(`--bot` 미지정 시 `system` 봇 체인).
+- **내가 통제하는, 기본 비공개 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`, `tuning/`, `archive/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않고, **원격이 공개 GitHub 레포면 푸시를 거부**합니다(`gh` 또는 공개 API로 확인; `--allow-public`으로만 허용, 확인 불가한 호스트는 경고만). 동기화 자체도 기록됩니다(`--bot` 미지정 시 `system` 봇 체인).
 - **의존성 0.** Grok Bot 문서는 수동 설치 패키지는 사라질 수 있다고 경고합니다. `gblog`는 표준 라이브러리 단일 스크립트이고 `install.sh`로 몇 초 안에 재설치됩니다.
 
 ## 봇이 잊어도 남는 증거: `capture` 와 `coverage`
@@ -69,6 +69,35 @@ gblog coverage                                  # 관측된 행동 중 봇이 �
 제안마다 id·근거 레코드·지표와 기준값이 붙습니다. 봇이 정확한 수정안을 작성 → 사용자가 승인 → `gblog tune --apply <id> --detail "..."`(또는 `--reject`)로 기록.
 다음 주 리포트가 적용 전/후 지표를 비교해(`too early` / `improving` / `not helping`) 루프를 닫습니다. `bot-tune` 스킬과 주간 루틴이 이 과정을 끝까지 수행합니다.
 
+## 주장이 아니라 증거 파일: `archive`
+
+"트랜스크립트를 읽었다"는 *주장*만 저장하는 장부는 약합니다. `gblog archive`는 대화 원문·메시지 본문·결과물 파일 자체를
+`archive/<bot>/<날짜>/<sha256>.gz`에 콘텐츠 주소 방식으로 저장하고 해시를 체인에 기록합니다.
+
+```bash
+gblog archive --bot ledger --kind transcript --file transcripts/kim-biseo/2026-10-16.jsonl --task-id "$TID"
+cat body.txt | gblog archive --bot ops --kind message --stdin --name "거래처 회신"
+```
+
+텍스트는 해시 전에 마스킹되고(원장이 시크릿이 남은 파일을 가리키지 않도록; 원문 그대로 저장하려면 `--no-redact`),
+같은 내용은 한 번만 저장되며, `gblog verify`가 모든 보관 파일을 다시 해시해 수정·삭제를 로그 줄 편집과 똑같이 FAIL로 잡습니다.
+개인 플랜 Grok Bot은 같은 계정 다른 봇의 대화 원문을 읽을 수 있으므로, 일일 루틴이 봇별 트랜스크립트를 보관하면 원장이 일기가 아닌 기록이 됩니다.
+
+## 봇 하나, 이름 하나: `alias`
+
+봇 이름은 `kim`, `kim-primary`, `KimBisunim`처럼 갈라지고, 한글 표시 이름은 체인 키로 쓸 수 없습니다. `alias`는 기존 체인을 하나도 다시 쓰지 않고 둘을 해결합니다.
+
+```bash
+gblog alias add --slug kim-biseo --display 김비서님 --alias kim --alias kim-primary --alias KimBisunim
+gblog alias list            # slug·표시 이름·변형·디스크의 체인·미등록 체인
+gblog alias strict on       # 모르는 이름을 경고 대신 거부
+```
+
+- 정식 키는 단일 ASCII slug. `report`·`status`·`tail`·`coverage`·`tune`이 모든 변형 체인을 합산하고 `김비서님(kim-biseo)` 형식으로 표시합니다.
+- 변형 이름이나 표시 이름으로 쓴 새 레코드는 slug 체인에 들어가고, 옛 체인은 그대로 유지되며 verify도 그대로 통과합니다.
+- 모르는 이름은 기록은 되지만 stderr에 경고(`strict on`이면 거부).
+- 같은 제목의 작업이 같은 봇의 다른 체인에서 닫힌 경우 리포트에 표시: `outcome **open** — likely closed as `a2` in chain `kim-primary` (ok)`.
+
 ## Grok Bot 컴퓨터에 설치 (5분)
 
 1. 봇에게:
@@ -88,6 +117,14 @@ gblog coverage                                  # 관측된 행동 중 봇이 �
   누락 발견 시 (백데이팅이 아닌) `note` 추가 규칙.
 - Auto Review는 메모리 쓰기를 검토하지 않고, 루틴의 승인은 약 10분 후 만료되므로 `gblog sync`를 사전 승인하지 않으면 로컬 커밋만 됩니다.
 - **Enterprise**라면 Action Recording + OpenTelemetry Export + conversation content export를 켜는 것이 정답(사실 기록)이고, `gblog`는 "왜 그랬는지"(note, 결정)를 보완하는 용도로 쓰세요.
+
+## Grok Bot 컴퓨터에서 업그레이드
+
+```bash
+git -C /workspace/grokbot-activity-log pull && bash /workspace/grokbot-activity-log/install.sh && gblog --version
+gblog verify --all                  # 로그 포맷 호환, 마이그레이션 없음
+gblog alias add --slug <slug> --display <표시이름> --alias <옛이름> ...   # 이름 변형이 있는 봇마다 한 번
+```
 
 ## 라이선스
 
