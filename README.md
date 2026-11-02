@@ -40,9 +40,10 @@ OK    ops                       5 records  head 3c4241c25eb5
 
 - **One chain per Bot.** Records go to `logs/<bot>/YYYY-MM-DD.jsonl`. Each record has `seq`,
   `prev` (hash of the previous record) and `hash` (SHA-256 of its canonical JSON).
-  `gblog verify` walks the chain and reports the first edited, deleted, duplicated or
-  truncated line. The chain head is also kept in `state/<bot>.json`, so silently deleting
-  the tail of a log is detected too.
+  `gblog verify` walks every contiguous segment. An edited, deleted, duplicated or
+  truncated line is FAIL. One pinned `break_ack` (see below) may mark a single discontinuity
+  as `PASS(승인 단절 N건)`; any other break is still FAIL. The chain head is also kept in
+  `state/<bot>.json`. Before each append, the log tail must match that head.
 - **Parallel Bots are safe.** All Bots share one computer; `gblog` takes an `flock` per Bot
   so concurrent writes never interleave.
 - **Secrets are scrubbed before they touch disk**: PEM blocks, GitHub/Slack/AWS/OpenAI/xAI/Google
@@ -50,7 +51,7 @@ OK    ops                       5 records  head 3c4241c25eb5
   (Pattern matching cannot catch everything — Bots are also told never to paste credentials.)
 - **Human-readable output.** `gblog report` renders a Markdown day report grouped by Bot and
   task with FAIL/DENIED markers; `gblog status` shows chain heads, open tasks and sync state.
-- **Backups you control — and private by policy.** `gblog sync` commits `logs/`, `reports/`, `state/`, `tuning/`, `archive/`
+- **Backups you control — and private by policy.** `gblog sync` commits `logs/`, `reports/`, `state/`, `tuning/`, `archive/`, `anchors/`, and `spool/`
   into a git repo at the ledger root and pushes to the remote you configured. Nothing leaves the computer unless
   you set a remote, and `sync` **refuses to push to a public GitHub repository** (checked via `gh` or the public API;
   override with `--allow-public`, unknown hosts only warn). Each sync is itself logged (under bot `system` unless `--bot` is given).
@@ -129,6 +130,23 @@ gblog alias strict on       # refuse unknown names instead of warning
 - The report flags an open task whose twin (same title) was closed in another chain of the same Bot:
   `outcome **open** — likely closed as `a2` in chain `kim-primary` (ok)`.
 
+### Chain repair (v0.4): one sealed gap, per-chain anchors, tail check
+
+These commands do **not** quarantine a day file and do **not** rehash history. They also do not
+edit a live ledger by themselves. Live use is `docs/chain-repair-live-apply.md`, and only after Jay says so.
+
+```bash
+gblog verify --bot kim-biseo          # FAIL until the pinned gap is sealed; then PASS(승인 단절 1건)
+gblog seal --bot kim-biseo --jay-approval-id <Jay's id>
+gblog anchor                          # every chain; never a whole-ledger skip
+```
+
+- **`seal`** appends one `break_ack` for the pinned kim-biseo gap only: `logs/kim-biseo/2026-11-02.jsonl` lines 164/165, seq 1919→1921, missing `{1920}`, and the three full hashes in `KIM_BISEO_BREAK`. There is no flag to acknowledge a different break. `PENDING-JAY` is rejected. Verify walks both segments and allows only that link. A later break is FAIL. The same descriptor is also appended as a witness note on the `ledger` bot. `jay_approval_id` is stored on the ack.
+- **`anchor`** writes `anchors/<bot>.json` and `anchors/days/<date>.json`. OK chains set `resumed_from` to their previous anchor head. A FAIL chain stores the break descriptor and both segment heads. `whole_ledger_skip` is always false.
+- **Append** refuses when the file tail's seq/hash does not match state. The event is saved under `spool/<bot>/`, `state/<bot>.alert.json` is replaced, and the CLI exits **4** with `ALERT tail mismatch` on stderr. gblog does not email or post; treat that file and exit code as the page. The log line is not written, and state is replaced only after the new line is fsynced.
+
+Copy tests live in `tests/fixtures/kim-biseo-break/` (fabricated; not the live ledger) and `tests/test_chain_repair.py`.
+
 ### Record schema (v1)
 
 ```json
@@ -137,7 +155,7 @@ gblog alias strict on       # refuse unknown names instead of warning
  "prev":"851cc7d8…","hash":"3866d105…"}
 ```
 
-`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune | archive` · optional `source` ∈ `self | auto | routine` ·
+`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune | archive` (`break_ack` is written only by `seal`) · optional `source` ∈ `self | auto | routine` ·
 `action` ∈ `shell | browser | connector | file | message | computer_use | delegation | memory | routine | other` ·
 `outcome` ∈ `ok | fail | denied | pending | skipped | n/a`. Timestamps are UTC.
 

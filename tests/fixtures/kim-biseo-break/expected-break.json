@@ -1,0 +1,19 @@
+{
+  "break": {
+    "file": "logs/kim-biseo/2026-11-02.jsonl",
+    "hash_after": "9a6a20dc90fa9afe5dbe86f11ec553883427f42cd55e25211fbfbfb6d0f56357",
+    "hash_before": "2b982fbb13d94b9e3f97abc758e0a839d20351aca16ce033fcd851625193b8bb",
+    "line_after": 165,
+    "line_before": 164,
+    "missing_seqs": [
+      1920
+    ],
+    "orphan_prev": "9f0f329d09728fa474d3df839850c7e02c027da64cef8a0d36947540235443fe",
+    "seq_after": 1921,
+    "seq_before": 1919
+  },
+  "fabricated": true,
+  "live_ledger": false,
+  "note": "Honest hashes of this fabricated copy. Not the live record bodies. gblog seal (no copy flag) must refuse this tree.",
+  "orphan_prev_source": "sha256('gblog fixture orphan prev; not a record body')"
+}
