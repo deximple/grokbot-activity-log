@@ -27,13 +27,15 @@ Grok Bot의 공식 로그(Action Recording, OpenTelemetry Export, Audit Logs)는
 ## 동작 원리
 
 - **봇별 해시 체인.** 기록은 `logs/<bot>/YYYY-MM-DD.jsonl`에 쌓이며 각 레코드는 `seq`, `prev`(이전 레코드 해시),
-  `hash`(정규화 JSON의 SHA-256)를 가집니다. `gblog verify`가 체인을 따라가며 수정·삭제·중복·절단된 첫 줄을 보고합니다.
-  체인 헤드는 `state/<bot>.json`에도 저장되어 로그 꼬리를 몰래 지워도 탐지됩니다.
+  `hash`(정규화 JSON의 SHA-256)를 가집니다. `gblog verify`는 이어진 구간을 모두 걷습니다.
+  수정·삭제·중복·절단은 FAIL입니다. 고정된 `break_ack` 하나(아래)만 단절 한 건을 `PASS(승인 단절 N건)`으로
+  표시할 수 있고, 그 밖의 단절은 FAIL입니다. 체인 헤드는 `state/<bot>.json`에 있으며, append 전에
+  로그 꼬리의 seq/hash가 그 헤드와 같아야 합니다.
 - **병렬 봇 안전.** 모든 봇이 한 컴퓨터를 공유하므로 봇별 `flock`으로 동시 쓰기가 섞이지 않게 합니다.
 - **디스크에 닿기 전에 시크릿 제거**: PEM 블록, GitHub/Slack/AWS/OpenAI/xAI/Google 키 형태, JWT, `Bearer …`,
   `password=…`, `?token=…` 쿼리 파라미터, `user:pass@` URL. (패턴 매칭이 전부를 잡지는 못하므로 봇에게도 자격증명을 붙이지 말라고 지시합니다.)
 - **사람이 읽는 출력.** `gblog report`는 봇·작업별로 묶인 Markdown 일일 리포트(FAIL/DENIED 표시), `gblog status`는 체인 헤드·열린 작업·동기화 상태.
-- **내가 통제하는, 기본 비공개 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`, `tuning/`, `archive/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않고, **원격이 공개 GitHub 레포면 푸시를 거부**합니다(`gh` 또는 공개 API로 확인; `--allow-public`으로만 허용, 확인 불가한 호스트는 경고만). 동기화 자체도 기록됩니다(`--bot` 미지정 시 `system` 봇 체인).
+- **내가 통제하는, 기본 비공개 백업.** `gblog sync`가 `logs/`, `reports/`, `state/`, `tuning/`, `archive/`, `anchors/`, `spool/`를 원장 루트의 git 레포에 커밋하고 설정한 리모트로 푸시합니다. 리모트를 설정하지 않으면 아무것도 밖으로 나가지 않고, **원격이 공개 GitHub 레포면 푸시를 거부**합니다(`gh` 또는 공개 API로 확인; `--allow-public`으로만 허용, 확인 불가한 호스트는 경고만). 동기화 자체도 기록됩니다(`--bot` 미지정 시 `system` 봇 체인).
 - **의존성 0.** Grok Bot 문서는 수동 설치 패키지는 사라질 수 있다고 경고합니다. `gblog`는 표준 라이브러리 단일 스크립트이고 `install.sh`로 몇 초 안에 재설치됩니다.
 
 ## 봇이 잊어도 남는 증거: `capture` 와 `coverage`
@@ -97,6 +99,23 @@ gblog alias strict on       # 모르는 이름을 경고 대신 거부
 - 변형 이름이나 표시 이름으로 쓴 새 레코드는 slug 체인에 들어가고, 옛 체인은 그대로 유지되며 verify도 그대로 통과합니다.
 - 모르는 이름은 기록은 되지만 stderr에 경고(`strict on`이면 거부).
 - 같은 제목의 작업이 같은 봇의 다른 체인에서 닫힌 경우 리포트에 표시: `outcome **open** — likely closed as `a2` in chain `kim-primary` (ok)`.
+
+## 체인 수리 (v0.4): 봉인 1건, 체인별 앵커, tail 검사
+
+일자 파일을 격리하지 않고, 과거 해시를 다시 계산하지도 않습니다. 이 명령을 실행해도 라이브 원장이
+바로 고쳐지지는 않습니다. 라이브 적용은 `docs/chain-repair-live-apply.md`이며, Jay가 하라고 한 뒤에만 합니다.
+
+```bash
+gblog verify --bot kim-biseo          # 봉인 전에는 FAIL, 봉인 뒤에는 PASS(승인 단절 1건)
+gblog seal --bot kim-biseo --jay-approval-id <Jay의 id>
+gblog anchor                          # 체인마다. 원장 전체 skip은 없음
+```
+
+- **`seal`** 은 고정된 김비서 단절 한 건만 `break_ack`로 덧붙입니다. 좌표는 `logs/kim-biseo/2026-11-02.jsonl` 164/165행, seq 1919→1921, 빠진 seq `{1920}`, 해시 세 개(`KIM_BISEO_BREAK`)입니다. 다른 단절을 승인하는 플래그는 없습니다. `PENDING-JAY`는 거부됩니다. verify는 두 구간을 모두 걷고 그 연결만 허용합니다. 그 다음 단절은 FAIL입니다. 같은 기술자를 `ledger` 봇 체인에 witness note로도 남기고, `jay_approval_id`를 ack에 적습니다.
+- **`anchor`** 는 `anchors/<bot>.json`과 `anchors/days/<날짜>.json`을 씁니다. OK 체인은 직전 앵커 헤드를 `resumed_from`으로 잇습니다. FAIL 체인은 단절 기술자와 두 구간 head를 남깁니다. `whole_ledger_skip`은 항상 false입니다.
+- **append** 는 파일 꼬리의 seq/hash가 state와 다르면 거부합니다. 이벤트는 `spool/<bot>/`에 남고, `state/<bot>.alert.json`이 바뀌며, CLI는 stderr에 `ALERT tail mismatch`를 찍고 **종료 코드 4**로 끝납니다. gblog는 메일이나 채팅을 보내지 않습니다. 그 파일과 종료 코드가 경보입니다. 로그 줄은 쓰지 않고, state는 새 줄을 fsync한 뒤에만 원자적으로 바꿉니다.
+
+사본 테스트는 `tests/fixtures/kim-biseo-break/`(가공된 데이터, 라이브 원장 아님)와 `tests/test_chain_repair.py`입니다.
 
 ## Grok Bot 컴퓨터에 설치 (5분)
 

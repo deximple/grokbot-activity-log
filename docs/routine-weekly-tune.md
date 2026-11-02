@@ -7,7 +7,7 @@ Prerequisite: the Bot has the `bot-tune` and `activity-log` skills.
 
 ```
 Every Monday at 09:00 (my time zone), run the bot-tune skill:
-1. `gblog verify --all` — stop and report if anything is FAIL.
+1. `gblog verify --all` — stop and report if the exit code is non-zero (FAIL). `PASS(승인 단절 N건)` exits 0; report the count, do not seal, and do not edit logs.
 2. `gblog capture browser` and `gblog capture files --path /workspace` for every Bot, then `gblog coverage`.
 3. `gblog tune --days 28`. Read the report.
 4. For each proposal, draft the exact edit (description sentence, skill step, routine prompt, Auto-review rule, memory entry).
@@ -22,7 +22,7 @@ If there are no proposals, say so in one line.
 
 ```
 매주 월요일 09:00(내 시간대)에 bot-tune 스킬을 실행해:
-1. `gblog verify --all` — FAIL이 있으면 중단하고 보고.
+1. `gblog verify --all` — 종료 코드가 0이 아니면(FAIL) 중단하고 보고. `PASS(승인 단절 N건)`은 종료 코드 0이다. 건수를 보고하고, seal 하지 말고, 로그를 고치지 마.
 2. 모든 봇에 대해 `gblog capture browser`, `gblog capture files --path /workspace` 실행 후 `gblog coverage`.
 3. `gblog tune --days 28` 실행 후 리포트를 읽어.
 4. 제안마다 정확한 수정안을 작성해 (description 문장, 스킬 단계, 루틴 프롬프트, Auto-review 규칙, 메모리 항목).

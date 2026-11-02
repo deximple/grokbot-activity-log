@@ -78,8 +78,12 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
 
 ## Validate
 
-- `gblog verify --bot "$BOT"` must print `OK`. If it prints `FAIL`, stop, tell the
-  user exactly which line is reported, and do not "fix" the log files by hand.
+- `gblog verify --bot "$BOT"` must exit 0. `OK` means the chain is intact.
+  `PASS(승인 단절 N건)` means a discontinuity that was already sealed; report the count and do not
+  treat it as a clean chain. If it prints `FAIL`, stop, tell the user exactly which line is reported,
+  and do not edit the log files. Do not run `gblog seal`.
+- If a command prints `ALERT tail mismatch` (exit 4), stop. The event is in `spool/<bot>/` and
+  `state/<bot>.alert.json`. Do not retry by editing logs.
 - `gblog status` shows `open` tasks; an open task older than today means a
   `task-end` was missed — close it with `--outcome skipped --detail "closed late"`.
 
