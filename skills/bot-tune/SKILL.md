@@ -22,7 +22,7 @@ changes that do not help get reverted.
 
 ## Sequence of work
 
-1. **Refresh evidence**: `gblog verify --all` must exit 0. `FAIL` stops the tune. `PASS(승인 단절 N건)` is a sealed break to report, not a clean chain; do not seal it yourself. Run `gblog capture browser --bot <bot>`
+1. **Refresh evidence**: `gblog verify --all` must exit 0. `FAIL` stops the tune. `PASS (N approved break(s))` is a sealed break to report, not a clean chain; do not seal it yourself. Run `gblog capture browser --bot <bot>`
    and `gblog capture files --bot <bot>` for each Bot that has a computer session, then `gblog coverage`.
 2. **Generate proposals**: `gblog tune --days 28` (writes `tuning/<date>.md` and `tuning/proposals.json`).
    Read the whole report. Categories and what they map to:

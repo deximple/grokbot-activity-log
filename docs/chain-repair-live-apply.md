@@ -20,7 +20,7 @@ N1 found no seq 1920 anywhere searched, so the live path is this seal, not inser
 5. Jay writes down the real approval id.
 6. Once: `gblog seal --bot kim-biseo --jay-approval-id <that id>`.
    The command refuses if the on-disk line, seq, or full hashes differ from `KIM_BISEO_BREAK`. It only appends. It does not rewrite 164/165.
-7. `gblog verify --bot kim-biseo` — expect exit 0 and `PASS(승인 단절 1건)`. `gblog verify --all` must not print FAIL. A new break is still FAIL.
+7. `gblog verify --bot kim-biseo` — expect exit 0 and `PASS (1 approved break)`. `gblog verify --all` must not print FAIL. A new break is still FAIL.
 8. `gblog anchor` again. kim-biseo is now PASS with `approved_breaks` 1 and the same id. Other chains still resume from their own anchors.
 9. Leave the witness note on the `ledger` bot chain. Do not delete `spool/` or `state/*.alert.json` if an append was refused; report those and stop.
 

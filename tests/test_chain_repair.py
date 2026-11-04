@@ -86,7 +86,7 @@ class ChainRepairTest(unittest.TestCase):
         rc, out, _ = run(["verify", "--bot", "kim-biseo"], self.root)
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL", out)
-        self.assertNotIn("PASS(승인 단절", out)
+        self.assertNotIn("approved break", out)
         self.assertIn("broken chain", out)
 
         res = self.ledger.verify("kim-biseo")
@@ -126,7 +126,7 @@ class ChainRepairTest(unittest.TestCase):
         self.assertEqual(_snapshot(self.root), before)
         rc, out, _ = run(["verify", "--bot", "kim-biseo"], self.root)
         self.assertEqual(rc, 1)
-        self.assertNotIn("PASS(승인 단절", out)
+        self.assertNotIn("approved break", out)
 
         ack = self.ledger.seal_break("kim-biseo", observed, "PENDING-JAY", copy_fixture=True)
         self.assertEqual(ack["type"], "break_ack")
@@ -147,11 +147,11 @@ class ChainRepairTest(unittest.TestCase):
         self.assertEqual(res["jay_approval_id"], "PENDING-JAY")
         rc, out, _ = run(["verify", "--bot", "kim-biseo"], self.root)
         self.assertEqual(rc, 0, out)
-        self.assertIn("PASS(승인 단절 1건)", out)
+        self.assertIn("PASS (1 approved break)", out)
         self.assertIn("approved_discontinuities=1", out)
         rc, out, _ = run(["verify", "--all"], self.root)
         self.assertEqual(rc, 0, out)
-        self.assertIn("PASS(승인 단절 1건)", out)
+        self.assertIn("PASS (1 approved break)", out)
         self.assertIn("ledger", out)
 
         with self.assertRaises(gblog.SealError):
@@ -164,7 +164,7 @@ class ChainRepairTest(unittest.TestCase):
         rc, out, _ = run(["verify", "--bot", "kim-biseo"], self.root)
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL", out)
-        self.assertNotIn("PASS(승인 단절", out)
+        self.assertNotIn("approved break", out)
 
     def test_wrong_ack_does_not_pass(self):
         res = self.ledger.verify("kim-biseo")
@@ -181,7 +181,7 @@ class ChainRepairTest(unittest.TestCase):
         self.assertTrue(any("does not match" in p or "broken chain" in p for p in res["problems"]))
         rc, out, _ = run(["verify", "--bot", "kim-biseo"], self.root)
         self.assertEqual(rc, 1)
-        self.assertNotIn("PASS(승인 단절", out)
+        self.assertNotIn("approved break", out)
 
     def test_anchor_ok_chain_resumes_and_fail_chain_keeps_both_heads(self):
         self.ledger.append("ops", {"type": "note", "detail": "ok chain", "ts": "2026-11-02T12:00:00Z"})

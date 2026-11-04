@@ -2,7 +2,7 @@
 
 **A complete, tamper-evident activity record for [Grok Bot](https://docs.x.ai/grok-bot/overview) — on plans that have no Action Recording.**
 
-[한국어 README](README.ko.md) · MIT licensed · Python 3.8+ standard library only · one file
+MIT licensed · Python 3.8+ standard library only · one file
 
 Grok Bot's official logging (Action Recording, OpenTelemetry export, audit logs) is
 [Enterprise-only](https://docs.x.ai/grok-bot/security). On SuperGrok / Cursor individual
@@ -42,7 +42,7 @@ OK    ops                       5 records  head 3c4241c25eb5
   `prev` (hash of the previous record) and `hash` (SHA-256 of its canonical JSON).
   `gblog verify` walks every contiguous segment. An edited, deleted, duplicated or
   truncated line is FAIL. One pinned `break_ack` (see below) may mark a single discontinuity
-  as `PASS(승인 단절 N건)`; any other break is still FAIL. The chain head is also kept in
+  as `PASS (N approved break(s))`; any other break is still FAIL. The chain head is also kept in
   `state/<bot>.json`. Before each append, the log tail must match that head.
 - **Parallel Bots are safe.** All Bots share one computer; `gblog` takes an `flock` per Bot
   so concurrent writes never interleave.
@@ -85,7 +85,7 @@ reads the last 28 days and writes `tuning/<date>.md` with evidence-backed propos
 | same task started manually on ≥ 3 days | `routine` — with the typical start hour |
 | same 3-step action sequence in ≥ 3 tasks | `skill` — write it down as a skill |
 | tasks > 2× median duration | `description` — checkpoints, ask early |
-| notes containing lessons ("always/never/다음부터…") | `memory` |
+| notes containing lessons ("always/never/from now on…") | `memory` |
 | coverage < 80% for a kind, tasks never closed | `logging` |
 | an applied change whose metric got worse after 7 days | `revert` |
 
@@ -113,30 +113,37 @@ routine can archive each Bot's transcript and make the ledger a real record, not
 
 ### One Bot, one name: `alias`
 
-Bots drift into name variants (`kim`, `kim-primary`, `KimBisunim`, …) and Korean display names are not valid
-chain keys. `alias` fixes both without rewriting any existing chain:
+Bots drift into name variants (`cos`, `cos-primary`, `ChiefOfStaff`, …), and display names with spaces or
+non-ASCII characters are not valid chain keys. `alias` fixes both without rewriting any existing chain:
 
 ```bash
-gblog alias add --slug kim-biseo --display 김비서님 --alias kim --alias kim-primary --alias KimBisunim
-gblog alias list            # slugs, display names, variants, chains on disk, unregistered chains
+gblog alias add --slug chief-of-staff --display "Chief of Staff" --alias cos --alias cos-primary --alias ChiefOfStaff
+gblog alias list            # slugs, display names, variants, chains on disk, unregistered chains, conflicts
+gblog alias remove --slug cos-old   # drop a registry entry; its chains stay on disk and still verify
 gblog alias strict on       # refuse unknown names instead of warning
 ```
 
 - The canonical key is a single ASCII slug; `report`, `status`, `tail`, `coverage` and `tune` merge all
-  variant chains under it and print `김비서님(kim-biseo)`.
+  variant chains under it and print `Chief of Staff(chief-of-staff)`.
 - New records written under any variant or the display name go to the slug's chain; old chains stay
   byte-for-byte as they were (and still verify).
+- `alias add` refuses a variant or display name that is already another Bot's slug or display name, and a slug
+  that is already another Bot's alias. `alias list` prints any such conflicts left by older versions, with the fix.
+- Name Bots by role, in English (`chief-of-staff`, `personal-assistant`, `editor`, …). The slug is the chain key
+  and never changes; rename freely through `--display` and keep old names as `--alias`.
 - Unknown names log normally but warn on stderr (or are refused with `strict on`).
 - The report flags an open task whose twin (same title) was closed in another chain of the same Bot:
-  `outcome **open** — likely closed as `a2` in chain `kim-primary` (ok)`.
+  `outcome **open** — likely closed as `a2` in chain `cos-primary` (ok)`.
 
 ### Chain repair (v0.4): one sealed gap, per-chain anchors, tail check
 
 These commands do **not** quarantine a day file and do **not** rehash history. They also do not
 edit a live ledger by themselves. Live use is `docs/chain-repair-live-apply.md`, and only after Jay says so.
+`kim-biseo` is the historical slug of the maintainer's chief-of-staff Bot, where the gap occurred; slugs are
+chain keys and are never renamed, so the pinned incident keeps that name.
 
 ```bash
-gblog verify --bot kim-biseo          # FAIL until the pinned gap is sealed; then PASS(승인 단절 1건)
+gblog verify --bot kim-biseo          # FAIL until the pinned gap is sealed; then PASS (1 approved break)
 gblog seal --bot kim-biseo --jay-approval-id <Jay's id>
 gblog anchor                          # every chain; never a whole-ledger skip
 ```
