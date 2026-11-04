@@ -34,7 +34,7 @@ OK    ops                       5 records  head 3c4241c25eb5
 | Weekly tune routine | `docs/routine-weekly-tune.md` | capture → coverage → tune → ask → apply → record, every week |
 | Marketplace kit | `docs/marketplace.md` | Ready-to-paste listing, operating instructions, skills/routines/memories for a shareable "Ledger" Bot |
 | Bot template | `docs/bot-template.md` | A shareable "Ledger" Bot for x.ai/bot, and a comparison with existing note-taking Bots |
-| Tests + CI | `tests/`, `.github/workflows/ci.yml` | 20 unit tests incl. tamper detection, coverage matching and the tune loop; Python 3.8/3.10/3.12; shellcheck |
+| Tests + CI | `tests/`, `.github/workflows/ci.yml` | 35 unit tests incl. tamper detection, coverage matching, the tune loop, chain repair and alias conflicts; Python 3.8/3.10/3.12; shellcheck |
 
 ## How it works
 
