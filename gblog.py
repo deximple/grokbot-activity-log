@@ -42,7 +42,7 @@ try:  # POSIX only; on other platforms we degrade to no locking.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 SCHEMA_VERSION = 1
 GENESIS = "genesis"
 
@@ -244,7 +244,7 @@ def _parse_ack(rec: Dict) -> Optional[Dict]:
 
 
 def pass_label(approved: int) -> str:
-    return "PASS(승인 단절 %d건)" % approved
+    return "PASS (%d approved break%s)" % (approved, "" if approved == 1 else "s")
 
 
 def _fsync_dir(path: str) -> None:
@@ -362,11 +362,25 @@ class Ledger:
     def add_alias(self, slug: str, display: Optional[str], variants: Iterable[str]) -> Dict:
         slug = safe_name(slug).lower()
         data = self.aliases()
+        display = display.strip() if display else None
+        variants = [v.strip() for v in variants if v and v.strip()]
+        for other, e in data["bots"].items():
+            if other == slug:
+                continue
+            if slug in [a.lower() for a in e.get("aliases", [])]:
+                raise SystemExit("error: '%s' is already an alias of %s; add it there or remove it first" % (slug, other))
+            for name in variants + ([display] if display else []):
+                if name.lower() == other:
+                    raise SystemExit("error: '%s' is the slug of another Bot; run `gblog alias remove --slug %s` first"
+                                     % (name, other))
+                if name == e.get("display"):
+                    raise SystemExit("error: '%s' is already the display name of %s" % (name, other))
+            if display and display in e.get("aliases", []):
+                raise SystemExit("error: display name '%s' is already an alias of %s" % (display, other))
         entry = data["bots"].setdefault(slug, {"display": slug, "aliases": []})
         if display:
-            entry["display"] = display.strip()
+            entry["display"] = display
         for v in variants:
-            v = v.strip()
             if v and v != slug and v not in entry["aliases"]:
                 entry["aliases"].append(v)
         for other, e in data["bots"].items():
@@ -374,6 +388,38 @@ class Ledger:
                 e["aliases"] = [a for a in e.get("aliases", []) if a not in entry["aliases"]]
         self.save_aliases(data)
         return entry
+
+    def remove_alias(self, slug: str) -> Dict:
+        """Drop one registry entry. Chains on disk are never touched."""
+        slug = safe_name(slug).lower()
+        data = self.aliases()
+        if slug not in data["bots"]:
+            raise SystemExit("error: '%s' is not a registered slug" % slug)
+        entry = data["bots"].pop(slug)
+        self.save_aliases(data)
+        return entry
+
+    def alias_conflicts(self) -> List[str]:
+        """Registry entries that make name resolution depend on file order (left by gblog < 0.5)."""
+        bots = self.aliases()["bots"]
+        problems = []
+        for slug in sorted(bots):
+            for other in sorted(bots):
+                if other != slug and slug in [a.lower() for a in bots[other].get("aliases", [])]:
+                    problems.append("slug '%s' is also an alias of %s; the slug wins, so that alias is ignored "
+                                    "(fix: gblog alias remove --slug %s)" % (slug, other, slug))
+        by_display: Dict[str, List[str]] = {}
+        for slug, e in bots.items():
+            if e.get("display") and e.get("display") != slug:
+                by_display.setdefault(e["display"], []).append(slug)
+        for display, slugs in sorted(by_display.items()):
+            if len(slugs) > 1:
+                problems.append("display name '%s' is used by %s; it resolves to whichever is listed first"
+                                % (display, ", ".join(sorted(slugs))))
+            for other in sorted(bots):
+                if other not in slugs and display in bots[other].get("aliases", []):
+                    problems.append("display name '%s' of %s is also an alias of %s" % (display, ", ".join(slugs), other))
+        return problems
 
     def resolve(self, name: str) -> Tuple[str, bool]:
         """Map any Bot name (slug, display name, historical variant) to its canonical slug.
@@ -604,7 +650,7 @@ class Ledger:
         """Walk every segment. One break_ack may approve one exact link; any other break FAILs.
 
         A passing sealed chain is ok with approved_breaks >= 1. Callers print
-        ``PASS(승인 단절 N건)`` and must not treat that as a chain with no gap.
+        ``PASS (N approved break(s))`` and must not treat that as a chain with no gap.
         """
         bot = safe_name(bot)
         items = self._chain_items(bot)
@@ -1842,11 +1888,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     al = sub.add_parser("alias", help="canonical Bot names: one ASCII slug per Bot, a display name, and historical variants")
     als = al.add_subparsers(dest="what", required=True)
-    s = als.add_parser("add", help="register or extend a Bot: --slug kim-biseo --display 김비서님 --alias kim --alias KimBisunim")
+    s = als.add_parser("add", help="register or extend a Bot: --slug chief-of-staff --display 'Chief of Staff' --alias cos --alias ChiefOfStaff")
     s.add_argument("--slug", required=True)
     s.add_argument("--display")
     s.add_argument("--alias", action="append", default=[], help="historical chain/name variant (repeatable)")
-    als.add_parser("list", help="show slugs, display names, variants and which chains exist on disk")
+    s = als.add_parser("remove", help="drop a registry entry (chains on disk are untouched)")
+    s.add_argument("--slug", required=True)
+    als.add_parser("list", help="show slugs, display names, variants, chains on disk, and registry conflicts")
     s = als.add_parser("strict", help="refuse (instead of warn about) names that are not registered")
     s.add_argument("mode", choices=("on", "off"))
     s = als.add_parser("resolve", help="print the canonical slug for a name")
@@ -2133,6 +2181,15 @@ def _main(argv: Optional[List[str]] = None) -> int:
             unmapped = [c for c in chains if c not in data["bots"] and ledger.canonical(c) == c]
             if unmapped:
                 out.write("unregistered chains: %s\n" % ", ".join(unmapped))
+            conflicts = ledger.alias_conflicts()
+            if conflicts:
+                out.write("conflicts:\n" + "".join("  - %s\n" % c for c in conflicts))
+            return 0
+        if args.what == "remove":
+            slug = safe_name(args.slug).lower()
+            entry = ledger.remove_alias(slug)
+            out.write("removed %s (display=%s); chains on disk untouched; '%s' now resolves to %s\n"
+                      % (slug, entry.get("display", slug), slug, ledger.canonical(slug)))
             return 0
         if args.what == "strict":
             data["strict"] = args.mode == "on"

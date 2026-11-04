@@ -312,33 +312,33 @@ class AliasArchiveSyncTest(unittest.TestCase):
 
     def _seed_variants(self):
         L = self.ledger
-        L.append("kim", {"type": "task_start", "task_id": "a1", "task": "Reconcile invoices", "ts": "2026-02-01T09:00:00Z"})
-        L.append("KimBisunim", {"type": "action", "action": "shell", "target": "ls", "ts": "2026-02-01T09:05:00Z"})
-        L.append("kim-primary", {"type": "task_start", "task_id": "a2", "task": "Reconcile invoices", "ts": "2026-02-01T09:10:00Z"})
-        L.append("kim-primary", {"type": "task_end", "task_id": "a2", "outcome": "ok", "ts": "2026-02-01T09:20:00Z"})
+        L.append("cos", {"type": "task_start", "task_id": "a1", "task": "Reconcile invoices", "ts": "2026-02-01T09:00:00Z"})
+        L.append("ChiefOfStaff", {"type": "action", "action": "shell", "target": "ls", "ts": "2026-02-01T09:05:00Z"})
+        L.append("cos-primary", {"type": "task_start", "task_id": "a2", "task": "Reconcile invoices", "ts": "2026-02-01T09:10:00Z"})
+        L.append("cos-primary", {"type": "task_end", "task_id": "a2", "outcome": "ok", "ts": "2026-02-01T09:20:00Z"})
 
     def test_resolve_and_label_without_aliases_is_unchanged(self):
         self.assertEqual(self.ledger.resolve("ops"), ("ops", True))
         self.assertEqual(self.ledger.label("ops"), "ops")
         with self.assertRaises(SystemExit):
-            self.ledger.resolve("김비서님")
+            self.ledger.resolve("Ωμέγα")
 
     def test_alias_merges_chains_without_rewriting_them(self):
         self._seed_variants()
         heads_before = {c: self.ledger.read_state(c)["head"] for c in self.ledger.bots()}
-        rc, out, _ = run(["alias", "add", "--slug", "kim-biseo", "--display", "김비서님", "--alias", "kim", "--alias", "KimBisunim",
-                          "--alias", "kim-primary"], self.root)
+        rc, out, _ = run(["alias", "add", "--slug", "chief-of-staff", "--display", "Chief of Staff", "--alias", "cos", "--alias", "ChiefOfStaff",
+                          "--alias", "cos-primary"], self.root)
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.ledger.resolve("KimBisunim"), ("kim-biseo", True))
-        self.assertEqual(self.ledger.resolve("김비서님"), ("kim-biseo", True))
-        self.assertEqual(self.ledger.resolve("kim-biseo"), ("kim-biseo", True))
-        self.assertEqual(self.ledger.label("kim"), "김비서님(kim-biseo)")
-        self.assertEqual(sorted(self.ledger.chains_for("kim-biseo")), ["KimBisunim", "kim", "kim-primary"])
-        self.assertEqual(len(self.ledger.records("kim-biseo")), 4)
+        self.assertEqual(self.ledger.resolve("ChiefOfStaff"), ("chief-of-staff", True))
+        self.assertEqual(self.ledger.resolve("Chief of Staff"), ("chief-of-staff", True))
+        self.assertEqual(self.ledger.resolve("chief-of-staff"), ("chief-of-staff", True))
+        self.assertEqual(self.ledger.label("cos"), "Chief of Staff(chief-of-staff)")
+        self.assertEqual(sorted(self.ledger.chains_for("chief-of-staff")), ["ChiefOfStaff", "cos", "cos-primary"])
+        self.assertEqual(len(self.ledger.records("chief-of-staff")), 4)
         # new writes go to the canonical slug; old chains are untouched and still verify
-        rc, out, _ = run(["log", "--bot", "김비서님", "--action", "shell", "--target", "pwd"], self.root)
+        rc, out, _ = run(["log", "--bot", "Chief of Staff", "--action", "shell", "--target", "pwd"], self.root)
         self.assertEqual(rc, 0)
-        self.assertEqual(self.ledger.records("kim-biseo")[-1]["bot"], "kim-biseo")
+        self.assertEqual(self.ledger.records("chief-of-staff")[-1]["bot"], "chief-of-staff")
         self.assertEqual({c: self.ledger.read_state(c)["head"] for c in heads_before}, heads_before)
         for c in self.ledger.bots():
             self.assertTrue(self.ledger.verify(c)["ok"], c)
@@ -350,27 +350,69 @@ class AliasArchiveSyncTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run(["log", "--bot", "park", "--action", "shell", "--target", "ls"], self.root)
         rc, out, _ = run(["alias", "list"], self.root)
-        self.assertIn("kim-biseo", out)
-        self.assertIn("김비서님", out)
+        self.assertIn("chief-of-staff", out)
+        self.assertIn("Chief of Staff", out)
         self.assertIn("unregistered chains: lee", out)
+
+    def test_alias_add_refuses_conflicts_and_remove_keeps_chains(self):
+        L = self.ledger
+        L.append("pa-old", {"type": "note", "detail": "legacy chain", "ts": "2026-02-01T09:00:00Z"})
+        head = L.read_state("pa-old")["head"]
+        run(["alias", "add", "--slug", "pa-old", "--display", "Assistant"], self.root)
+        run(["alias", "add", "--slug", "personal-assistant", "--display", "Personal Assistant", "--alias", "pa2"], self.root)
+        for argv in (["--slug", "personal-assistant", "--alias", "pa-old"],      # another Bot's slug
+                     ["--slug", "editor", "--display", "Assistant"],             # another Bot's display name
+                     ["--slug", "editor", "--alias", "Personal Assistant"],      # display name used as alias
+                     ["--slug", "pa2", "--display", "PA two"]):                  # slug already an alias elsewhere
+            with self.assertRaises(SystemExit):
+                run(["alias", "add"] + argv, self.root)
+        self.assertNotIn("editor", L.aliases()["bots"])
+        rc, out, _ = run(["alias", "remove", "--slug", "pa-old"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("chains on disk untouched", out)
+        rc, _, _ = run(["alias", "add", "--slug", "personal-assistant", "--alias", "pa-old", "--alias", "Ωμέγα"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertEqual(L.resolve("pa-old"), ("personal-assistant", True))
+        self.assertEqual(L.resolve("Ωμέγα"), ("personal-assistant", True))
+        self.assertEqual(L.read_state("pa-old")["head"], head)
+        self.assertTrue(L.verify("pa-old")["ok"])
+        with self.assertRaises(SystemExit):
+            run(["alias", "remove", "--slug", "pa-old"], self.root)
+
+    def test_alias_list_reports_conflicts_left_by_older_versions(self):
+        self.ledger.save_aliases({"strict": False, "bots": {
+            "assistant": {"display": "Assistant", "aliases": []},
+            "personal-assistant": {"display": "Assistant", "aliases": ["assistant", "pa"]},
+            "radar": {"display": "Radar", "aliases": []},
+            "scout": {"display": "Scout", "aliases": ["Radar"]},
+        }})
+        rc, out, _ = run(["alias", "list"], self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("conflicts:", out)
+        self.assertIn("slug 'assistant' is also an alias of personal-assistant", out)
+        self.assertIn("display name 'Assistant' is used by assistant, personal-assistant", out)
+        self.assertIn("display name 'Radar' of radar is also an alias of scout", out)
+        self.ledger.save_aliases({"strict": False, "bots": {"radar": {"display": "Radar", "aliases": []}}})
+        rc, out, _ = run(["alias", "list"], self.root)
+        self.assertNotIn("conflicts:", out)
 
     def test_report_status_tail_merge_and_detect_cross_chain_close(self):
         self._seed_variants()
-        self.ledger.add_alias("kim-biseo", "김비서님", ["kim", "KimBisunim", "kim-primary"])
+        self.ledger.add_alias("chief-of-staff", "Chief of Staff", ["cos", "ChiefOfStaff", "cos-primary"])
         rc, out, _ = run(["report", "--date", "2026-02-01", "--stdout"], self.root)
         self.assertEqual(rc, 0)
-        self.assertIn("## 김비서님(kim-biseo)", out)
+        self.assertIn("## Chief of Staff(chief-of-staff)", out)
         self.assertIn("Chains merged by alias", out)
-        self.assertIn("likely closed as `a2` in chain `kim-primary` (ok)", out)
+        self.assertIn("likely closed as `a2` in chain `cos-primary` (ok)", out)
         self.assertEqual(sum(1 for l in out.splitlines() if l.startswith("## ")), 1)
         rc, out, _ = run(["status"], self.root)
-        self.assertIn("김비서님(kim-biseo)", out)
-        self.assertNotIn("KimBisunim", out)
+        self.assertIn("Chief of Staff(chief-of-staff)", out)
+        self.assertNotIn("ChiefOfStaff", out)
         rc, out, _ = run(["status", "--chains"], self.root)
-        self.assertIn("KimBisunim", out)
+        self.assertIn("ChiefOfStaff", out)
         rc, out, _ = run(["tail", "-n", "1"], self.root)
-        self.assertIn("김비서님(kim-biseo)", out)
-        rc, out, _ = run(["coverage", "--bot", "kim", "--days", "100000"], self.root)
+        self.assertIn("Chief of Staff(chief-of-staff)", out)
+        rc, out, _ = run(["coverage", "--bot", "cos", "--days", "100000"], self.root)
         self.assertEqual(rc, 0)
 
     def test_archive_roundtrip_dedup_redaction_and_verify(self):
