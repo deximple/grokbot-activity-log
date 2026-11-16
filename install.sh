@@ -13,6 +13,7 @@
 #   GBLOG_ROOT     where the ledger lives         (default: /workspace/activity-log if writable, else ~/activity-log)
 #                  a relative path is made absolute before it is used or persisted
 #   GBLOG_REPO     base URL to fetch gblog.py from (default: GitHub raw at $GBLOG_REF)
+#                  an https:// URL is never redirected to another scheme
 #   GBLOG_REF      branch, tag or commit used to build the default URL (default: main; ignored when GBLOG_REPO is set)
 #   GBLOG_SHA256   expected sha256 of gblog.py; the install aborts on mismatch and installs nothing
 set -euo pipefail
@@ -57,7 +58,13 @@ if [ -n "$HERE" ] && [ -f "$HERE/gblog.py" ] && [ -f "$HERE/install.sh" ]; then
   origin="local checkout"
 else
   command -v curl >/dev/null 2>&1 || { echo "curl is required to download gblog.py" >&2; exit 1; }
-  curl -fsSL "$REPO_RAW/gblog.py" -o "$tmp"
+  # An https source stays https: without --proto-redir, `curl -L` would follow a redirect
+  # to plain http (or another scheme). Any other source (file://, a local mirror) is
+  # fetched exactly as given.
+  case "$REPO_RAW" in
+    [Hh][Tt][Tt][Pp][Ss]://*) curl -fsSL --proto-redir '=https' "$REPO_RAW/gblog.py" -o "$tmp" ;;
+    *) curl -fsSL "$REPO_RAW/gblog.py" -o "$tmp" ;;
+  esac
   origin="$REPO_RAW"
 fi
 
@@ -103,6 +110,7 @@ esac
 path_line="export PATH=$(printf %q "$PREFIX"):\"\$PATH\""
 root_line="export GBLOG_ROOT=$(printf %q "$GBLOG_ROOT")"
 modified=0
+failed=0  # set when a startup file could not be written (for example a read-only HOME)
 
 # Lines written without the "# gblog ..." markers (by an older install.sh, or by hand)
 # count too: an `export PATH=` line that already names $PREFIX and an `export GBLOG_ROOT=`
@@ -174,6 +182,7 @@ persist() {  # persist FILE: append the missing blocks to FILE and say what was 
     if printf '\n# gblog PATH\n%s\n' "$path_line" >> "$rc"; then
       what="PATH"
     else
+      failed=1
       echo "warning: could not write $rc" >&2
       return 0
     fi
@@ -190,6 +199,7 @@ persist() {  # persist FILE: append the missing blocks to FILE and say what was 
   elif printf '\n# gblog ROOT\n%s\n' "$root_line" >> "$rc"; then
     what="${what:+$what, }GBLOG_ROOT"
   else
+    failed=1
     echo "warning: could not write $rc" >&2
   fi
   if [ -n "$what" ]; then
@@ -211,7 +221,11 @@ if [ "$found" = 0 ]; then
   persist "$HOME/.profile"  # no rc file exists yet: create ~/.profile
 fi
 
-if [ "$modified" = 0 ]; then
+if [ "$modified" = 0 ] && [ "$failed" = 1 ]; then
+  # A read-only HOME or rc file: say so instead of claiming everything is already configured.
+  echo "no shell startup file could be written (see the warnings above); nothing was persisted"
+  echo "for this shell: $root_line"
+elif [ "$modified" = 0 ]; then
   echo "no shell startup file was modified (already configured)"
 else
   echo "open a new shell to pick up the change"

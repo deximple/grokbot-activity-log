@@ -193,3 +193,124 @@ jobs:
             echo "checksum mismatch was not detected"; exit 1
           fi
           if [ -e "$T/bad/gblog" ]; then echo "gblog was installed despite a checksum mismatch"; exit 1; fi
+      - name: An https source is never redirected to another scheme
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/home" "$T/stub" "$T/cwd"
+          SRC="$PWD"
+          # A stand-in for curl: it records its arguments and "downloads" the checkout's gblog.py. No network is used.
+          cat > "$T/stub/curl" <<'SH'
+          #!/usr/bin/env bash
+          printf '%s\n' "$@" > "$CURL_ARGS"
+          out=""
+          while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-o" ]; then out="${2:-}"; fi
+            shift
+          done
+          [ -n "$out" ] && cp "$CURL_SRC" "$out"
+          SH
+          chmod +x "$T/stub/curl"
+          (
+            cd "$T/cwd"
+            export PATH="$T/stub:$PATH" CURL_ARGS="$T/https.args" CURL_SRC="$SRC/gblog.py"
+            HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" GBLOG_REPO="https://mirror.invalid/gblog" bash < "$SRC/install.sh"
+          )
+          cat "$T/https.args"
+          cmp "$SRC/gblog.py" "$T/bin/gblog"
+          grep -qx -- '--proto-redir' "$T/https.args"
+          grep -qx -- '=https' "$T/https.args"
+          grep -qxF -- 'https://mirror.invalid/gblog/gblog.py' "$T/https.args"
+          # any other source (here file://) is fetched exactly as before
+          (
+            cd "$T/cwd"
+            export PATH="$T/stub:$PATH" CURL_ARGS="$T/file.args" CURL_SRC="$SRC/gblog.py"
+            HOME="$T/home" GBLOG_PREFIX="$T/bin2" GBLOG_ROOT="$T/ledger" GBLOG_REPO="file://$SRC" bash < "$SRC/install.sh"
+          )
+          cat "$T/file.args"
+          cmp "$SRC/gblog.py" "$T/bin2/gblog"
+          if grep -q -- 'proto-redir' "$T/file.args"; then echo "--proto-redir was passed for a non-https source"; exit 1; fi
+
+  restricted-env:
+    name: restricted env (py${{ matrix.python-version }}, ASCII stdio, read-only HOME)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.12"
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Create a read-only HOME
+        run: |
+          # HOME is switched per step (not for the whole job), so checkout and setup-python keep their real HOME.
+          RO_HOME="$RUNNER_TEMP/ro-home"
+          mkdir -p "$RO_HOME"
+          chmod 0555 "$RO_HOME"
+          if ( : > "$RO_HOME/probe" ) 2>/dev/null; then
+            echo "::error::$RO_HOME is still writable (is this job running as root?); the read-only HOME checks would prove nothing"
+            exit 1
+          fi
+          echo "RO_HOME=$RO_HOME" >> "$GITHUB_ENV"
+      - name: Unit tests (ASCII stdio, read-only HOME)
+        env:
+          PYTHONIOENCODING: ascii
+        run: |
+          export HOME="$RO_HOME"
+          python -m unittest discover -s tests
+      - name: CLI with ASCII stdio and a read-only HOME
+        env:
+          PYTHONIOENCODING: ascii
+        run: |
+          export HOME="$RO_HOME"
+          # A ledger outside HOME works as usual. Text that ASCII cannot encode is escaped, never fatal.
+          export GBLOG_ROOT="$RUNNER_TEMP/gblog-restricted"
+          ./bin/gblog init
+          ./bin/gblog alias add --slug buero --display "Büro Chef"
+          ./bin/gblog note --bot buero --detail "café ☕ visit"
+          ./bin/gblog tail -n 1 | grep -F 'Chef(buero)' >/dev/null
+          ./bin/gblog status | grep -F 'Chef(buero)' >/dev/null
+          for cmd in "tail -n 1" "status" "report --stdout" "alias list" "export"; do
+            # every byte written to an ASCII stdout must be ASCII
+            # shellcheck disable=SC2086
+            ./bin/gblog $cmd | python -c 'import sys; sys.stdin.buffer.read().decode("ascii")'
+          done
+          ./bin/gblog export | python -c 'import json,sys; [json.loads(line) for line in sys.stdin]'
+          ./bin/gblog verify --all
+          # A ledger root under the read-only HOME: a write is a one-line error (exit 2), never a traceback,
+          # and the read-only commands still answer without creating anything.
+          export GBLOG_ROOT="$HOME/activity-log"
+          rc=0
+          ./bin/gblog note --bot ci --detail x 2> "$RUNNER_TEMP/ro-err.txt" || rc=$?
+          cat "$RUNNER_TEMP/ro-err.txt" >&2
+          if [ "$rc" -ne 2 ]; then echo "note under a read-only HOME exited $rc, expected 2"; exit 1; fi
+          grep -q '^error: ' "$RUNNER_TEMP/ro-err.txt"
+          if grep -q 'Traceback' "$RUNNER_TEMP/ro-err.txt"; then echo "a traceback was printed for a read-only ledger root"; exit 1; fi
+          ./bin/gblog status
+          ./bin/gblog verify --all
+          if [ -n "$(ls -A "$HOME")" ]; then echo "something was written into the read-only HOME"; ls -la "$HOME"; exit 1; fi
+      - name: install.sh with a read-only HOME
+        env:
+          PYTHONIOENCODING: ascii
+        run: |
+          T="$(mktemp -d)"
+          rc=0
+          HOME="$RO_HOME" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash ./install.sh > "$T/out.txt" 2> "$T/err.txt" || rc=$?
+          cat "$T/out.txt"
+          cat "$T/err.txt" >&2
+          if [ "$rc" -ne 0 ]; then echo "install.sh exited $rc with a read-only HOME, expected 0"; exit 1; fi
+          HOME="$RO_HOME" "$T/bin/gblog" --version
+          test -d "$T/ledger/logs"
+          # The startup file could not be written: that is a warning, and the script must say so.
+          grep -q '^warning: could not write ' "$T/err.txt"
+          grep -q '^no shell startup file could be written' "$T/out.txt"
+          if grep -q 'already configured' "$T/out.txt"; then echo "install.sh claimed the shell was already configured"; exit 1; fi
+          if [ -n "$(ls -A "$RO_HOME")" ]; then echo "install.sh wrote into the read-only HOME"; ls -la "$RO_HOME"; exit 1; fi
