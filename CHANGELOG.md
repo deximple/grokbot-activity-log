@@ -14,12 +14,45 @@ their release dates were not recorded.
 
 Implements the round-2 audit of 2026-11-16. The item ids in parentheses (R-01 … R-25) refer to that
 audit. The record format and the hash rule are unchanged. A healthy ledger prints the same
-`gblog verify --all` output as with 0.6.0.
+`gblog verify --all` output as with 0.6.0, apart from the new `!` warning lines listed below (for
+example for a symlinked `archive/<bot>` directory or a `gblog log --type archive` record).
 
 This release also implements the findings of two adversarial security reviews of that tree. Their
 ids are written `A:…` (review A) and `B:…` (review B). Findings that R-01 … R-15 had already closed
 are not repeated below: `A:H-1` and `B:H1` (R-01), `A:H-3` and `B:M6` (R-09), `A:M-5` (R-08),
 `B:L7` (R-06), and the crash paths of `A:M-3`, `B:M1` and `B:L1` covered by R-05, R-06 and R-10.
+
+### Known open findings
+
+The round-3 audit of 2026-11-16 (finding ids `T-…`, work items `W-…`) compared this section with
+the code. The items below are **not** in the code yet. They were taken out of the lists further
+down and return there when their fix is merged. 0.6.1 stays "Unreleased" until then.
+
+- **Version string (T-03, W-01).** `gblog --version` in this tree still prints `gblog 0.6.0`,
+  although the fixes listed below are present. The number changes with the release step.
+- **`ts` form (T-01 e, W-03).** `verify` does not check that `ts` is written in the normalised form
+  `YYYY-MM-DDTHH:MM:SSZ`, in any mode. The planned check is `--strict` only, because records
+  written with a free-form `--ts` before 0.6 are valid.
+- **`capture files` baseline (T-11, W-07).** There is no `--record-baseline` flag. A new baseline
+  is announced on stderr only; the stdout line still reads `files: 0 change(s) …`. The very first
+  run for a chain prints no notice.
+- **Shell hook and variables (T-04, W-10).** The hook's skip rule treats every `$` as a possible
+  substitution. A plain `gblog log --bot "$BOT" --task-id "$TID" …` typed at a prompt is therefore
+  logged as an auto shell action, which lowers shell coverage.
+- **`sync` and invalid chain directories (T-09, W-05).** `sync` stamps `last_sync` on every
+  directory under `logs/`, including one whose name is not a valid chain key, and so creates
+  `state/<dir>.json` and `state/<dir>.lock` for it.
+- **`alias list` and `anchor` output (T-12, W-11).** `alias list` exits 2 when a directory such as
+  `logs/---` exists and at least one Bot is registered. `anchor` prints the problem lines of a
+  missing chain without neutralising control characters.
+- **Clamped records in two daily reports (T-14, W-12).** A record whose `ts` day and
+  `clock_regressed` day differ is listed by `report --date` for both days. `status` counts it once.
+- **Dead code (R-15, T-05, W-15).** `_exit2`, `_assert_tail_matches`, `_BREAK_KEYS` and the
+  re-entrancy table `_Lock._held` are still in `gblog.py`. Behaviour is not affected.
+
+The other fixes that the round-3 audit listed as missing (T-01 a to d and f, the duplicate-key
+warning of T-01 e, and the symlink findings of T-02) are in the code, and their tests carry no
+`expectedFailure` marker.
 
 ### Behaviour changes
 
@@ -79,6 +112,8 @@ Read these before upgrading a routine or a script that branches on output or exi
   before. Every change of `origin` is written to the ledger as a `sync` record with the old and the
   new URL (credentials removed). In 0.6.0 any `gblog` caller could silently and permanently re-point
   the backup to another host.
+- **`sync --re` is ambiguous and exits 2.** The new flag `--replace-remote` shares that prefix with
+  `--remote`. `--rem` still works. `--r` on `sync` now also matches `--replace-remote`.
 - **More GitHub URLs are checked by the public-remote guard (A:H-2, B:H2).** A remote is classified
   by its parsed host, not by a pattern over the URL text.
   - `github.com`, `www.github.com`, `ssh.github.com` and any other `*.github.com` host count as
@@ -114,13 +149,15 @@ Read these before upgrading a routine or a script that branches on output or exi
   Records already on disk are unaffected.
 - **Symlinks are not followed on write (A:M-4, B:L8).** Day files, state, anchor, report, tuning,
   snapshot, archive and lock files are opened without following a symlink at the final path
-  component, and temporary files get unique names. A planted symlink makes the command exit 2
+  component, and temporary files get per-process names (`<path>.<pid>.tmp`). A planted symlink makes the command exit 2
   instead of writing through it.
 - **A `*.jsonl` entry that is not a regular file is FAIL (B:L2).** A FIFO, directory or device in a
   chain directory is reported by `verify` and never opened. It used to hang `append` (while holding
   the lock) and `verify --all`.
-- **Archive records are checked more strictly (B:L4).** `verify` reports an `archive` record without
-  a `path` or a 64-hex `sha256`, and a path whose file name is not `<sha256>.gz`. Two records that
+- **Archive records are checked more strictly (B:L4).** `verify` FAILs an `archive` record that has
+  a `sha256` but no `path`, a `path` but no 64-hex `sha256`, or a path whose file name is not
+  `<sha256>.gz`. A record that names neither (as `gblog log --type archive` writes) is a `!`
+  warning, and a problem with `--strict`: it is a claim that no stored file backs. Two records that
   name the same path with different hashes are both checked. `archive` re-hashes an existing file
   before it treats new content as "already stored", and rewrites it when it does not match.
 - `alias add` refuses a display name or variant that contains control characters or line breaks
@@ -131,8 +168,9 @@ Read these before upgrading a routine or a script that branches on output or exi
 - `capture files` (A:L-2, B:L6):
   - `--limit` below 1 exits 2;
   - a run with more changes than `--limit` no longer forgets the changes it did not list;
-  - a new baseline (missing or unreadable snapshot, changed `--path`) is said on the output line
-    and on stderr instead of looking like "0 changes".
+  - a new baseline is announced with a `notice:` line on stderr: for an unreadable snapshot, a
+    changed `--path`, and a snapshot that is missing although the chain already holds
+    file-capture records. The stdout line is unchanged (see "Known open findings").
 - The shell hook skips only a plain `gblog …` command. A command line that merely contains the word
   `gblog`, or chains it with `;`, `&`, `|` or a substitution, is logged. A command that starts with
   `-` is logged instead of being dropped. A hook that is already installed is not updated; see
@@ -143,13 +181,18 @@ Read these before upgrading a routine or a script that branches on output or exi
 - A record that was appended while `state/<bot>.json` was missing or unreadable carries the new
   field `state_adopted`, and `verify` warns about every such record. In 0.6.0 the "state missing"
   warning disappeared with the first append (B:M8).
+  `sync` and `capture browser` append no record when they re-create state from the log tail. They
+  write the key `state_adopted` (`how`, `seq`, `ts`) into `state/<bot>.json` instead, and `verify`
+  warns about that key too. Both markers are permanent: later appends and `state rebuild` keep
+  them. Report the `!` line once with its cause (`docs/DESIGN.md`, section 4).
 - Terminal output (`tail`, `status`, `spool list`, `alias list`, `verify` problem and warning lines)
   no longer contains raw control characters taken from records, file names or display names. Text
   without control characters prints as before (A:L-1, B:M7).
-- New `!` warnings in `verify`: a non-string text field, a `ts` that is not in normalised form, a
-  non-standard number, a line with duplicate keys, a symlink among the chain's files, and a
-  `state_adopted` record. `--strict` turns all but the last into problems (A:M-2, A:M-4, A:L-5,
-  B:M7, B:M8, B:L10).
+- New `!` warnings in `verify`: a non-string text field, a non-standard number, a line with
+  duplicate keys, a symlink among the chain's files, an `archive` record that names neither a
+  `path` nor a `sha256`, and a `state_adopted` marker (on a record or in state). `--strict` turns
+  all but the last into problems (A:M-2, A:M-4, A:L-5, B:L4, B:M7, B:M8, B:L10). A line that is
+  only reformatted is still silent without `--strict`.
 - An unexpected internal error is printed as one `error:` line with a non-zero exit code. Set
   `GBLOG_DEBUG=1` to see the traceback (A:M-3).
 
@@ -211,11 +254,12 @@ Read these before upgrading a routine or a script that branches on output or exi
 - `tune` records store `count` in the `proposal` snapshot (R-11).
 - In-memory record key `bot_field` (R-04).
 - `sync --replace-remote` (B:H3).
-- `capture files --record-baseline`: also append an `auto` note when a new baseline is taken
-  (A:L-2).
-- Record field `state_adopted` (`missing` or `unreadable`) (B:M8).
+- Record field `state_adopted` (`missing` or `unreadable`), and the key `state_adopted` in
+  `state/<bot>.json` (B:M8).
 - `GBLOG_DEBUG` environment variable (A:M-3).
-- `state/anchors.lock`, taken around the day-rollup merge of `gblog anchor` (A:L-3, B:L8).
+- `state/.anchors.lock`, held for the whole run of `gblog anchor`, so that two concurrent runs
+  cannot lose each other's day-rollup entries (A:L-3, B:L8). The leading dot keeps it apart from
+  the lock file of a Bot named `anchors`.
 - `SECURITY.md`: "Auditing a clone of the backup" (A:M-4).
 
 ### Changed
@@ -229,11 +273,11 @@ Read these before upgrading a routine or a script that branches on output or exi
   stored at decision time. Evidence ageing out of the window no longer brings it back early (R-11).
 - `task-end` looks for the matching `task-start` newest day first and stops at the first hit (R-13).
 - Atomic JSON writes use a per-process temporary file name (R-14).
-- Dead code and duplicate helpers were removed; behaviour is unchanged (R-15).
-- State, alias-registry, proposal, snapshot and archive writes use uniquely named temporary files
-  (A:L-3, B:L8).
-- `capture browser` saves its marker per history file and opens the copied database read-only
-  (A:L-2).
+- State, alias-registry, proposal, snapshot and archive writes use per-process temporary file names
+  (`<path>.<pid>.tmp`) (A:L-3, B:L8).
+- `capture browser` keeps one marker per history file. When an append fails part-way through an
+  import, the markers of the rows already imported are saved first, so the next run does not
+  import them again (A:L-2).
 
 ### Fixed
 
@@ -271,6 +315,11 @@ Read these before upgrading a routine or a script that branches on output or exi
   the weekly tune routine only.
 - Threat model, guarantees, non-guarantees, redaction lists and the private-remote policy were
   updated for the security-review fixes above (`SECURITY.md`, `docs/DESIGN.md`, README).
+- Round-3 documentation pass (W-22, W-23). Claims that the code does not meet yet were moved to
+  "Known open findings" above. Corrected: the lock name `state/.anchors.lock` and what it covers,
+  the two `state_adopted` markers and their permanence, the archive-record rules, the day-rollup
+  problem text and the `verify` warning list. Step 1 of the daily routine now uses
+  `--skip-archives`.
 
 ## [0.6.0] - 2026-11-16
 

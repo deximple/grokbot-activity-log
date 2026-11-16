@@ -16,8 +16,9 @@ Every day at 23:50 (my time zone), run the ledger audit. gblog days are UTC days
    If it fails, report "ledger missing" and stop. Do not run any gblog command: gblog would create an empty ledger.
    If it passes, open this run's task with `gblog task-start --bot <your slug> --source routine --task "Daily ledger audit"`.
 1. Rollback check. Find the "Chain heads" block you posted in this conversation on the previous run.
-   For each chain in it run `gblog verify --bot <slug> --contains <yesterday's head>` (the slug exactly as posted;
+   For each chain in it run `gblog verify --bot <slug> --skip-archives --contains <yesterday's head>` (the slug exactly as posted;
    one `--contains` per 64-hex head posted for that chain).
+   `--skip-archives` only leaves out the re-hash of archived files here; step 2 re-hashes them.
    `expected hash ... not found in chain`, or `no chain on disk` for a chain that was posted yesterday, is a ROLLBACK:
    report it under that word with the chain name and the full hash. Do not try to fix it.
    If there is no previous "Chain heads" block, say "no previous heads to check" and continue.
@@ -81,6 +82,11 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
   4 tail mismatch. After exit 2, a usage error (an argparse message, `error: --…`) wrote nothing. An
   environment error (`error: <system message>`) may already have written the record: check
   `gblog tail -n 1` before retrying.
+- **Step 1 skips archives; step 2 is two full passes.** The rollback check only needs the chain walk, so
+  step 1 passes `--skip-archives`. A chain that has archive records then prints `(archives not checked)`
+  on its line. In step 2, `gblog verify --all --record` re-hashes every archived file. `gblog anchor` then
+  verifies every chain again, archives included, before it writes the anchors. Two full passes in step 2
+  are expected; do not drop one to save time.
 - **No capture step.** `gblog capture browser` and `gblog capture files` run in the weekly tune routine
   (`docs/routine-weekly-tune.md`, step 2) and nowhere else. The shell hook needs no routine.
 

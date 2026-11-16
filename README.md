@@ -140,13 +140,18 @@ What capture does **not** see:
   It also skips a command identical to the one typed just before it.
   The hook reads bash history, so a command that bash keeps out of history (a leading space with
   `HISTCONTROL=ignorespace` or `ignoreboth`) is not captured. Only a plain `gblog …` command is skipped;
-  a command line that merely contains the word, or chains `gblog` with `;`, `&&` or `|`, is logged.
+  a command line that merely contains the word, chains `gblog` with `;`, `&&` or `|`, redirects with
+  `<` or `>`, or uses a command substitution (`$(…)` or backticks) is logged. A hook installed from
+  this tree also logs a `gblog` command that contains a shell variable (`--task-id "$TID"`), which
+  lowers shell coverage; see "Known open findings" in [`CHANGELOG.md`](CHANGELOG.md).
 - Browser capture stores **scheme://host/path and the page title** (first 120 characters, in `detail`).
   It stores no query string or fragment. After a missed run it resumes from its per-history marker.
   History files it could not read are reported as `, N unreadable`.
 - File capture compares against a snapshot in `state/capture-files-<bot>.json`. If that file is missing,
-  unreadable or was made for another `--path`, the run takes a new baseline and logs no changes. gblog says
-  so on its output line and on stderr; treat an unexpected new baseline as a gap in the evidence.
+  unreadable or was made for another `--path`, the run takes a new baseline and logs no changes. gblog prints
+  a `notice:` line on stderr for an unreadable snapshot, a changed `--path`, and a snapshot that is missing
+  although the chain already holds file-capture records. The stdout line still starts with
+  `files: 0 change(s)`, so read stderr. Treat an unexpected new baseline as a gap in the evidence.
 - **On a shared computer, file and browser capture cannot attribute activity to one Bot.** All Bots
   share one browser profile and one `/workspace`, so every Bot that runs `capture browser` or
   `capture files` imports the same visits and file changes. Read per-Bot coverage for those two
@@ -260,6 +265,11 @@ not run `state rebuild` or `spool replay` on its own; the operator decides.
   `state/<bot>.json` is replaced, the next append finds state exactly one record behind. It adopts the tail,
   prints `notice: recovered state/<bot>.json after an interrupted append` on stderr and continues. Every
   other mismatch is still refused with exit 4.
+- **Lost state file.** When `state/<bot>.json` is missing or unreadable and a command re-creates it from the
+  log tail, `verify` prints a `!` line from then on: for the record that adopted the tail (`append`), or for
+  the state file itself (`sync`, `capture browser`). These adoption lines are permanent, and no command
+  dismisses them. Report each one once with its cause, and check the chain against a head kept off the
+  computer with `gblog verify --bot <chain> --contains <hash>`.
 - **`gblog state rebuild --bot B`** rewrites `state/<bot>.json` from the log tail when state is missing,
   unreadable, reset to genesis or behind the log, and the chain has no other problem. It appends a `note`
   recording what state said before. State *ahead* of the log is always refused (`restore the log from backup`).
@@ -299,7 +309,7 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
   than the Bot's last record and not in the future; otherwise gblog exits 2 and writes nothing. Put a
   historical time in `--detail`.
 - Spell flags out. Abbreviations that became ambiguous in 0.6 exit 2: `--s` on `log`, `archive` and `tune`;
-  `--r` on `verify`, `sync`, `tune` and `capture shell-hook`; `--a`, `--al` and `--allow` on `sync`.
+  `--r` on `verify`, `sync`, `tune` and `capture shell-hook`; `--re`, `--a`, `--al` and `--allow` on `sync`.
   The full table is under "Upgrading".
 - `log --type` still accepts housekeeping types (`verify`, `sync`, `tune`, `archive`). A `verify ok` record
   in the ledger is therefore a claim, not proof; rerun `gblog verify`.
@@ -307,7 +317,7 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 | Exit | Meaning |
 |---|---|
 | 0 | OK. For `verify`: `OK` or `PASS (N approved break(s))`; `!` warnings do not change it. |
-| 1 | Integrity FAIL (`verify`, `anchor`, unknown `--bot` on those, `--contains` miss), or `sync` committed but did not push. |
+| 1 | Integrity FAIL (`verify`, `anchor`, unknown `--bot` on those, `--contains` miss); `sync` committed but did not push, or found committed content that differs from the files on disk (nothing is pushed then); or an unexpected internal error (`error: internal error …`). |
 | 2 | Usage or environment error. A **usage error** wrote nothing: an argparse message, or `error: --…` and similar lines for a bad flag or value, an invalid `--ts` or date, an unregistered name in strict mode, a reserved name, a `seal` or `state rebuild` refusal. An **environment error** (`error: <system message>`, for example `error: No space left on device: <path>`, or `git failed: …` from `sync`) may already have written the record, so check `gblog tail --bot <bot> -n 1` before you retry. `spool replay` exits 2 when it had to skip an unreadable spool file; it lists the events it did replay. |
 | 3 | Policy refusal: `sync` will not push to a public or unconfirmed-visibility GitHub remote. |
 | 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. |
@@ -386,7 +396,8 @@ Spell the flag out in routines and scripts.
 | Command | No longer accepted | Now ambiguous between | Shortest form that still works |
 |---|---|---|---|
 | `verify` | `--r` | `--record`, `--root` | `--rec` |
-| `sync` | `--r` | `--remote`, `--root` | `--rem` |
+| `sync` | `--r` | `--remote`, `--replace-remote`, `--root` | `--rem` |
+| `sync` | `--re` (from 0.6.1) | `--remote`, `--replace-remote` | `--rem` |
 | `sync` | `--a`, `--al`, `--allow` | `--allow-public`, `--allow-unknown-visibility` | `--allow-p` |
 | `tune` | `--r` | `--reject`, `--root` | `--rej` |
 | `tune` | `--s` | `--stdout`, `--summary` | `--std` |

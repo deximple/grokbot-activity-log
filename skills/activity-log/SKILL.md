@@ -165,6 +165,8 @@ gblog capture browser --bot "$BOT"                    # new visits from browser 
 gblog capture files --bot "$BOT" --path /workspace    # changed files -> ledger
 gblog coverage                                        # % of observed actions you also reported
 ```
+- **Reinstall the hook after upgrading gblog** (README, Upgrading, item 6). An upgrade does not change a hook
+  that is already in `~/.bashrc`. The step edits a shell startup file, so the operator does it.
 - **The shell hook is interactive bash only.** Non-interactive tool shells and zsh are not captured, so the
   hook never replaces your own `gblog log --action shell` records.
 - **Where capture runs.** `capture browser` and `capture files` run in one place: step 2 of the weekly tune

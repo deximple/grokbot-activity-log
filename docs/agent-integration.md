@@ -363,8 +363,8 @@ Common rules:
 | # | Command | Notes |
 |---|---|---|
 | 0 | `test -d "$GBLOG_ROOT/logs"` | Run this before any gblog command. If it fails, report "ledger missing" and stop. |
-| 1 | `gblog verify --bot <chain> --contains <yesterday's 64-hex head>` | One call per chain posted on the previous run. `expected hash … not found in chain` or `no chain on disk` means a rollback. |
-| 2 | `gblog verify --all --record`, then `gblog anchor` | Run `anchor` even if `verify` exited 1. |
+| 1 | `gblog verify --bot <chain> --skip-archives --contains <yesterday's 64-hex head>` | One call per chain posted on the previous run. `expected hash … not found in chain` or `no chain on disk` means a rollback. Archived files are re-hashed in step 2. |
+| 2 | `gblog verify --all --record`, then `gblog anchor` | Run `anchor` even if `verify` exited 1. `anchor` verifies every chain again, so two full passes are expected. |
 | 3 | Post a "Chain heads" block | Take the full heads from `anchors/<chain>.json`: `head`, or every entry of `segment_heads` for a FAIL chain. |
 | 4 | `gblog status`, `gblog spool list` | Include `ALERT` and `CLOCK` lines and the names of the alert files. |
 | 5 | `gblog archive --bot ledger --kind transcript --file <file> --detail "<slug> transcript"` | One call per exported transcript. |
@@ -474,7 +474,7 @@ problems=""
 step() { "$@"; rc=$?; [ "$rc" -eq 0 ] || problems="$problems [exit $rc: $*]"; return 0; }
 
 # 1. Rollback check: one call per chain listed in yesterday's "Chain heads" block.
-step gblog verify --bot ops --contains "<64-hex head of ops posted yesterday>"
+step gblog verify --bot ops --skip-archives --contains "<64-hex head of ops posted yesterday>"
 
 # 2. Verify and anchor every chain. A FAIL (exit 1) is reported, and the run continues.
 step gblog verify --all --record

@@ -46,7 +46,8 @@ output. Run the newest 0.6.x: 0.6.0 still reports an emptied chain as `OK … 0 
 state file survives, and does not refuse reserved bot names on append. It also pushes to a GitHub
 remote written with a port, as `ssh.github.com` or through an ssh host alias after only a warning,
 and lets `gblog sync --remote` re-point an existing backup remote. All of these are fixed in 0.6.1 (see
-[`CHANGELOG.md`](CHANGELOG.md)).
+[`CHANGELOG.md`](CHANGELOG.md)). 0.6.1 is not released yet: a checkout that contains these fixes
+still prints `gblog 0.6.0`, and the CHANGELOG lists what is still open under "Known open findings".
 
 ## Threat model (summary)
 
@@ -78,8 +79,10 @@ transcript where the daily routine posts chain heads, and a git remote that reje
 - an edited record;
 - a deleted, inserted, re-ordered or duplicated line;
 - a forged `break_ack`;
-- a modified or missing archived file, and an `archive` record that is not addressed by its own
-  hash (`archive/<bot>/<date>/<sha256>.gz`);
+- a modified or missing archived file, and an `archive` record whose path is not addressed by its
+  own hash (`archive/<bot>/<date>/<sha256>.gz`) or that carries only one of `path` and `sha256`.
+  A record that names no file at all (`gblog log --type archive` writes one) is a `!` warning, and
+  FAIL with `--strict`: it is a claim, not stored evidence;
 - a truncated tail, an emptied chain or a rewritten chain, as long as at least one witness survives:
   `state/<bot>.json`, an anchor or anchor-history entry, or a head you pass to
   `verify --contains`;
@@ -101,7 +104,9 @@ Two properties of the check itself are guaranteed too:
 `verify` keeps warning about every record that was appended while `state/<bot>.json` was missing or
 unreadable (the record carries `state_adopted`). An append can therefore no longer erase the
 "state is missing" warning. It stays a warning: gblog cannot tell a lost state file from a hidden
-truncation.
+truncation. When `sync` or `capture browser` re-creates state, the marker is the key
+`state_adopted` in the state file, and `verify` warns about it in the same way. These `!` lines
+are permanent; report each one once with its cause.
 
 **Not guaranteed.**
 
