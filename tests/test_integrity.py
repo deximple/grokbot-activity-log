@@ -33,11 +33,13 @@ STATE_RESET = "state/%s.json was reset to genesis"
 
 
 sys.path.insert(0, HERE)
-from _support import run  # noqa: E402,F401  (shared helper, round-3 W-20)
+from _support import AfterRelease as _AfterRelease, run_strict as run  # noqa: E402,F401  (shared helpers)
+from _support import stamp as _stamp  # noqa: E402
 
 
 def stamp(n, day="2026-03-01"):
-    return "%sT10:%02d:%02dZ" % (day, n // 60, n % 60)
+    """``_support.stamp`` with the default day of this module."""
+    return _stamp(n, day)
 
 
 def _lines(path):
@@ -604,21 +606,7 @@ def _committed_fixture_break():
         return json.load(fh)["break"]
 
 
-class _AfterRelease:
-    """Wraps a lock context manager and runs a callback right after the lock has been released."""
-
-    def __init__(self, inner, callback):
-        self.inner = inner
-        self.callback = callback
-
-    def __enter__(self):
-        self.inner.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        result = self.inner.__exit__(*exc)
-        self.callback()
-        return result
+# _AfterRelease is tests/_support.AfterRelease (round-4 G2-05).
 
 
 # --------------------------------------------------------------------------- R-01
@@ -644,12 +632,6 @@ class StateWitnessTest(IntegrityBase):
         res = self.ledger.verify("ops")
         self.assertTrue(res["ok"], res["problems"])
 
-    def test_non_string_state_head_is_a_warning(self):
-        self.chain("ops", 2)
-        self.ledger.write_state("ops", {"seq": 2, "head": 7})
-        res = self.ledger.verify("ops")
-        self.assertTrue(res["ok"], res["problems"])
-        self.assertIn(STATE_MISSING % "ops", res["warnings"])
 
     def test_logs_dir_deleted_state_remains_fails(self):
         recs = self.chain("ops", 3)

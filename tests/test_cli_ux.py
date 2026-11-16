@@ -38,7 +38,8 @@ import gblog  # noqa: E402
 
 GIT = shutil.which("git")
 sys.path.insert(0, HERE)
-from _support import GIT_ENV, run, run_raw, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import GIT_ENV, run_raw, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 DAY = "2024-06-01"
 # every chain of the Bot registered by CliBase.seed_variants()
 VARIANTS = ("ChiefOfStaff", "chief-of-staff", "cos", "cos-primary")
@@ -71,8 +72,8 @@ class CliBase(unittest.TestCase):
         env = mock.patch.dict(os.environ, GIT_ENV)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("GBLOG_TASK", None)
-        os.environ.pop("GBLOG_ROOT", None)
+        for key in ("GBLOG_TASK", "GBLOG_ROOT", "GBLOG_DEBUG", "GBLOG_BOT"):
+            os.environ.pop(key, None)
 
     # -- helpers
     def chain(self, bot):

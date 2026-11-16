@@ -46,7 +46,10 @@ GIT = shutil.which("git")
 BASH = shutil.which("bash")
 DAY = "2024-06-01"
 sys.path.insert(0, HERE)
-from _support import GIT_ENV, deep_nesting, run, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import GIT_ENV, deep_nesting, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import AfterRelease as _AfterRelease, FakeBody as _Body  # noqa: E402  (round-4 G2-05)
+from _support import chrome_history, git, write_raw_chain  # noqa: E402
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 from _support import run_cli as _support_run_cli  # noqa: E402
 PIN_MSG = "break_ack is not the pinned kim-biseo 2026-11-02 approval"
 FIXTURE_LINE = "      ! fixture break_ack honoured: this root is a temporary test copy"
@@ -61,8 +64,7 @@ def run_cli(argv, root, extra_env=None, timeout=120):
     return _support_run_cli(argv, root, extra_env=extra_env, timeout=timeout)
 
 
-def git(*args, check=True):
-    return subprocess.run(["git"] + list(args), check=check, capture_output=True, text=True).stdout
+# git(*args, check=True) is tests/_support.git: it never inherits GIT_DIR or GIT_INDEX_FILE (K6-05).
 
 
 def visibility(public, reason="test"):
@@ -70,44 +72,7 @@ def visibility(public, reason="test"):
     return mock.patch.object(gblog, "remote_visibility", return_value={"public": public, "reason": reason})
 
 
-def write_raw_chain(root, bot, extras, day=DAY):
-    """Hash-valid lines written straight to logs/<bot>/<day>.jsonl, bypassing gblog; state names the last one.
-
-    ``extras`` holds one dict per record; its keys override the default fields before the hash is computed."""
-    d = os.path.join(root, "logs", bot)
-    os.makedirs(d, exist_ok=True)
-    os.makedirs(os.path.join(root, "state"), exist_ok=True)
-    prev, recs = gblog.GENESIS, []
-    with open(os.path.join(d, day + ".jsonl"), "w", encoding="utf-8") as fh:
-        for i, extra in enumerate(extras, 1):
-            rec = {"v": 1, "seq": i, "ts": stamp(i, day), "bot": bot, "type": "note", "detail": "raw %d" % i, "prev": prev}
-            rec.update(extra)
-            rec["hash"] = gblog.compute_hash(rec)
-            prev = rec["hash"]
-            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
-            recs.append(rec)
-    with open(os.path.join(root, "state", bot + ".json"), "w", encoding="utf-8") as fh:
-        json.dump({"seq": len(recs), "head": prev, "updated": stamp(len(recs), day)}, fh)
-    return recs
-
-
-def chrome_history(directory, visits):
-    """A Chrome-style History database. ``visits`` is [(url, title, seconds ago)]."""
-    prof = os.path.join(directory, "Default")
-    os.makedirs(prof)
-    path = os.path.join(prof, "History")
-    now = int((time.time() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
-                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        for i, (url, title, age) in enumerate(visits, 1):
-            conn.execute("INSERT INTO urls VALUES (?, ?, ?)", (i, url, title))
-            conn.execute("INSERT INTO visits VALUES (?, ?, ?)", (i, i, now - age * 1_000_000))
-        conn.commit()
-    finally:
-        conn.close()
-    return path
+# write_raw_chain and chrome_history are shared helpers of tests/_support.py (round-4 G2-05).
 
 
 def ledger_mentions(root, needle):
@@ -131,37 +96,7 @@ def ledger_mentions(root, needle):
     return False
 
 
-class _Body:
-    """Stand-in for the object urlopen() returns."""
-
-    def __init__(self, data):
-        self.data = data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self.data
-
-
-class _AfterRelease:
-    """Wraps a lock context manager and runs a callback right after the lock has been released."""
-
-    def __init__(self, inner, callback):
-        self.inner = inner
-        self.callback = callback
-
-    def __enter__(self):
-        self.inner.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        result = self.inner.__exit__(*exc)
-        self.callback()
-        return result
+# _Body and _AfterRelease are tests/_support.FakeBody and AfterRelease (round-4 G2-05).
 
 
 class Base(unittest.TestCase):
@@ -174,7 +109,7 @@ class Base(unittest.TestCase):
         env = mock.patch.dict(os.environ, GIT_ENV)
         env.start()
         self.addCleanup(env.stop)
-        for key in ("GBLOG_TASK", "GBLOG_ROOT"):
+        for key in ("GBLOG_TASK", "GBLOG_ROOT", "GBLOG_DEBUG", "GBLOG_BOT"):
             os.environ.pop(key, None)
 
     def path(self, *parts):
@@ -338,7 +273,9 @@ class RemoteGuardTest(Base):
         with visibility(None, "not a github.com remote; visibility unknown"):
             rc, out, err = run(["sync", "--remote", legit], self.root)
             self.assertEqual(rc, 0, out + err)
-            run(["sync", "--remote", attacker], self.root)
+            rc, out, err = run(["sync", "--remote", attacker], self.root)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--replace-remote", err)
         self.assertEqual(git("-C", self.root, "remote", "get-url", "origin").strip(), legit)
         self.assertEqual(git("--git-dir", attacker, "rev-list", "--all", "--count").strip(), "0")
 
@@ -613,7 +550,8 @@ class ReaderRobustnessTest(Base):
             return real(ledger, bot, *args, **kwargs)
 
         with mock.patch.object(gblog.Ledger, "verify", flaky):
-            rc, out, err = run(["verify", "--all"], self.root)
+            rc, out, err = run(["verify", "--all"], self.root, internal_ok=True)  # "verify aborted" is expected
+        self.assertIn("      - verify aborted: RuntimeError: unexpected bug while walking aaa", out.splitlines())
         self.assertEqual(rc, 1, out + err)
         self.assertNotIn("Traceback", err)
         self.assertRegex(out, r"(?m)^FAIL\s+aaa\s")
@@ -770,6 +708,7 @@ class FutureTailTest(Base):
     def test_clamped_records_still_appear_in_todays_report(self):
         self._pin_the_clock()
         rc, out, err = run(["report", "--stdout"], self.root)
+        self.assertEqual(rc, 0, out + err)
         self.assertIn("invisible work", out)
 
 
@@ -1042,10 +981,9 @@ class ConcurrencyTest(Base):
         def hooked(this, bot):
             if not fired:
                 fired.append(True)
-                thread = threading.Thread(target=other_replay)
-                thread.start()
-                thread.join(5)  # with the bot lock held across the loop the other replay waits
-                threads.append(thread)
+                # No thread and no sleep (K6-10): the other replay is not blocked by this one. Each event is
+                # appended once because of the _still_pending guard, which runs under the bot lock.
+                other_replay()
             return real(this, bot)
 
         with mock.patch.object(gblog.Ledger, "_tail_ok", hooked):
@@ -1061,18 +999,8 @@ class ConcurrencyTest(Base):
 
 # --------------------------------------------------------------------------- A-L-5, B-M3, B-M8, B-L4
 class MiscHardeningTest(Base):
-    # fixed: A-L-5 (was: spool replay appends a planted break_ack; only `seal` may write one)
-    def test_spool_replay_never_appends_a_break_ack(self):
-        self.seed("ops", 2)
-        brk = {k: v for k, v in gblog.KIM_BISEO_BREAK.items() if k != "bot"}
-        payload = {"v": 1, "kind": "tail_mismatch", "ts": "2024-06-01T11:00:00Z", "bot": "ops",
-                   "record": {"type": "break_ack", "jay_approval_id": "NOT-JAY-0001", "detail": "planted", "break": brk}}
-        self.write(self.path("spool", "ops", "20240601T110000Z-deadbeef.json"), json.dumps(payload))
-        try:
-            self.ledger.spool_replay("ops")
-        except ValueError:
-            pass
-        self.assertNotIn("break_ack", [r.get("type") for r in self.chain("ops")])
+    # fixed: A-L-5 (a planted break_ack is never replayed): the test is
+    # test_mutation_gaps.SpoolGapTest.test_planted_break_ack_stays_in_the_spool_and_is_reported (K6-14).
 
     # fixed: A-L-5 (was: a bot named x.alert.resolved-<stamp> collides with state/x.alert.resolved-<stamp>.json)
     def test_resolved_alert_names_are_reserved(self):

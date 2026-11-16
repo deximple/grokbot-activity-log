@@ -1,9 +1,9 @@
 """Tests for the gaps named in the test-quality review of 2026-11-16 (mutations M-01 .. M-30).
 
 Each test carries the id of the review item it closes (N-..) or of the defect it documents (D-..).
-Every test passes on the current gblog.py, except the ones marked ``@unittest.expectedFailure``
-with a ``bug: ...`` comment: those document behaviour that the documentation promises and the
-code does not have. They are listed in ``tests/PENDING.txt`` (``tests/test_meta.py`` checks that).
+Every test passes on the current gblog.py. A test that documents a gap would carry
+``@unittest.expectedFailure`` and a line in ``tests/PENDING.txt`` (``tests/test_meta.py`` checks
+that); no test of this module does.
 
 Everything runs in temporary directories. No network is used: git remotes are local bare
 repositories, git runs with GIT_ALLOW_PROTOCOL=file, and the visibility lookup, ``gh``, ``ssh``
@@ -39,6 +39,9 @@ import gblog  # noqa: E402
 sys.path.insert(0, HERE)
 from _support import GIT_ENV, deep_nesting, run_cli, run_raw, stamp  # noqa: E402
 from _support import run as _support_run  # noqa: E402
+from _support import run_strict as run  # noqa: E402  (fails on a swallowed crash; see _support, K6-01)
+from _support import FakeBody as _Body, add_visit, git, write_raw_chain  # noqa: E402  (round-4 G2-05)
+from _support import chrome_history as _chrome_history, webkit_time as _webkit  # noqa: E402
 
 GIT = shutil.which("git")
 BASH = shutil.which("bash")
@@ -47,39 +50,7 @@ LINK_TEXT = "%s: symbolic link (gblog does not write through one)"
 INTERNAL_LINE = "error: internal error (RuntimeError: boom second line); set GBLOG_DEBUG=1 for a traceback\n"
 
 
-def run(argv, root, internal_ok=False):
-    """Run the CLI in-process. Unlike ``_support.run`` this also fails on a swallowed crash:
-    ``main()`` turns an unexpected exception into ``error: internal error`` and ``verify --all``
-    turns it into ``verify aborted``, so a missing traceback alone proves nothing."""
-    rc, out, err = _support_run(argv, root)
-    if not internal_ok:
-        for text, where in (("Traceback", err), ("internal error", err), ("verify aborted", out)):
-            if text in where:
-                raise AssertionError("gblog %s: unexpected %r\n%s\n%s" % (" ".join(argv), text, out[-2000:], err[-2000:]))
-    return rc, out, err
-
-
-def write_raw_chain(root, bot, extras, day=DAY, state=True):
-    """Hash-valid lines written straight to logs/<bot>/<day>.jsonl, bypassing gblog.
-
-    ``extras`` holds one dict per record; its keys override the default fields before the hash is
-    computed. With ``state`` the state file names the last record."""
-    d = os.path.join(root, "logs", bot)
-    os.makedirs(d, exist_ok=True)
-    prev, recs = gblog.GENESIS, []
-    with open(os.path.join(d, day + ".jsonl"), "w", encoding="utf-8") as fh:
-        for i, extra in enumerate(extras, 1):
-            rec = {"v": 1, "seq": i, "ts": stamp(i, day), "bot": bot, "type": "note", "detail": "raw %d" % i, "prev": prev}
-            rec.update(extra)
-            rec["hash"] = gblog.compute_hash(rec)
-            prev = rec["hash"]
-            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
-            recs.append(rec)
-    if state:
-        os.makedirs(os.path.join(root, "state"), exist_ok=True)
-        with open(os.path.join(root, "state", bot + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"seq": len(recs), "head": prev, "updated": recs[-1]["ts"]}, fh)
-    return recs
+# run (the strict runner) and write_raw_chain are shared helpers of tests/_support.py.
 
 
 def ago(days, seconds=0):
@@ -88,8 +59,7 @@ def ago(days, seconds=0):
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def git(*args, check=True):
-    return subprocess.run(["git"] + list(args), check=check, capture_output=True, text=True).stdout
+# git(*args, check=True) is tests/_support.git: it never inherits GIT_DIR or GIT_INDEX_FILE (K6-05).
 
 
 def _read_bytes(path):
@@ -105,35 +75,9 @@ def _rewrite(path, data):
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
 
 
-def _webkit(epoch):
-    return (int(epoch) + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000
-
-
-def add_visit(path, url, title, when):
-    conn = sqlite3.connect(path)
-    try:
-        cur = conn.execute("INSERT INTO urls(url, title) VALUES (?, ?)", (url, title))
-        conn.execute("INSERT INTO visits(url, visit_time) VALUES (?, ?)", (cur.lastrowid, when))
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def chrome_history(directory, visits):
-    """A Chrome-style History database. ``visits`` is [(url, title, raw visit_time)]."""
-    prof = os.path.join(directory, "Default")
-    os.makedirs(prof)
-    path = os.path.join(prof, "History")
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
-                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        conn.commit()
-    finally:
-        conn.close()
-    for url, title, when in visits:
-        add_visit(path, url, title, when)
-    return path
+    """``_support.chrome_history`` with raw visit times (WebKit microseconds)."""
+    return _chrome_history(directory, visits, ago=False)
 
 
 class Base(unittest.TestCase):
@@ -424,28 +368,20 @@ class SyncGapTest(Base):
         self.assertIn("committed content differs from disk for %s" % self.DAY_FILE, out)
         self.assertEqual(self.commits(bare), 1)
 
-    def test_sync_cache_does_not_hide_a_changed_file(self):
-        # N-02: the cache branch of _sync_drift
+    def test_same_size_rewrite_is_drift_without_any_cache(self):
+        # N-02 (round-4 G2-02): sync keeps no cache; a same-size rewrite is drift and every file is hashed
         rc, out, err = run(["sync", "--no-push"], self.root)
         self.assertEqual(rc, 0, out + err)
         _forced, checked = gblog._sync_evidence(self.ledger)
         self.assertIn(self.DAY_FILE, checked)
-        cache = os.path.join(self.base, "sync-cache.json")
-        self.assertEqual(gblog._sync_drift(self.root, checked, cache), [])
-        self.assertTrue(os.path.isfile(cache))
+        self.assertEqual(gblog._sync_drift(self.root, checked), [])
         full = self.path(*self.DAY_FILE.split("/"))
         original = _read_bytes(full)
         self.assertIn(b"something to back up", original)
         _rewrite(full, original.replace(b"something to back up", b"SOMETHING TO BACK UP"))
         self.assertEqual(os.path.getsize(full), len(original))
-        self.assertEqual(gblog._sync_drift(self.root, checked, cache), [self.DAY_FILE])
+        self.assertEqual(gblog._sync_drift(self.root, checked), [self.DAY_FILE])
         _rewrite(full, original)
-        self.assertEqual(gblog._sync_drift(self.root, checked, cache), [])
-        # nothing changed since the last run: no file is hashed again
-        with mock.patch.object(gblog, "_git_blob_id", wraps=gblog._git_blob_id) as spy:
-            self.assertEqual(gblog._sync_drift(self.root, checked, cache), [])
-        self.assertEqual(spy.call_count, 0)
-        # without a cache every checked file is hashed
         with mock.patch.object(gblog, "_git_blob_id", wraps=gblog._git_blob_id) as spy:
             self.assertEqual(gblog._sync_drift(self.root, checked), [])
         self.assertEqual(spy.call_count, len(checked))
@@ -553,20 +489,7 @@ class SyncGapTest(Base):
 
 
 # --------------------------------------------------------------------------- N-03
-class _Body:
-    """Stand-in for the object urlopen() returns."""
-
-    def __init__(self, data):
-        self.data = data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self.data
+# _Body is tests/_support.FakeBody (round-4 G2-05).
 
 
 class VisibilityLookupTest(unittest.TestCase):
@@ -1488,8 +1411,8 @@ class ArchiveClaimGapTest(Base):
         rc, out, err = run(["note", "--bot", "ops", "--detail", "still appending"], self.root)
         self.assertEqual(rc, 0, out + err)
 
-    # bug: D-8. A bare `archive` record names no file ("a claim, not stored evidence"), yet verify counts
-    # it in the "(N archived file(s) intact)" suffix of the OK line.
+    # fixed: D-8. A bare `archive` record names no file ("a claim, not stored evidence") and is no longer
+    # counted in the "(N archived file(s) intact)" suffix of the OK line.
     def test_bare_archive_record_is_not_counted_as_intact(self):
         self._claim()
         rc, out, err = run(["verify", "--bot", "ops"], self.root)
@@ -1531,8 +1454,6 @@ class InternalErrorGapTest(Base):
         self.assertRegex(out, r"(?m)^OK\s+zzz\s")
         self.assertEqual(err, "")
 
-    # bug: D-6. docs/DESIGN.md section 11 says GBLOG_DEBUG=1 re-raises "also from inside verify --all and
-    # anchor"; _verify_guarded never reads the variable and turns the exception into a FAIL entry.
     def test_debug_env_reraises_from_verify_all(self):
         self.seed("ops", 1)
         with mock.patch.dict(os.environ, {"GBLOG_DEBUG": "1"}), \
@@ -1542,61 +1463,9 @@ class InternalErrorGapTest(Base):
 
 
 # --------------------------------------------------------------------------- section 5 (D-1 .. D-7)
-class DocumentedButAbsentTest(Base):
-    """Behaviour the documentation describes and the code does not have. Each test fails today."""
-
-    # bug: D-1. The daily routine prompt, DESIGN sections 8/13 and the CHANGELOG use
-    # `gblog anchor --skip-archives`; the anchor parser has no such flag and exits 2.
-    def test_anchor_skip_archives(self):
-        rec = gblog.archive_file(self.ledger, "ops", b"evidence\n", "e.txt", "artifact", ts=stamp(0))
-        with gzip.open(self.path(*rec["path"].split("/")), "wb") as fh:
-            fh.write(b"something else")
-        rc, out, err = run(["anchor"], self.root)
-        self.assertEqual(rc, 1, out + err)
-        rc, out, err = run(["anchor", "--skip-archives"], self.root)
-        self.assertEqual(rc, 0, out + err)
-        self.assertIn("ANCHOR OK", out)
-
-    # bug: D-2. README and CHANGELOG say that running `capture shell-hook --install` again replaces an
-    # older hook block in place; install_shell_hook returns False whenever any block exists.
-    def test_install_replaces_outdated_hook(self):
-        rc_file = os.path.join(self.base, "bashrc")
-        old = "# >>> gblog shell hook >>>\n# an older hook body\n# <<< gblog shell hook <<<\n"
-        self.write(rc_file, "# my settings\n" + old)
-        self.assertTrue(gblog.install_shell_hook("ops", rc_file))
-        text = self.read(rc_file)
-        self.assertEqual(text.count(">>> gblog shell hook >>>"), 1)
-        self.assertIn("__gblog_hook", text)
-        self.assertIn("# my settings", text)
-        self.assertNotIn("an older hook body", text)
-
-    # bug: D-3. The CHANGELOG says a counter such as `max_tokens=100000` is left as written; the
-    # glued-name redaction rule turns it into `max_tokens=[REDACTED]`.
-    def test_token_counters_untouched(self):
-        for text in ("max_tokens=100000", "prompt_tokens: 123456", "--max-tokens=200000"):
-            self.assertEqual(gblog.redact(text), text)
-
-    # bug: D-4. CHANGELOG, DESIGN section 13 and FAQ 35 say the "Effect of applied changes" table covers
-    # changes applied in the last 90 days (default --days 28); `tune` loads the whole history.
-    def test_effect_table_limited_to_90_days(self):
-        proposal = {"title": "Old change", "category": "skill", "key": "fail:connector:x.sync",
-                    "metric": {"kind": "fail", "bot": "ops", "action": "connector", "key": "x.sync"},
-                    "baseline": 3.0, "better": "lower", "window": {"since": ago(228), "until": ago(200)}}
-        self.ledger.append("ops", {"type": "tune", "action": "other", "target": "old00001", "outcome": "ok",
-                                   "detail": "applied long ago", "proposal": proposal, "ts": ago(200)})
-        rc, out, err = run(["tune", "--days", "28", "--json", "--stdout"], self.root)
-        self.assertEqual(rc, 0, out + err)
-        self.assertEqual(json.loads(out)["effects"], [])
-
-    # bug: D-7. `status --json` and `tune --json` write ensure_ascii=False text through a backslashreplace
-    # stream; on an ASCII stdout a non-ASCII display name becomes `B\xfcro`, which is not a JSON escape.
-    def test_json_outputs_are_valid_on_ascii_stdout(self):
-        self.quiet(self.ledger.add_alias, "chief", "B\u00fcro Chef", [])
-        self.ledger.append("chief", {"type": "note", "detail": "caf\u00e9 visit"})
-        for argv in (["status", "--json"], ["tune", "--json", "--stdout"]):
-            rc, out, err = run_cli(argv, self.root, "ascii")
-            self.assertEqual(rc, 0, err)
-            json.loads(out)
+# D-1 .. D-7 are in the code. Their tests live in tests/test_round3_followups.py: AnchorSkipArchivesTest,
+# ShellHookTest, TokenCounterTest, TuneWindowTest.test_effect_table_limited_to_90_days and JsonWriterTest
+# (round-4 G2-02; the class that used to stand here repeated them).
 
 
 if __name__ == "__main__":

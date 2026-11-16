@@ -14,6 +14,8 @@ import gblog  # noqa: E402
 
 
 sys.path.insert(0, HERE)
+from unittest import mock  # noqa: E402
+from _support import freeze_clock  # noqa: E402
 from _support import run as _support_run  # noqa: E402  (shared helper, round-3 W-20)
 
 
@@ -170,6 +172,7 @@ class CliTest(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def test_full_flow(self):
+        freeze_clock(self)  # K6-07: the records and the default report day must fall on one UTC day
         rc, out, _ = run(["init"], self.root)
         self.assertEqual(rc, 0)
         rc, tid, _ = run(["task-start", "--bot", "ops", "--task", "demo"], self.root)
@@ -220,17 +223,7 @@ class CliTest(unittest.TestCase):
 
 
 class RedactionPatterns(unittest.TestCase):
-    def test_bearer_without_colon_and_query_params(self):
-        self.assertEqual(gblog.redact("Authorization: Bearer abcdef123456 x"), "Authorization: Bearer [REDACTED] x")
-        self.assertEqual(
-            gblog.redact("https://mail.google.com/inbox?token=abc&x=1&api_key=zzz"),
-            "https://mail.google.com/inbox?token=[REDACTED]&x=1&api_key=[REDACTED]",
-        )
-        self.assertEqual(gblog.redact("https://user:pa55word@h/x"), "https://[REDACTED]@h/x")
-        self.assertIn("[REDACTED]", gblog.redact("ghp_" + "a" * 36))
-        self.assertIn("[REDACTED]", gblog.redact("AKIAABCDEFGHIJKLMNOP"))
-        self.assertIn("[REDACTED]", gblog.redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop"))
-
+    # The six "existing expectations" live in test_redaction_extended.test_existing_expectations_unchanged (K6-14).
     def test_plain_text_untouched(self):
         for s in ["git status", "open https://example.com/a/b", "token count was 12", "the key is under the mat"]:
             self.assertEqual(gblog.redact(s), s)
@@ -320,15 +313,13 @@ class CaptureCoverageTuneTest(unittest.TestCase):
         rc, out, _ = run(["tune", "--reject", cats["approval"]["id"], "--detail", "intended"], self.root)
         self.assertEqual(rc, 0)
         self.assertTrue(L.verify("ops")["ok"])
-        rc, out, _ = run(["tune", "--apply", "nope"], self.root)
-        self.assertNotEqual(rc, 0)
+        rc, out, err = run(["tune", "--apply", "nope"], self.root)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("unknown proposal id nope", err)
 
     def test_log_source_and_env_task(self):
-        os.environ["GBLOG_TASK"] = "envtask"
-        try:
+        with mock.patch.dict(os.environ, {"GBLOG_TASK": "envtask"}):  # restores the caller's value afterwards
             rc, out, _ = run(["log", "--bot", "ops", "--action", "shell", "--target", "ls", "--source", "auto"], self.root)
-        finally:
-            del os.environ["GBLOG_TASK"]
         self.assertEqual(rc, 0)
         rec = self.ledger.records("ops")[-1]
         self.assertEqual((rec["task_id"], rec["source"]), ("envtask", "auto"))
@@ -449,6 +440,7 @@ class AliasArchiveSyncTest(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_archive_roundtrip_dedup_redaction_and_verify(self):
+        freeze_clock(self)  # K6-07: "already stored" is per UTC day
         src = os.path.join(self.root, "transcript.jsonl")
         with open(src, "w", encoding="utf-8") as fh:
             fh.write('{"role":"user","text":"token=abcdef123456 please"}\n{"role":"bot","text":"done"}\n')
@@ -524,7 +516,9 @@ class AliasArchiveSyncTest(unittest.TestCase):
                 else:
                     os.environ[key] = value
             shutil.rmtree(bare, ignore_errors=True)
-        self.assertNotEqual(rc, 3)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(" pushed", out)
+        self.assertNotIn("(not pushed)", out)
 
     def test_remote_visibility_parses_urls(self):
         for url in ("git@github.com:deximple/grokledger.git", "https://github.com/deximple/grokledger", "https://github.com/deximple/grokledger.git/"):

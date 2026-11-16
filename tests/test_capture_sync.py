@@ -25,7 +25,7 @@ import gblog  # noqa: E402
 
 GIT = shutil.which("git")
 sys.path.insert(0, HERE)
-from _support import GIT_ENV, run as _support_run  # noqa: E402  (shared helpers, round-3 W-20)
+from _support import GIT_ENV, git as _git_cmd, run_strict as _support_run  # noqa: E402  (shared helpers)
 
 
 def run(argv, root):
@@ -83,7 +83,7 @@ class _Base(unittest.TestCase):
         self.ledger.write_state(bot, state)
 
     def _git(self, *args):
-        return subprocess.run(["git"] + list(args), check=True, capture_output=True, text=True).stdout
+        return _git_cmd(*args)  # never the repository of whoever runs the suite (K6-05)
 
     def _bare(self, name="origin.git"):
         path = os.path.join(self.tmp, name)
@@ -184,12 +184,8 @@ class SyncTest(_Base):
         self.assertIn("refused", out + err)
         self.assertIn("could not confirm", out + err)
         self.assertTrue(self.vis_calls)
-        # Either override lifts the refusal. The push itself cannot leave this machine
-        # (GIT_ALLOW_PROTOCOL=file), so it may fail, but not with a usage error or a refusal.
-        for flag in ("--allow-unknown-visibility", "--allow-public"):
-            rc, out, err = run(["sync", flag], self.root)
-            self.assertNotIn(rc, (2, 3, 4), "%s: %s%s" % (flag, out, err))
-            self.assertNotIn("refused:", out + err, flag)
+        # The overrides are tested where the push can be seen to arrive (a local bare repository):
+        # test_mutation_gaps.SyncGapTest.test_unknown_visibility_override_really_pushes (K6-18).
 
     def test_unknown_visibility_other_host_warns(self):
         bare = self._bare()

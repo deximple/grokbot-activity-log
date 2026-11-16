@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 sys.path.insert(0, HERE)
-from _support import DAY, GIT_ENV, run, stamp  # noqa: E402
+from _support import DAY, GIT_ENV, run_strict as run, stamp  # noqa: E402
 
 GIT = shutil.which("git")
 FIXTURE = os.path.join(HERE, "fixtures", "kim-biseo-break")

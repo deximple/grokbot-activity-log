@@ -29,7 +29,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 sys.path.insert(0, HERE)
-from _support import DAY, run, run_cli, stamp  # noqa: E402
+from _support import DAY, run_cli, stamp  # noqa: E402
+from _support import add_visit as _add_visit, chrome_history, webkit_time as _webkit  # noqa: E402  (G2-05)
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 
 PW = "hunter2" + "hunter2"
 HEX = "abcdef" + "0123456789"
@@ -136,35 +138,9 @@ class GitLocaleTest(Base):
 
 
 # --------------------------------------------------------------------------- W-04
-def _webkit(epoch):
-    return (int(epoch) + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000
-
-
-def _add_visit(path, url, title, when):
-    conn = sqlite3.connect(path)
-    try:
-        cur = conn.execute("INSERT INTO urls(url, title) VALUES (?, ?)", (url, title))
-        conn.execute("INSERT INTO visits(url, visit_time) VALUES (?, ?)", (cur.lastrowid, when))
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def _chrome_history(directory, rows):
-    """A Chrome-style History database. ``rows`` is [(url, title, visit time in WebKit microseconds)]."""
-    prof = os.path.join(directory, "Default")
-    os.makedirs(prof)
-    path = os.path.join(prof, "History")
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
-                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        conn.commit()
-    finally:
-        conn.close()
-    for row in rows:
-        _add_visit(path, *row)
-    return path
+    """``_support.chrome_history`` with raw visit times (WebKit microseconds)."""
+    return chrome_history(directory, rows, ago=False)
 
 
 class BrowserUnusableRowsTest(Base):
@@ -317,6 +293,16 @@ class TuneWindowTest(Base):
         # the effect table covers changes applied in the loaded range (90 days) only
         self.assertEqual([e["id"] for e in analysis["effects"]], ["feedbeef"])
         self.assertEqual(analysis["metrics"]["ops"]["tasks"], 3)
+
+    def test_effect_table_limited_to_90_days(self):
+        # W-11 (moved from test_mutation_gaps, round-4 G2-02): a change applied before the loaded
+        # range is not measured, so it has no row in "Effect of applied changes"
+        self.ledger.append("ops", {"type": "tune", "action": "other", "target": "old00001", "outcome": "ok",
+                                   "detail": "applied long ago", "proposal": self._snapshot("old change"),
+                                   "ts": self.ts(200)})
+        rc, out, err = run(["tune", "--days", "28", "--json", "--stdout"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(json.loads(out)["effects"], [])
 
     def test_tune_history_returns_only_what_records_leaves_out(self):
         pid = self._seed()

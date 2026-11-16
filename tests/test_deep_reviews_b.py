@@ -34,7 +34,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 sys.path.insert(0, HERE)
-from _support import DAY, GIT_ENV, run, run_cli, stamp  # noqa: E402
+from _support import DAY, GIT_ENV, chrome_history, git, run_cli, stamp  # noqa: E402
+from _support import AfterRelease as _AfterRelease, FakeBody as _Body  # noqa: E402  (round-4 G2-05)
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 
 GIT = shutil.which("git")
 BASH = shutil.which("bash")
@@ -42,8 +44,7 @@ T0 = calendar.timegm((2024, 6, 1, 10, 0, 0))  # 2024-06-01T10:00:00Z
 ROLLUP = {"mode": "per-chain", "whole_ledger_skip": False, "ts": "2024-06-01T12:00:00Z"}
 
 
-def git(*args):
-    return subprocess.run(["git"] + list(args), check=True, capture_output=True, text=True).stdout
+# git(*args) is tests/_support.git: it never inherits GIT_DIR or GIT_INDEX_FILE (K6-05).
 
 
 def commits(repo):
@@ -63,56 +64,7 @@ def rec(seq, bot="ops", **fields):
     return out
 
 
-def chrome_history(directory, visits):
-    """A Chrome-style History database. ``visits`` is [(url, title, seconds ago)]."""
-    prof = os.path.join(directory, "Default")
-    os.makedirs(prof)
-    path = os.path.join(prof, "History")
-    now = int((time.time() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
-                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        for i, (url, title, age) in enumerate(visits, 1):
-            conn.execute("INSERT INTO urls VALUES (?, ?, ?)", (i, url, title))
-            conn.execute("INSERT INTO visits VALUES (?, ?, ?)", (i, i, now - age * 1_000_000))
-        conn.commit()
-    finally:
-        conn.close()
-    return path
-
-
-class _Body:
-    """Stand-in for the object urlopen() returns."""
-
-    def __init__(self, data):
-        self.data = data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        return self.data
-
-
-class _AfterRelease:
-    """Wraps a lock context manager and runs a callback right after the lock has been released."""
-
-    def __init__(self, inner, callback):
-        self.inner = inner
-        self.callback = callback
-
-    def __enter__(self):
-        self.inner.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        result = self.inner.__exit__(*exc)
-        self.callback()
-        return result
+# chrome_history, _Body and _AfterRelease are shared helpers of tests/_support.py (round-4 G2-05).
 
 
 class Base(unittest.TestCase):
@@ -281,7 +233,7 @@ class ChainIsolationTest(Base):
         self.seed("aaa", 1)
         self.seed("zzz", 1)
         os.makedirs(self.path("anchors", "aaa.history.jsonl"))  # a directory where the history file belongs
-        rc, out, err = run(["anchor"], self.root)
+        rc, out, err = run(["anchor"], self.root, internal_ok=True)  # "anchor aborted" is the expected entry
         self.assertEqual(rc, 1, out + err)
         self.assertNotIn("Traceback", err)
         self.assertRegex(out, r"(?m)^ANCHOR FAIL aaa\s")
@@ -590,7 +542,7 @@ class SyncDeepTest(Base):
         self.assertIn("PUBLIC", out + err)
         self.assertEqual(seen, ["https://api.github.com/repos/octocat/Hello-World"])
 
-    # pending: D3-03 remotes-file case — a legacy .git/remotes/origin file is still pushed to
+    # fixed: D3-03, including the remotes-file case (a legacy .git/remotes/origin file is never pushed to)
     def test_no_repo_origin_is_never_pushed(self):
         # D3-03: a remote named origin that git would find outside the ledger repository's own config
         for case in ("directory", "remotes-file", "global-config"):
@@ -794,20 +746,30 @@ class BrowserWindowTest(Base):
         super().setUp()
         self.hist = chrome_history(os.path.join(self.base, "chrome"), [("https://a.example/one", "A", 60)])
 
-    def test_negative_hours_is_a_usage_error_and_writes_nothing(self):
-        rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", self.hist, "--hours=-87600"], self.root)
-        self.assertEqual(rc, 2, out + err)
-        self.assertIn("error: --hours must be", err)
+    def test_negative_hours_is_refused_with_the_exact_message(self):
+        # D4-03 (the larger negative-window test is test_deep_reviews.CliLayerTest, K6-14)
+        argv = ["capture", "browser", "--bot", "ops", "--history", self.hist]
+        rc, out, err = run(argv + ["--hours=-1"], self.root)
+        self.assertEqual((rc, out), (2, ""))
+        self.assertEqual(err, "error: --hours must be 0 or more\n")
         self.assertFalse(os.path.exists(self.path("state", "ops.json")))
-        rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", self.hist], self.root)
+        rc, out, err = run(argv, self.root)
         self.assertEqual(rc, 0, out + err)
         self.assertIn("browser: 1 new visit(s)", out)
 
-    # bug: D4-03. README and CHANGELOG say `capture browser --hours` below 1 exits 2; --hours=0 is accepted.
-    def test_hours_zero_is_a_usage_error(self):
-        rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", self.hist, "--hours=0"], self.root)
-        self.assertEqual(rc, 2, out + err)
-        self.assertFalse(os.path.exists(self.path("state", "ops.json")))
+    # bug: Z-12 (round-4 G2-01). README, FAQ 28 and the CHANGELOG say that only a negative --hours is
+    # refused and that `--hours 0` imports nothing on a first run; _validate_args still exits 2 for 0.
+    @unittest.expectedFailure
+    def test_hours_zero_imports_nothing_on_a_first_run(self):
+        argv = ["capture", "browser", "--bot", "ops", "--history", self.hist]
+        rc, out, err = run(argv + ["--hours=0"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("browser: 0 new visit(s) from 1 history file(s)", out)
+        # the first run left a marker: the default window does not reach back behind it
+        rc, out, err = run(argv, self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("browser: 0 new visit(s) from 1 history file(s)", out)
+        self.assertEqual(self.chain(), [])
 
     def test_future_marker_is_ignored_with_a_notice(self):
         future = int((time.time() + 10 * 365 * 86400 + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)

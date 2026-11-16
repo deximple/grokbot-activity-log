@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 sys.path.insert(0, HERE)
-from _support import DAY, GIT_ENV, run, run_cli, stamp  # noqa: E402
+from _support import DAY, GIT_ENV, git as _git_cmd, run_cli, stamp, write_raw_chain  # noqa: E402
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 
 GIT = shutil.which("git")
 BASH = shutil.which("bash")
@@ -46,24 +47,7 @@ exit "${GBLOG_FAKE_RC:-2}"
 '''
 
 
-def write_raw_chain(root, bot, extras, day=DAY):
-    """Hash-valid lines written straight to logs/<bot>/<day>.jsonl; state names the last one."""
-    d = os.path.join(root, "logs", bot)
-    os.makedirs(d, exist_ok=True)
-    os.makedirs(os.path.join(root, "state"), exist_ok=True)
-    prev, recs = gblog.GENESIS, []
-    with open(os.path.join(d, day + ".jsonl"), "w", encoding="utf-8") as fh:
-        for i, extra in enumerate(extras, 1):
-            rec = {"v": 1, "seq": i, "ts": stamp(i, day), "bot": bot, "type": "note", "detail": "raw %d" % i, "prev": prev}
-            rec.update(extra)
-            rec["prev"] = prev
-            rec["hash"] = gblog.compute_hash(rec)
-            prev = rec["hash"]
-            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
-            recs.append(rec)
-    with open(os.path.join(root, "state", bot + ".json"), "w", encoding="utf-8") as fh:
-        json.dump({"seq": recs[-1]["seq"], "head": prev, "updated": recs[-1]["ts"]}, fh)
-    return recs
+# write_raw_chain is tests/_support.write_raw_chain (round-4 G2-05).
 
 
 class Base(unittest.TestCase):
@@ -478,7 +462,7 @@ class AnchorVerifyIsolationTest(Base):
 
     def test_anchor_isolates_a_non_regular_history_file(self):
         os.mkdir(self.path("anchors", "aaa.history.jsonl"))
-        rc, out, err = run(["anchor"], self.root)
+        rc, out, err = run(["anchor"], self.root, internal_ok=True)  # "anchor aborted" is the expected entry
         self.assertEqual(rc, 1, out + err)
         self.assertRegex(out, r"(?m)^ANCHOR FAIL aaa\s")
         self.assertIn("      - anchor aborted: IsADirectoryError", out.splitlines())
@@ -488,7 +472,7 @@ class AnchorVerifyIsolationTest(Base):
 
     def test_anchor_isolates_a_directory_at_the_anchor_file(self):
         os.mkdir(self.path("anchors", "aaa.json"))
-        rc, out, err = run(["anchor"], self.root)
+        rc, out, err = run(["anchor"], self.root, internal_ok=True)  # "anchor aborted" is the expected entry
         self.assertEqual(rc, 1, out + err)
         self.assertRegex(out, r"(?m)^ANCHOR FAIL aaa\s")
         self.assertRegex(out, r"(?m)^ANCHOR OK\s+zzz\s")
@@ -630,7 +614,7 @@ class SyncFilesystemTest(Base):
         self.addCleanup(patcher.stop)
 
     def _git(self, *args):
-        return subprocess.run(["git"] + list(args), check=True, capture_output=True, text=True).stdout
+        return _git_cmd(*args)  # never the repository of whoever runs the suite (K6-05)
 
     def _commits(self, repo):
         res = subprocess.run(["git", "-C", repo, "rev-list", "--all", "--count"], capture_output=True, text=True)

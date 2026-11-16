@@ -31,7 +31,7 @@ TS_ERROR = "error: --ts must look like 2026-11-16T09:30:00Z"
 
 
 sys.path.insert(0, HERE)
-from _support import run, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import run_strict as run, stamp  # noqa: E402,F401  (shared helpers; K6-01 strict runner)
 
 
 def _utc_now():
@@ -69,8 +69,8 @@ class SafetyBase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("GBLOG_TASK", None)
-        os.environ.pop("GBLOG_ROOT", None)
+        for key in ("GBLOG_TASK", "GBLOG_ROOT", "GBLOG_DEBUG", "GBLOG_BOT"):
+            os.environ.pop(key, None)
 
     def seed(self, n=2, bot="ops"):
         return [self.ledger.append(bot, {"type": "note", "detail": "seed %d" % (i + 1), "ts": stamp(i)}) for i in range(n)]

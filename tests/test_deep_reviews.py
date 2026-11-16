@@ -27,7 +27,8 @@ sys.path.insert(0, REPO)
 import gblog  # noqa: E402
 
 sys.path.insert(0, HERE)
-from _support import DAY, GIT_ENV, run, run_cli, stamp  # noqa: E402
+from _support import DAY, GIT_ENV, chrome_history, run_cli, stamp  # noqa: E402
+from _support import run_strict as run  # noqa: E402  (K6-01: a swallowed crash fails the test)
 
 GIT = shutil.which("git")
 GBLOG_PY = os.path.join(REPO, "gblog.py")
@@ -35,23 +36,7 @@ FIXTURE = os.path.join(HERE, "fixtures", "kim-biseo-break")
 HEAD_MISMATCH = "state/%s.json: head does not match last record (state tampered or log truncated)"
 
 
-def chrome_history(directory, visits):
-    """A Chrome-style History database. ``visits`` is [(url, title, seconds ago)]."""
-    prof = os.path.join(directory, "Default")
-    os.makedirs(prof)
-    path = os.path.join(prof, "History")
-    now = int((time.time() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
-                           "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        for i, (url, title, age) in enumerate(visits, 1):
-            conn.execute("INSERT INTO urls VALUES (?, ?, ?)", (i, url, title))
-            conn.execute("INSERT INTO visits VALUES (?, ?, ?)", (i, i, now - age * 1_000_000))
-        conn.commit()
-    finally:
-        conn.close()
-    return path
+# chrome_history(directory, [(url, title, seconds ago)]) is tests/_support.chrome_history (round-4 G2-05).
 
 
 class Base(unittest.TestCase):

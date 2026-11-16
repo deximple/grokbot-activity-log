@@ -1,3 +1,6 @@
 # Tests that carry @unittest.expectedFailure, one "Class.test_name" per line.
 # tests/test_meta.py fails when this list and the markers in tests/test*.py differ.
-# Nothing is pending.
+# tests/test_deep_reviews_b.py (Z-12: `capture browser --hours 0` is documented as accepted; it exits 2)
+BrowserWindowTest.test_hours_zero_imports_nothing_on_a_first_run
+# tests/test_k6.py (K6-04: a day file deleted after the verify snapshot raises; it should be a problem line)
+SnapshotWindowTest.test_day_file_deleted_after_snapshot_is_a_problem

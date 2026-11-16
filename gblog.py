@@ -34,10 +34,12 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -122,6 +124,38 @@ class ProposalsCorruptError(ValueError):
 
 class _UsageError(Exception):
     """Bad CLI value. main() prints ``error: ...`` and returns 2."""
+
+
+class _Terminated(BaseException):
+    """SIGTERM or SIGHUP arrived (K10-04). Raised by the handler main() installs, so that the cleanup
+    paths (temp files, partial lines, capture progress) run; main() returns ``128 + signum``."""
+
+    def __init__(self, signum: int):
+        super().__init__("terminated by signal %d" % signum)
+        self.signum = int(signum)
+
+
+# Signals that are held back between a durable log line and its state replace (K10-04).
+_DEFER_SIGNALS = tuple(getattr(signal, _name) for _name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, _name))
+
+
+def _block_signals():
+    """Block the deferred signals for this thread; returns the old mask (None where unsupported)."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return None
+    try:
+        return signal.pthread_sigmask(signal.SIG_BLOCK, _DEFER_SIGNALS)
+    except (OSError, ValueError):
+        return None
+
+
+def _unblock_signals(old) -> None:
+    if old is None:
+        return
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    except (OSError, ValueError):
+        pass
 
 
 class _VerifyResult(dict):
@@ -483,6 +517,19 @@ def _entry_kind(path: str) -> str:
 def _real_dir(path: str) -> bool:
     """True for a directory that is not reached through a symlink (the one "directory at a side file" predicate)."""
     return _entry_kind(path) == "directory" and not os.path.islink(path)
+
+
+def _torn_tail_hint(bot: str, torn: Optional[Tuple], total: int, log_names: List[str],
+                    state_head: object) -> Optional[str]:
+    """K10-07 a: the hint verify adds when the unparsable line is the very last line of the newest log
+    file and state names the record before it: an interrupted write, not an edit. The verdict stays FAIL."""
+    if torn is None or not isinstance(state_head, str):
+        return None
+    index, rel, lineno, before = torn
+    if index != total - 1 or not log_names or rel != log_names[-1] or state_head != before:
+        return None
+    return ("%s:%d: last line is incomplete and state/%s.json names the record before it (interrupted write): "
+            "restore the line from backup; no acknowledged record is missing" % (rel, lineno, bot))
 
 
 def _one_behind(bot: str, raw_state: Optional[Dict], last_rec: object) -> Optional[str]:
@@ -952,6 +999,23 @@ def _fsync_dir(path: str) -> None:
             raise
     finally:
         os.close(fd)
+
+
+def _fsync_path(path: str) -> None:
+    """Make an existing file and its directory entry durable (K10-01; used on recovery paths only).
+
+    A state file must never name a log line that was not fsynced first: a tail that a killed appender
+    left in the page cache is flushed before state adopts it."""
+    flags = getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, os.O_RDWR | flags)  # Windows needs write access for fsync
+    except OSError:
+        fd = os.open(path, os.O_RDONLY | flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir(os.path.dirname(path))
 
 
 def _utcnow() -> _dt.datetime:
@@ -1465,12 +1529,14 @@ class Ledger:
                 try:
                     _path, rec = self._tail_record(bot)
                 except OSError:
-                    rec = {"_corrupt": True}
+                    _path, rec = None, {"_corrupt": True}
                 if rec is not None:
                     if not _self_consistent(rec):
                         sys.stderr.write("warning: state/%s.json is missing or unreadable and the log tail is not "
                                          "self-consistent; state not written\n" % bot)
                         return False
+                    if _path:
+                        _fsync_path(_path)  # K10-01: the adopted tail is durable before state names it
                     state.update({"seq": rec["seq"], "head": rec["hash"]})
                     if isinstance(rec.get("ts"), str):
                         state["updated"] = rec["ts"]
@@ -1873,6 +1939,9 @@ class Ledger:
                     if wrote <= 0:
                         raise OSError("short write appending %s" % path)
                     view = view[wrote:]
+                # K10-01: a failed fsync takes the same rollback as a failed write. After a failed fsync
+                # the line cannot be trusted to reach the disk, so it must not stay for the next append to adopt.
+                os.fsync(fd)
             except BaseException:
                 # A failed write (full disk) must not leave a torn line behind. Only the bytes this call
                 # wrote are removed, and only while they are still the end of the file (no other writer
@@ -1895,7 +1964,6 @@ class Ledger:
                 except OSError:
                     pass
                 raise
-            os.fsync(fd)
         finally:
             os.close(fd)
         if size == 0:
@@ -2066,6 +2134,10 @@ class Ledger:
             seq, head, tail, observed, recovered = self._append_head(bot, seen)
             if observed is not None:
                 self._refuse_tail(bot, record, seq, head, observed)
+            if recovered and len(seen) > 1 and seen[1]:
+                # K10-01: the tail that is about to be adopted may only be in the page cache (its writer was
+                # killed before fsync returned). It is made durable before any state file names it.
+                _fsync_path(seen[1])  # type: ignore[arg-type]
             if recovered == "interrupted":
                 # Persist the adopted tail first. If this write fails as well, no new line has been
                 # written and state is still exactly one record behind: the next append can retry.
@@ -2130,12 +2202,18 @@ class Ledger:
                 self._refuse_tail(bot, record, seq, head, {
                     "seq": None, "hash": None, "corrupt": True, "cause": "day_file_not_regular",
                     "file": os.path.relpath(path, self.root).replace(os.sep, "/")})
+            # K10-04: SIGINT, SIGTERM and SIGHUP are held back from here until line and state agree.
+            mask = _block_signals()
             try:
                 self._append_line(path, json.dumps(full, ensure_ascii=False, sort_keys=True) + "\n")
             except OSError as exc:
                 # K8-05: the CLI says whether a retry could log the record twice.
                 exc.gblog_append = ("unwritten" if getattr(exc, "gblog_unwritten", False) else "unknown",  # type: ignore[attr-defined]
                                     bot, full["seq"], full["hash"])
+                _unblock_signals(mask)
+                raise
+            except BaseException:
+                _unblock_signals(mask)
                 raise
             # The state read at the top of this lock hold is still current (state writers take this lock),
             # so the file is not read a second time.
@@ -2149,7 +2227,12 @@ class Ledger:
                 self.write_state(bot, state)
             except OSError as exc:
                 exc.gblog_append = ("written", bot, full["seq"], full["hash"])  # type: ignore[attr-defined]
+                _unblock_signals(mask)
                 raise
+            except BaseException:
+                _unblock_signals(mask)
+                raise
+            _unblock_signals(mask)
             return full
 
     def _chain_items(self, bot: str) -> List[Tuple[str, int, Dict]]:
@@ -2407,6 +2490,7 @@ class Ledger:
         seg_first: Optional[Tuple] = None
         prev_item: Optional[Tuple] = None
         stopped = False
+        torn: List[Tuple] = []  # K10-07 a: (index, file, line, hash of the record before) of the unparsable line
 
         def close(first: Tuple, last: Tuple, start: int, end: int) -> None:
             if end < start:
@@ -2439,6 +2523,7 @@ class Ledger:
                 seg_first = cur
             if "_corrupt" in rec:
                 walk_problems.append("%s: not valid JSON" % where)
+                torn.append((i, rel, lineno, prev_item[2].get("hash") if prev_item is not None else GENESIS))
                 return stop(i)
             if rec.get("hash") != _safe_hash(rec):
                 walk_problems.append("%s: hash mismatch (record edited)" % where)
@@ -2573,6 +2658,10 @@ class Ledger:
             behind = _one_behind(bot, raw_state, prev_item[2] if prev_item is not None else None)
             if behind:
                 warnings.append(behind)
+        torn_hint = _torn_tail_hint(bot, torn[0] if torn else None, n_items, log_names,
+                                    state_head if state_readable else None)
+        if torn_hint:
+            warnings.append(torn_hint)
         if n_items:
             if not state_readable:
                 warnings.append(_STATE_UNREADABLE % bot)
@@ -2737,11 +2826,13 @@ class Ledger:
         count = 0
         i = 0
         n = len(items)
+        torn_ref: List[Tuple] = []
         while i < n:
             rel, lineno, rec = items[i]
             where = "%s:%d" % (rel, lineno)
             if "_corrupt" in rec:
                 problems.append("%s: not valid JSON" % where)
+                torn_ref.append((i, rel, lineno, items[i - 1][2].get("hash") if i else GENESIS))
                 break
             if rec.get("hash") != _safe_hash(rec):
                 problems.append("%s: hash mismatch (record edited)" % where)
@@ -2819,6 +2910,10 @@ class Ledger:
             behind = _one_behind(bot, raw_state, items[-1][2] if items else None)
             if behind:
                 warnings.append(behind)
+        torn_hint = _torn_tail_hint(bot, torn_ref[0] if torn_ref else None, n, log_names,
+                                    state_head if state_readable else None)
+        if torn_hint:
+            warnings.append(torn_hint)
         if items:
             if not state_readable:
                 warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
@@ -3329,6 +3424,7 @@ class Ledger:
                             "not in it; restore the log from backup" % (bot, old.get("seq"), str(old_head)[:12]))
             new = dict(old or {})
             new.update({"seq": tail["seq"], "head": tail["hash"], "updated": tail["ts"]})
+            _fsync_path(os.path.join(self.root, *items[-1][0].split("/")))  # K10-01: tail durable before state
             self.write_state(bot, new)
         note = self.append(bot, {"type": "note", "source": "auto",
                                  "detail": "state rebuilt from log tail (was %s)" % was})
@@ -4830,6 +4926,103 @@ def _restore_origin(root: str, urls: List[str], pushurls: List[str]) -> None:
 
 
 _LEDGER_TOPS = ("logs", "reports", "state", "tuning", "archive", "anchors", "spool")
+_ROOT_FILES = ("README.md", ".gitignore")
+# Tracked paths only gblog writes: a repository that holds one was a gblog backup before (K9-01).
+_EVIDENCE_PATH_RE = re.compile(
+    r"(?:logs/[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl"
+    r"|anchors/[A-Za-z0-9._-]+\.history\.jsonl"
+    r"|archive/[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9a-f]{64}\.gz)\Z")
+
+
+def _ledger_on_disk(root: str) -> bool:
+    """True when the work tree at ``root`` is recognisably a gblog ledger (K9-01): every ledger directory
+    exists (what ``gblog init`` creates), or a chain has a day file together with its state file."""
+    if all(os.path.isdir(os.path.join(root, top)) for top in _LEDGER_TOPS):
+        return True
+    logs = os.path.join(root, "logs")
+    try:
+        chains = sorted(os.listdir(logs))[:2000]
+    except OSError:
+        return False
+    for chain in chains:
+        if not os.path.isfile(os.path.join(root, "state", chain + ".json")):
+            continue
+        try:
+            names = os.listdir(os.path.join(logs, chain))
+        except OSError:
+            continue
+        if any(_DAY_FILE_RE.match(n) for n in names):
+            return True
+    return False
+
+
+def _foreign_origin(root: str) -> List[str]:
+    """URLs that git would add to ``origin`` from the system or global configuration (K9-04)."""
+    found: List[str] = []
+    for scope in ("--system", "--global"):
+        for key in ("remote.origin.url", "remote.origin.pushurl"):
+            res = _git(root, "config", scope, "--get-all", key, check=False)
+            if res.returncode == 0:
+                found += [u.strip() for u in res.stdout.splitlines() if u.strip()]
+    return found
+
+
+def _mark_origin_not_applied(ledger: "Ledger", exc: "TailMismatchError") -> None:
+    """K9-02: the spooled and alert copies of a refused origin-change record must not say ``ok``.
+    A later ``spool replay`` then records that the change was NOT applied."""
+    for path in (exc.spool_path, exc.alert_path):
+        doc = _read_json(path)
+        rec = doc.get("record") if doc else None
+        if isinstance(rec, dict):
+            rec["outcome"] = "denied"
+            rec["detail"] = "%s NOT applied (record refused; origin was not changed)" % rec.get("detail")
+            try:
+                ledger._atomic_json(path, doc)
+            except OSError:
+                pass
+
+
+def _change_origin(ledger: "Ledger", bot: str, root: str, current: List[str], remote: str, bookkeep) -> None:
+    """Record a change of ``origin`` in the ledger, then make it (K10-06: record first, so a crash in between
+    over-reports and never under-reports; K9-02: a refused record never survives as ``origin A -> B, ok``)."""
+    change = {"type": "sync", "action": "other", "target": "git remote", "outcome": "ok",
+              "detail": "origin %s -> %s" % (_safe_url(current[0]) if current else "-", _safe_url(remote))}
+    try:
+        if current:
+            # Replacing an existing origin must be in the chain: a tail mismatch is not swallowed (exit 4),
+            # and origin is not touched.
+            ledger.append(bot, change)
+        else:
+            bookkeep(change)
+    except TailMismatchError as exc:
+        _mark_origin_not_applied(ledger, exc)
+        raise
+    except OSError as exc:
+        # The line can be durable although the call failed (the state replace is the usual failing step).
+        # Then the chain says the change happened, so it is made; otherwise origin stays as it is.
+        tag = getattr(exc, "gblog_append", None)
+        durable = bool(tag) and tag[0] == "written"
+        if tag and tag[0] == "unknown":
+            try:
+                _tp, tail = ledger._tail_record(bot)
+                durable = isinstance(tail, dict) and tail.get("hash") == tag[3]
+            except OSError:
+                durable = False
+        if durable:
+            try:
+                _set_origin(root, bool(current), remote)
+            except Exception:
+                pass
+        raise
+    try:
+        _set_origin(root, bool(current), remote)
+    except BaseException as exc:
+        try:
+            bookkeep({"type": "sync", "action": "other", "target": "git remote", "outcome": "fail",
+                      "detail": "origin change to %s failed: %s" % (_safe_url(remote), exc.__class__.__name__)})
+        except Exception:
+            pass
+        raise
 
 
 def _require_ledger_repo(root: str) -> None:
@@ -4839,19 +5032,39 @@ def _require_ledger_repo(root: str) -> None:
     disabled and push that repository's branch. A repository counts as a ledger when it carries the marker
     ``gblog.ledger = true`` in its own config, or when everything it tracks is a ledger path; the marker is
     then set. Nothing is created or staged before this check."""
-    marked = _git(root, "config", "--local", "--get", "gblog.ledger", check=False)
+    # K9-01: the marker is read as a git boolean (yes / on / 1 / true).
+    marked = _git(root, "config", "--local", "--bool", "--get", "gblog.ledger", check=False)
     if marked.returncode == 0 and marked.stdout.strip().lower() == "true":
         return
     listed = _git(root, "ls-files", "-z", check=False)
     if listed.returncode != 0:
         return  # not a usable repository: the git calls of sync report that, as before
-    for path in listed.stdout.split("\0"):
-        if not path or path in ("README.md", ".gitignore"):
-            continue
-        if path.partition("/")[0] not in _LEDGER_TOPS:
+    # K9-01: decide from what the repository and the work tree show. A genuine ledger backup is never
+    # refused, whatever else it tracks (LICENSE, transcripts/, unified/, .gitattributes, ...).
+    tracked = {p for p in listed.stdout.split("\0") if p}
+    foreign = sorted(p for p in tracked if p not in _ROOT_FILES and p.partition("/")[0] not in _LEDGER_TOPS)
+    was_backup = any(_EVIDENCE_PATH_RE.match(p) for p in tracked)  # gblog files were committed here before
+    is_ledger = was_backup or _ledger_on_disk(root)
+    if foreign and not is_ledger:
+        raise _UsageError(
+            "%s is a git repository that is not a gblog ledger (it tracks %s); nothing was changed. "
+            "If it is your ledger, run: git -C <root> config gblog.ledger true" % (root, _term(foreign[0])))
+    if not is_ledger and not any(p.partition("/")[0] in _LEDGER_TOPS for p in tracked):
+        # Nothing of a ledger is tracked or on disk: adopted only when the work tree holds nothing foreign
+        # (a project whose only commit is README.md + .gitignore must not become a ledger).
+        try:
+            extra = sorted(n for n in os.listdir(root)
+                           if n != ".git" and n not in _ROOT_FILES and n not in _LEDGER_TOPS)
+        except OSError:
+            extra = []
+        if extra:
             raise _UsageError(
-                "%s is a git repository that is not a gblog ledger (it tracks %s); nothing was changed. "
-                "If it is your ledger, run: git -C <root> config gblog.ledger true" % (root, _term(path)))
+                "%s is a git repository that holds no ledger yet and contains other files (%s); nothing was "
+                "changed. If it is your ledger, run: git -C <root> config gblog.ledger true" % (root, _term(extra[0])))
+    if foreign:
+        sys.stderr.write("notice: this backup repository also tracks %d path(s) gblog does not write (%s%s); "
+                         "gblog commits only its own files\n"
+                         % (len(foreign), _term(foreign[0]), ", ..." if len(foreign) > 1 else ""))
     _git(root, "config", "--local", "gblog.ledger", "true", check=False)
 
 
@@ -4909,12 +5122,8 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         # Another spelling of the current origin (…/r for …/r.git, https for ssh) is not a change: .git/config
         # stays as it is and the run goes on (K3-04). --replace-remote stores the new spelling.
         changed = remote not in current and not (same and not replace_remote)
-        old_push: List[str] = []
-        if changed:
-            # Nothing is touched when the URL is already one of origin's URLs (a multi-URL origin stays as it is).
-            old_push = [u.strip() for u in _git(root, "config", "--local", "--get-all", "remote.origin.pushurl",
-                                                check=False).stdout.splitlines() if u.strip()]
-            _set_origin(root, bool(current), remote)
+        # Nothing is touched when the URL is already one of origin's URLs (a multi-URL origin stays as it is).
+        # When it changes, the record is written first and origin is changed after it (see _change_origin).
         if _has_url_password(remote):
             # The secret itself is never echoed here.
             sys.stderr.write("warning: the --remote URL contains a user name and password; git stores it in "
@@ -4923,19 +5132,8 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             sys.stderr.write("warning: the --remote URL contains credentials; git stores it in "
                              ".git/config as written. Use a credential helper instead.\n")
         if changed:
-            try:
-                change = {"type": "sync", "action": "other", "target": "git remote", "outcome": "ok",
-                          "detail": "origin %s -> %s" % (_safe_url(current[0]) if current else "-", _safe_url(remote))}
-                if current:
-                    # G1-05: replacing an existing origin must be in the chain. A tail mismatch here is not
-                    # swallowed: the change is undone below, the event is in the spool and the CLI exits 4.
-                    ledger.append(bot, change)
-                else:
-                    _bookkeep(change)
-            except BaseException:
-                # Every change of origin is recorded. When the record cannot be written, the change is undone.
-                _restore_origin(root, current, old_push)
-                raise
+            # Every change of origin is recorded (K10-06: before it is made; K9-02: never as a false "ok").
+            _change_origin(ledger, bot, root, current, remote, _bookkeep)
     status = _git(root, "status", "--porcelain").stdout
     pending = [l for l in status.splitlines() if l.strip()]
     _bookkeep({"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
@@ -4959,6 +5157,25 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         forced = [rel for rel in forced if rel in hidden]
     for start in range(0, len(forced), 200):
         _git(root, "add", "-f", "--", *forced[start:start + 200], check=False)
+    # K10-02: the first pass reads the files one after another, so an append in between can be staged as
+    # "log at N, state at N+1". Each chain is therefore staged once more while its shared lock is held:
+    # log and state are then read in one quiet moment. One bot lock at a time, as everywhere else.
+    for chain in ledger.valid_chains():
+        rels = [p for p in ("logs/%s" % chain, "state/%s.json" % chain, "state/%s.alert.json" % chain,
+                            "anchors/%s.json" % chain, "anchors/%s.history.jsonl" % chain,
+                            "archive/%s" % chain, "spool/%s" % chain)
+                if os.path.lexists(os.path.join(root, *p.split("/")))]
+        if not rels:
+            continue
+        prefixes = tuple(r + "/" for r in rels)
+        try:
+            with ledger.lock(chain, shared=True):
+                _git(root, "add", "-A", "--", *rels, check=False)
+                mine = [rel for rel in forced if rel in rels or rel.startswith(prefixes)]
+                for start in range(0, len(mine), 200):
+                    _git(root, "add", "-f", "--", *mine[start:start + 200], check=False)
+        except OSError:
+            continue  # the first pass staged this chain; _sync_drift below stays the backstop
     # Lock files and file-capture snapshots are local scratch: untrack any that an older version committed.
     _git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "state/*.lock", "state/capture-files-*.json", check=False)
     # The commit message goes into git history (and to the remote): it is scrubbed like a record field.
@@ -4999,6 +5216,14 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
                                "be backed up; not pushed" % linked)
         _bookkeep({"type": "sync", "action": "other", "target": "git", "outcome": "fail", "detail": result["error"][:300]})
         push = False
+    if push:
+        # K9-04: once a local origin exists, git still reads remote.origin.url / pushurl from every scope.
+        # A URL from the system or global configuration would divert or widen the push: fail closed.
+        outside = _foreign_origin(root) if _local_origin(root) else []
+        if outside:
+            result["error"] = ("origin is also defined outside the ledger repository (system or global git "
+                               "configuration: %s); not pushed" % _safe_url(outside[0]))
+            push = False
     if push:
         # Every push URL counts: remote.origin.pushurl may differ from the fetch URL and may list several.
         # D3-03 / G1-07: only an origin configured in the ledger repository itself is a push target. A remote of
@@ -5100,6 +5325,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
 
 SHELL_HOOK = r'''# >>> gblog shell hook >>>
 # gblog hook v2
+# gblog hook text 3
 # Logs every interactive shell command to the gblog ledger (source=auto).
 # Set GBLOG_TASK=<task id> after `gblog task-start` so commands attach to the task.
 __gblog_last=""
@@ -5131,8 +5357,10 @@ __gblog_hook() {
   if [ "$st" -eq 2 ] && [ -n "${GBLOG_BOT:-}" ] && [ "${GBLOG_BOT:-}" != "%(bot)s" ]; then
     # Only for a refused name. Any other exit 2 (an environment error such as a full disk) may already
     # have written the record; logging it again under another Bot would record the command twice.
+    # The refusal is the last line gblog wrote; a warning above an environment error is not a refusal.
+    err=${err##*$'\n'}
     case "$err" in
-      ""|*"bot name"*|*"no ASCII letters"*)
+      ""|"error: bot name "*|"error: '"*"has no ASCII letters or digits"*)
         gblog log --bot "%(bot)s" --task-id "${GBLOG_TASK:-}" --action shell --target="$cmd" \
           --outcome "$outcome" --source auto --detail "GBLOG_BOT=${GBLOG_BOT} was refused" >/dev/null 2>&1 || true
         ;;
@@ -5168,6 +5396,9 @@ BROWSER_HISTORY_GLOBS = (
     "/workspace/.config/chromium*/*/History",
 )
 _WEBKIT_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
+# K10-03: capture saves its progress (marker, snapshot) every this many appended records, so a killed run
+# re-imports at most that many.
+_CAPTURE_BATCH = 25
 
 
 def shell_hook(bot: str) -> str:
@@ -5347,6 +5578,7 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         last_target, newest = None, since
+        batch = 0  # rows appended since the marker of this history was last saved (K10-03)
         horizon = time.time() + 86400  # a visit dated more than one day ahead is not believed
         unusable = 0  # rows that cannot be a visit: no usable time, a time in the future, a non-text URL
         for visit_time, url, title in rows:
@@ -5361,6 +5593,13 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
             if epoch > horizon:
                 unusable += 1
                 continue  # dated in the future: skipped without moving the marker, or it would hide every later visit
+            if batch >= _CAPTURE_BATCH and visit_time > newest:
+                # K10-03: every row up to ``newest`` is in the ledger. The marker is saved only at a boundary
+                # between two visit times, because the resume query is ``visit_time > marker``.
+                markers[path] = newest
+                changed = True
+                save_markers(final=False)
+                batch = 0
             if not isinstance(url, str):
                 unusable += 1
             target = _url_target(url) if isinstance(url, str) else None  # a BLOB or numeric url cell is not a visit
@@ -5383,6 +5622,7 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
                     raise
                 last_target = target
                 added += 1
+                batch += 1
             newest = max(newest, visit_time)
         if unusable:
             sys.stderr.write("notice: skipped %d unusable row(s) in %s\n" % (unusable, _term(_clean_text(path))))
@@ -5500,15 +5740,52 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
                 changes.append(("deleted", rel))
     # What an earlier run left pending is logged first: sustained noise in early paths cannot starve a later one.
     changes.sort(key=lambda c: (c[1] not in carried, c[1]))
+    done = [0]  # changes of this run that are in the ledger (K10-03)
+
+    def save_progress(n: int) -> None:
+        # The snapshot advanced by the first ``n`` changes; the rest stays pending for the next run.
+        partial = dict(previous)
+        for kind_, rel_ in changes[:n]:
+            if kind_ == "deleted":
+                partial.pop(rel_, None)
+            else:
+                partial[rel_] = current[rel_]
+        save_snapshot(partial, [rel_ for _k, rel_ in changes[n:]])
+
+    def logged(record: Dict, counted: bool = True) -> None:
+        # K10-03: records and snapshot are not written together. When an append fails part-way through a
+        # run, the snapshot is advanced for what was logged, so the next run does not log it again.
+        try:
+            ledger.append(bot, record)
+        except BaseException as exc:
+            n = done[0]
+            tag = getattr(exc, "gblog_append", None)
+            if counted and tag and tag[0] in ("written", "unknown"):
+                try:  # the failing append may have written its line (the state replace failed)
+                    _tp, tail = ledger._tail_record(bot)
+                    if isinstance(tail, dict) and tail.get("hash") == tag[3]:
+                        n += 1
+                except Exception:
+                    pass
+            if n:
+                try:
+                    save_progress(n)
+                except Exception:
+                    pass
+            raise
+        if counted:
+            done[0] += 1
+            if done[0] % _CAPTURE_BATCH == 0:
+                save_progress(done[0])
     for kind, rel in changes[:limit]:
         # ``observed``: when the file was written (its mtime), so coverage can match a report made at that time
         # and not only one made around the capture run. A deletion happened after the previous snapshot.
-        ledger.append(bot, {"type": "action", "action": "file", "target": rel, "outcome": "ok", "detail": kind,
+        logged({"type": "action", "action": "file", "target": rel, "outcome": "ok", "detail": kind,
                             "source": "auto", "capture": "files",
                             "observed": None if kind == "deleted" else _mtime_iso(current.get(rel)),
                             "observed_from": prev_taken if kind == "deleted" else None})
     if len(changes) > limit:
-        ledger.append(bot, {"type": "note",
+        logged(counted=False, record={"type": "note",
                             "detail": "%d more file changes not listed individually; they stay pending for the next run"
                                       % (len(changes) - limit),
                             "source": "auto", "capture": "files"})
@@ -6723,7 +7000,40 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.days = 36500
 
 
+def _on_term(signum, _frame) -> None:
+    raise _Terminated(signum)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    # K10-04: SIGTERM and SIGHUP (timeout, systemd, a closing terminal) unwind the stack like Ctrl-C does,
+    # so temp files are removed, partial lines rolled back and capture progress saved. Exit 128 + signum.
+    previous: Dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for name in ("SIGTERM", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                old = signal.getsignal(sig)
+                if old is None or old is signal.SIG_IGN:
+                    continue  # ignored on purpose (nohup), or installed outside Python: left alone
+                signal.signal(sig, _on_term)
+                previous[sig] = old
+            except (ValueError, OSError):
+                continue
+    try:
+        return _guarded_main(argv)
+    except _Terminated as exc:  # arrived while another exception was being reported
+        return 128 + exc.signum
+    finally:
+        for sig, old in previous.items():
+            try:
+                signal.signal(sig, old)  # type: ignore[arg-type]
+            except (ValueError, OSError, TypeError):
+                pass
+
+
+def _guarded_main(argv: Optional[List[str]] = None) -> int:
     _ALIASES_WARNED.clear()  # one "aliases.json is unreadable" warning per run
     _RUN["cmd"] = None
     _tolerant_streams()
@@ -6756,6 +7066,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 0 when the pipe closed mid-run (`gblog export | head`); the real verdict when the run had
         # finished and only the final flush hit the closed pipe (a verify FAIL stays exit 1).
         return rc
+    except _Terminated as exc:
+        return 128 + exc.signum
     except KeyboardInterrupt:
         return 130
     except OSError as exc:
@@ -6979,6 +7291,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
             emit(b, res)
             if args.record:
                 detail = "; ".join(res["problems"]) or "%d records verified" % res["records"]
+                if (res.get("state_problem") and res["problems"] == [res["state_problem"]]
+                        and any(str(w).endswith("the next append repairs it") for w in res.get("warnings") or [])):
+                    # K10-07 b: this very record rolls the state forward; the chained trace must not read as tampering.
+                    detail = "state one record behind (interrupted append); repaired by this record"
                 if res["ok"] and res.get("approved_breaks"):
                     detail = "%s; %s" % (pass_label(res["approved_breaks"]), detail)
                 rc |= _record_verify(ledger, None if as_json else out, b, res, {"type": "verify", "action": "other", "target": "chain", "outcome": "ok" if res["ok"] else "fail",

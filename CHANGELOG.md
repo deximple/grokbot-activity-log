@@ -290,6 +290,52 @@ New documentation:
 - `SECURITY.md`, "Filesystem assumptions": what gblog assumes of the file system, what the code
   does, and the open limits (K2).
 
+### Regression and crash-safety reviews (K9, K10)
+
+Ids `K9-…` (regressions of the round-4 work) and `K10-…` (concurrency and crash safety) come from two
+specialist reviews of 2026-11-16. The High and Medium findings are fixed in the code;
+`tests/test_k9_k10.py` covers them.
+
+- **Backup repository guard (K9-01).** `gblog sync` refuses (exit 2, nothing changed) a git repository
+  at the ledger root that it cannot recognise as a ledger: `<root> is a git repository that is not a
+  gblog ledger (it tracks <path>)`. A repository it recognises is marked with `gblog.ledger = true`
+  in `.git/config` (read as a git boolean). A repository that gblog synced before (it tracks a day
+  file, an anchor history or an archived file), and a work tree that holds a ledger, is always
+  recognised, whatever else it tracks (`LICENSE`, `transcripts/`, `unified/`, `.gitattributes`);
+  gblog prints one `notice:` that names the extra paths and commits only its own files. A project
+  repository that tracks only `README.md` / `.gitignore` beside other files is refused. If `sync`
+  refuses your ledger, the operator runs `git -C "$GBLOG_ROOT" config gblog.ledger true` once.
+- **Origin changes (K9-02, K10-06).** The `git remote` record is written before `origin` is changed.
+  When `--replace-remote` cannot be recorded (tail mismatch on the sync Bot's chain), nothing is
+  changed and nothing is committed (exit 4); the spooled event says `NOT applied` with outcome
+  `denied`. When the record is durable although the call failed, the change is made. A failed
+  change after its record is a second record with outcome `fail`.
+- **Push gate (K9-04).** A `remote.origin.url` or `pushurl` in the system or global git
+  configuration beside a local `origin` is refused: `origin is also defined outside the ledger
+  repository …; not pushed` (exit 1 after the commit).
+- **Shell hook (K9-03).** The fallback to the installed Bot looks at the last stderr line only and
+  runs only for `error: bot name …` / `error: '<name>' has no ASCII letters or digits`. The hook
+  text carries the extra line `# gblog hook text 3`; run `gblog capture shell-hook --bot <slug>
+  --install` again.
+- **Durable tail before state (K10-01).** A recovery path (roll-forward, tail adoption, `sync` /
+  `capture browser` state seeding, `state rebuild`) fsyncs the adopted day file before a state file
+  names it. A failed `fsync` of a new line rolls the line back, like a failed write.
+- **Consistent backup commit (K10-02).** `sync` stages every chain a second time while it holds that
+  chain's shared lock, so a commit never holds a state file that is ahead of its log.
+- **Capture progress (K10-03).** `capture files` advances its snapshot for what an interrupted run
+  logged; both captures save progress every 25 records.
+- **Signals (K10-04).** SIGTERM and SIGHUP run the cleanup paths and exit `128 + signal` (143 for
+  SIGTERM). SIGINT, SIGTERM and SIGHUP are held back between a durable log line and its state
+  replace.
+- **`install.sh` (K10-05).** The executable is replaced by a rename.
+- **Crash wording (K10-07 a, b).** New `!` line beside the FAIL of a torn last line:
+  `<file>:<n>: last line is incomplete and state/<bot>.json names the record before it (interrupted
+  write): …`. `verify --record` on a chain that is one record behind records `state one record
+  behind (interrupted append); repaired by this record`.
+
+Open from these reviews: K9-05 (the other documents), K9-06 … K9-08, K10-07 c (needs a maintainer
+decision) and K10-08 … K10-12.
+
 ### Known open findings
 
 **Not** in the code yet: the items the deep reviews rated below Medium, and the specialist-review

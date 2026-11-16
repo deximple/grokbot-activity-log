@@ -46,8 +46,8 @@ class MalformedBase(unittest.TestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("GBLOG_TASK", None)
-        os.environ.pop("GBLOG_ROOT", None)
+        for key in ("GBLOG_TASK", "GBLOG_ROOT", "GBLOG_DEBUG", "GBLOG_BOT"):
+            os.environ.pop(key, None)
 
     def seed(self, bot="ops", n=2):
         return [self.ledger.append(bot, {"type": "note", "detail": "valid %d" % (i + 1), "ts": stamp(i)}) for i in range(n)]

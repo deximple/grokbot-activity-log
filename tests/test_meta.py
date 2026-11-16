@@ -71,6 +71,95 @@ def marked_in_source(text, filename="<tests>"):
     return found
 
 
+_OPEN_RE = re.compile(r"^\s*#\s*(bug|pending):")
+
+
+def commented_open(text):
+    """Names of tests with a "bug:" or "pending:" comment in the lines directly above their def (K6-02)."""
+    found, flagged = set(), False
+    for line in text.splitlines():
+        s = line.strip()
+        if _OPEN_RE.match(line):
+            flagged = True
+        elif s.startswith("def test") and flagged:
+            found.add(s[4:s.index("(")])
+            flagged = False
+        elif s and not s.startswith(("#", "@")):
+            flagged = False
+    return found
+
+
+def duplicate_names(text, filename="<tests>"):
+    """Top-level class names and ``Class.test`` names defined twice: the earlier one never runs (K6-19)."""
+    found, classes = [], set()
+    for cls in ast.parse(text, filename=filename).body:
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        if cls.name in classes:
+            found.append(cls.name)
+        classes.add(cls.name)
+        seen = set()
+        for item in cls.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
+                if item.name in seen:
+                    found.append("%s.%s" % (cls.name, item.name))
+                seen.add(item.name)
+    return found
+
+
+# "@@" stands for "#", so that this sample is not itself read as an open comment.
+_OPEN_SAMPLE = '''
+class S(unittest.TestCase):
+    @@ bug: X-1. documented, missing
+    @unittest.expectedFailure
+    def test_marked(self):
+        pass
+
+    @@ pending: X-2
+
+    def test_unmarked(self):
+        pass
+
+    @@ bug: X-3 belongs to the assignment below
+    x = 1
+
+    def test_plain(self):
+        pass
+'''.replace("@@", "#")
+
+_DUP_SAMPLE = '''
+class A(unittest.TestCase):
+    def test_a(self):
+        pass
+
+    def test_a(self):
+        pass
+
+    def helper(self):
+        pass
+
+    def helper(self):
+        pass
+
+
+class B(unittest.TestCase):
+    def test_a(self):
+        pass
+
+
+class A(unittest.TestCase):
+    def test_b(self):
+        pass
+'''
+
+
+def _test_sources():
+    for name in sorted(os.listdir(HERE)):
+        if name.startswith("test") and name.endswith(".py"):
+            with open(os.path.join(HERE, name), encoding="utf-8") as fh:
+                yield name, fh.read()
+
+
 def marked_tests():
     found = set()
     for name in sorted(os.listdir(HERE)):
@@ -96,6 +185,26 @@ class PendingListTest(unittest.TestCase):
         # the comparison below is only worth something if a marker is actually seen
         self.assertEqual(marked_in_source(_SAMPLE),
                          {"Sample.test_attribute_form", "Sample.test_name_form", "WholeClass.test_inside"})
+
+    def test_open_comment_detection(self):
+        self.assertEqual(commented_open(_OPEN_SAMPLE), {"test_marked", "test_unmarked"})
+        self.assertEqual(duplicate_names(_DUP_SAMPLE), ["A.test_a", "A"])
+
+    def test_open_comments_have_markers(self):
+        # K6-02: a test that is commented as an open bug must be marked (and therefore listed)
+        stale = []
+        for name, text in _test_sources():
+            marked = {entry.split(".", 1)[1] for entry in marked_in_source(text, name)}
+            stale += ["%s: %s" % (name, test) for test in sorted(commented_open(text) - marked)]
+        self.assertEqual(stale, [], "a 'bug:' / 'pending:' comment without @unittest.expectedFailure: "
+                                    "mark the test, or rewrite the comment as 'fixed: <id>'")
+
+    def test_no_shadowed_tests_or_classes(self):
+        # K6-19: a second definition of the same name silently drops the first one from the run
+        found = []
+        for name, text in _test_sources():
+            found += ["%s: %s" % (name, dup) for dup in duplicate_names(text, name)]
+        self.assertEqual(found, [])
 
     def test_pending_list_is_well_formed(self):
         entries = listed_tests()
