@@ -22,6 +22,8 @@ ids are written `A:…` (review A) and `B:…` (review B). Findings that R-01 �
 are not repeated below: `A:H-1` and `B:H1` (R-01), `A:H-3` and `B:M6` (R-09), `A:M-5` (R-08),
 `B:L7` (R-06), and the crash paths of `A:M-3`, `B:M1` and `B:L1` covered by R-05, R-06 and R-10.
 
+A few entries carry an id of the form `W-…`. They come from the round-3 audit of the same day.
+
 ### Known open findings
 
 The round-3 audit of 2026-11-16 (finding ids `T-…`, work items `W-…`) compared this section with
@@ -106,6 +108,10 @@ Read these before upgrading a routine or a script that branches on output or exi
   - `warning: ignoring logs/<dir> (invalid chain directory name); run gblog verify --all` (R-04);
   - `notice: state/<bot>.json was missing; adopted the log tail (seq <n>)` (R-07).
 - Tuning Markdown has an empty line before `### already applied` (R-11).
+- `tune` reads records from the start of the `--days` window or from 90 days ago, whichever is
+  earlier, plus the `tune` records of any age. Decisions (`applied`, `rejected`) therefore still
+  count however old they are. The "Effect of applied changes" table and `revert` proposals cover
+  only changes applied since that start (the last 90 days with the default `--days 28`) (W-11).
 - **`sync --remote` no longer replaces an existing `origin` (B:H3).** When `origin` already points
   somewhere else, `gblog sync --remote <url>` exits 2 and changes nothing. Pass `--replace-remote`
   to move the backup on purpose. Setting the first `origin`, or repeating the current URL, works as
@@ -172,9 +178,12 @@ Read these before upgrading a routine or a script that branches on output or exi
     changed `--path`, and a snapshot that is missing although the chain already holds
     file-capture records. The stdout line is unchanged (see "Known open findings").
 - The shell hook skips only a plain `gblog …` command. A command line that merely contains the word
-  `gblog`, or chains it with `;`, `&`, `|` or a substitution, is logged. A command that starts with
-  `-` is logged instead of being dropped. A hook that is already installed is not updated; see
-  "Upgrading" in the README (A:L-2, B:L5).
+  `gblog`, or chains it with `;`, `&`, `|`, a redirection or a command substitution (`$( … )`,
+  backticks), is logged. A plain command may use variables (`--bot "$BOT"`). A command that starts
+  with `-` is logged instead of being dropped. The hook text is marked `# gblog hook v2`. An upgrade
+  does not touch a hook that is already installed: run `gblog capture shell-hook --bot <slug>
+  --install` again, which replaces an older hook block in place; see "Upgrading" in the README
+  (A:L-2, B:L5, W-16).
 - `report --date D` also lists records whose `clock_regressed` value (the real wall-clock time)
   falls on day D, so activity written after a future-dated record stays in the daily report
   (A:M-6, B:L3).
@@ -229,7 +238,9 @@ Read these before upgrading a routine or a script that branches on output or exi
   with the remaining chains.
 - **Redaction (A:M-1, B:M5, A:L-4, A:L-5, B:L9).** Added, with no pattern removed:
   - names with a secret word glued in or in camelCase (`dbPassword=…`, `accessToken: …`,
-    `secretKey=…`, `PASSWORD2=…`, `APITOKEN=…`, `userpwd=…`);
+    `secretKey=…`, `PASSWORD2=…`, `APITOKEN=…`, `userpwd=…`). A counter is left as written: a name
+    that ends in `tokens` with a value of only digits, `_`, `.` or `,` (`max_tokens=100000`,
+    `prompt_tokens: 123456`) (W-17);
   - secret keys in a Python `dict` repr (`'password': '…'`);
   - prefixed flags (`--db-password …`, `--client-secret …`, `--auth-token=…`);
   - a PEM private-key block that was cut off before its `END` line. The PEM rule no longer takes
@@ -315,6 +326,10 @@ Read these before upgrading a routine or a script that branches on output or exi
   the weekly tune routine only.
 - Threat model, guarantees, non-guarantees, redaction lists and the private-remote policy were
   updated for the security-review fixes above (`SECURITY.md`, `docs/DESIGN.md`, README).
+- `docs/DESIGN.md` describes `state/.anchors.lock` as it is held, quotes the `verify` problem and
+  warning texts, and has a new section "Cost on a large ledger" (W-27, W-29).
+- The daily audit prompt re-hashes archived files once per run: the rollback check and `anchor`
+  use `--skip-archives`, and `verify --all --record` stays the full check (W-28).
 - Round-3 documentation pass (W-22, W-23). Claims that the code does not meet yet were moved to
   "Known open findings" above. Corrected: the lock name `state/.anchors.lock` and what it covers,
   the two `state_adopted` markers and their permanence, the archive-record rules, the day-rollup

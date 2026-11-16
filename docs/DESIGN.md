@@ -18,6 +18,7 @@ Contents:
 10. Reserved bot names
 11. Exit codes
 12. Deliberate non-features
+13. Cost on a large ledger
 
 ## 1. Threat model
 
@@ -290,7 +291,8 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
   size it had before the call. That removes only bytes the failing call wrote. A process killed
   mid-write can still leave a torn line (see "Crash outcomes").
 - State is re-read, merged with `{seq, head, updated}` and replaced atomically. Other keys
-  (`last_sync`, `capture_browser_last`) are preserved.
+  (`last_sync`, `capture_browser_last`) are preserved, except a state-level `state_adopted` object,
+  which moves onto the record (see "Other writers of state").
 
 ### Crash outcomes
 
@@ -334,6 +336,15 @@ takes the bot lock, and if the state file is missing or unreadable while logs ex
 `head` from a self-consistent tail (the same test and the same `notice:` line as `append`), or
 writes nothing and warns. A genesis state is never written over a non-empty
 chain.
+
+No record is appended on that path, so the adoption marker cannot go into the chain at once.
+`update_state` stores it in the state file instead, as
+`state_adopted: {"how": "missing" | "unreadable", "seq": <n>, "ts": <when>}`. While the key is
+there, `verify` warns `state/<bot>.json was re-created from the log tail at seq <n> (it was <how>):
+truncation before that record cannot be ruled out from state`. The next `append` to the chain
+writes `state_adopted: <how>` on its record and drops the key from the state file it writes. From
+then on the marker is part of the hash chain, not of a file the adversary can edit, and `verify`
+reports it as a record-level warning like any other `state_adopted` record.
 
 `update_state` appends no record, so it marks the adoption in state itself: the key
 `state_adopted` with the object `{"how": "missing" | "unreadable", "seq": <tail seq>, "ts": <when>}`.
@@ -441,7 +452,7 @@ Rules:
 | `spooled_at` | the record was replayed from the spool; time of the original refusal |
 | `spool_id` | name of the spool file it was replayed from |
 | `original_ts` | the `ts` the refused record carried, if any |
-| `state_adopted` | `missing` or `unreadable`: this append adopted the log tail because `state/<bot>.json` was absent or could not be read (written since 0.6.1). `verify` warns about every such record |
+| `state_adopted` | `missing` or `unreadable`: this append adopted the log tail because `state/<bot>.json` was absent or could not be read, or `update_state` had done so before it and left the marker in the state file (section 4). Written since 0.6.1. `verify` warns about such records: the first few one by one, then a count |
 
 ### Per type
 
@@ -515,7 +526,8 @@ Not stored on disk:
 - `_dedup`: returned by `archive_file`.
 
 Readers other than `export` also replace a non-string value in a text field (`type`, `task_id`,
-`task`, `action`, `target`, `outcome`, `detail`, `source`, `decision`, `observed`, `kind`) with its
+`task`, `action`, `target`, `outcome`, `detail`, `source`, `decision`, `observed`, `kind`, `capture`,
+`profile`, `chain`) with its
 JSON text in memory, so a hash-valid record with odd field types cannot crash a report.
 Since 0.6.1 `append` refuses such a value (section 4), so only hand-written lines and older
 records carry one. `verify` warns about them.
@@ -562,7 +574,8 @@ and `      ! <warning>` lines. Warnings do not change the exit code. `PASS` is n
 callers must report the count.
 
 Only regular files take part in the walk. Any other `*.jsonl` entry in the chain directory (a FIFO,
-a directory, a device) is a problem and is never opened, so it can hang neither `verify` nor an
+a directory, a device) is a problem (`<path>: not a regular file`) and is never opened, so it can
+hang neither `verify` nor an
 `append` that holds the lock.
 
 Problem and warning lines can quote ledger content: a `bot` field, a file name, an anchor `ts`.
@@ -654,12 +667,14 @@ A synthetic entry has exactly these keys: `bot`, `ok` (`false`), `records` (0), 
 `problems`, `warnings` (empty) and `missing` (`true`).
 
 A chain whose verification stopped on an unexpected internal error also gets an entry, with
-`ok: false` and one problem that names the error. The other chains are verified as usual.
+`ok: false` and one problem that names the error (`verify aborted: <class>[: <text>]`). The other
+chains are verified as usual.
 
 ## 8. Anchor files and history
 
 `gblog anchor` verifies each chain and writes three things. There is no whole-ledger skip: one FAIL
-chain never drops the others.
+chain never drops the others. `anchor --skip-archives` runs that verification without re-hashing
+archived files, as `verify --skip-archives` does; anchor files and output lines do not change.
 
 **`anchors/<bot>.json`** — the latest entry.
 
@@ -805,7 +820,7 @@ letter or digit at all) is not a chain:
 | Code | Meaning | Examples |
 |---|---|---|
 | 0 | Success | any write; `verify` with only `OK` / `PASS (N approved break(s))` lines (warnings do not change it); `sync --no-push`; a closed output pipe |
-| 1 | Integrity FAIL, or not pushed | `verify` / `anchor` with a FAIL chain; `verify --bot` or `anchor --bot` with no chain on disk; a chain whose logs are missing while its state file, anchor or anchor history survives; an invalid directory name under `logs/`; a `--contains` miss; `verify --record` whose record append was refused; `sync` that committed but did not push; `capture browser` with no readable history |
+| 1 | Integrity FAIL, not pushed, or an unexpected internal error | `verify` / `anchor` with a FAIL chain; `verify --bot` or `anchor --bot` with no chain on disk; a chain whose logs are missing while its state file, anchor or anchor history survives; an invalid directory name under `logs/`; a `--contains` miss; `verify --record` whose record append was refused; `sync` that committed but did not push; `capture browser` with no readable history; an unexpected internal error (`error: internal error (…)`, see below) |
 | 2 | Usage or environment error (see below for what may have been written) | unknown flag or value; invalid, past or far-future `--ts`; an invalid date; `verify --contains` with `--all`; unregistered name under `alias strict on`; reserved name; alias conflict; unreadable `--file`; corrupt side file; an unreadable `state/aliases.json` that an `alias` command would overwrite; `git` failure; `seal` refusal; `state rebuild` refusal; unknown proposal id; `OSError` such as a full disk |
 | 3 | Policy refusal | `sync` would push to a public GitHub remote, or to one whose visibility cannot be confirmed |
 | 4 | Tail mismatch | an append was refused and the event is in `spool/<bot>/`; `sync` after committing, when one of its own records was refused; `spool replay` refused again |
@@ -836,9 +851,12 @@ Cases added in 0.6.1 by the security reviews:
   variant; a spooled event that `spool replay` will not replay.
 - Exit 3: a GitHub URL that cannot be mapped to one repository.
 
-An unexpected internal error is printed as one `error:` line with a non-zero exit code. Set
-`GBLOG_DEBUG=1` to see the traceback. In `verify --all` and `anchor` such an error is a FAIL of the
-chain it happened in, not the end of the run.
+An unexpected internal error is printed as one line,
+`error: internal error (<class>[: <text>]); set GBLOG_DEBUG=1 for a traceback`, and exits 1. It
+shares that code with an integrity FAIL on purpose: for `verify` and `anchor`, exit 1 is the
+fail-closed answer. In `verify --all` and `anchor` such an error is a FAIL of the chain it happened
+in (`verify aborted: <class>[: <text>]`), not the end of the run. With `GBLOG_DEBUG=1` the
+exception is raised with its traceback instead, also from inside `verify --all` and `anchor`.
 
 ## 12. Deliberate non-features
 
@@ -849,7 +867,8 @@ chain it happened in, not the end of the run.
 - **No signatures or HMAC with an on-box key.** The adversary has the same file access; use off-box
   anchors.
 - **No change to the canonical JSON, hash algorithm or schema `v`.**
-- **No third-party dependencies and no database backend.** Per-append cost stays O(1) and the JSONL
+- **No third-party dependencies and no database backend.** The cost of an append does not grow
+  with the number of records (one directory listing per append; see section 13), and the JSONL
   files stay human-readable.
 - **No per-Bot attribution of shared-computer browser or file activity.** It is not knowable from
   the evidence.
@@ -873,6 +892,37 @@ chain it happened in, not the end of the run.
   rule of `report --date` cover the effect.
 - **No guard against `git` used directly.** `--replace-remote`, the visibility check and the
   committed-content check protect `gblog sync`. A same-user process can still run `git push`.
+
+## 13. Cost on a large ledger
+
+N is the number of records in a chain, D the number of its day files, C the number of chains and A
+the total size of the archived files. The table says what each command reads, so that a later
+change can be checked against it. The figures follow from the code; they are not measurements.
+
+| Command | Reads | Cost |
+|---|---|---|
+| `append` (`task-start`, `log`, `note`, …) | one listing of `logs/<bot>/`; the last line of the newest day file, read backwards in 64 KiB blocks; `state/<bot>.json` | Does not grow with N. One directory listing of D entries per append; older day files are not opened. One fsync each for the day file, the state file and `state/`. `logs/<bot>/` is fsynced as well when the append creates the day file |
+| `verify --bot B` | every line of every day file of the chain, once, under the shared lock; the state file and both anchor files; archived files after the lock is released | O(N) time and memory: each line is parsed and hashed once, and the parsed records and their hashes are kept until the result is returned. The raw text of the lines is kept only with `--strict`. Plus O(A) to decompress and re-hash the archives, unless `--skip-archives` is given. The `ledger` chain is searched for the witness note only when a pinned `break_ack` was honoured |
+| `verify --all`, `anchor` | the above for each chain, one chain at a time | The sum over all chains. `anchor` verifies before it writes; `anchor --skip-archives` saves the O(A) part |
+| `status` | one read of each chain's state file; the day files of the last 30 days; the alert file and the spool directory of each chain | O(records of the last 30 days). Does not grow with older history |
+| `report --date D` | the day-D file of each chain; every later day file as raw lines | O(records of day D) parsed. Later files are scanned for `clock_regressed`, and only a line that contains that key is parsed |
+| `report --since`, `export --since`, `coverage` | day files from the start date on | O(records since that date), held in memory and sorted. `coverage` compares an observed action only with the self-reports of the same Bot, action kind and normalised target |
+| `tail -n k` | per chain, day files newest first, until k readable records were found | O(C × k) records in the usual case: one day file per chain for a small k |
+| `tune --days W` | records from the start of the window or from 90 days ago, whichever is earlier; older day files as raw lines, of which only lines that contain `"tune"` are parsed | O(records in that range), held in memory. Older history costs a raw scan only |
+| `sync` | git's own work; every log, anchor-history and archive file once more for the committed-content check | git cost plus O(bytes of the log, anchor-history and archive files). `git add -f` is used only for evidence files that git does not track yet. The re-hash is deliberate: it is the check for the case where the git index lies |
+| `export` without `--since` | every record of the selected chains | O(N) memory: the records are loaded and sorted before they are printed |
+
+The daily routine (`docs/routine-daily-audit.md`) re-hashes archived files once per run: step 2
+(`gblog verify --all --record`) does it, and the rollback check in step 1 and the `gblog anchor`
+call use `--skip-archives`.
+
+Two costs are kept on purpose:
+
+- The chain walk of `verify` is not streamed. It keeps the parsed records of one chain in memory,
+  because the order and the text of the problems on a broken chain depend on seeing both sides of
+  every join.
+- `sync` re-hashes the evidence files on every run. A cache of "already verified" files would
+  have to trust what the committed-content check exists to distrust.
 - **No FAIL for an `archive` record that names no file.** `gblog log --type archive` writes one, a
   chain cannot be repaired afterwards, and `gblog log` is on the Auto-review allow-list. Such a
   record is a warning, and a problem only with `--strict`.

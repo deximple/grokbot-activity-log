@@ -317,8 +317,8 @@ Not captured:
 - non-interactive tool shells and zsh;
 - commands that bash keeps out of history;
 - a command identical to the one just before it;
-- a plain `gblog …` call. A `gblog` command line that contains `;`, `&`, `|`, `$`, a backtick,
-  `<`, `>` or a line break is logged.
+- a plain `gblog …` call, with or without variables such as `"$BOT"`. A `gblog` command line that
+  contains `;`, `&`, `|`, `$(`, a backtick, `<`, `>` or a line break is logged.
 
 The hook discards the output of its own `gblog` call, so an alert caused by a hook record shows up
 only in `gblog status`.
@@ -345,7 +345,9 @@ the snapshot in `state/capture-files-<bot>.json`.
   the names given with `--exclude`.
 - Each difference is logged as `created`, `modified` or `deleted`.
 - The first run, a run after the snapshot was lost or became unreadable, and a run with a
-  different `--path` take a new baseline and log nothing. gblog says so on stderr.
+  different `--path` take a new baseline and log nothing. The output line then ends with
+  ` (new baseline: <reason>)`, and for every reason except a first run gblog also says so on
+  stderr. Add `--record-baseline` to append an `auto` note to the ledger as well.
 - At most `--limit` changes (default 200, minimum 1) are logged per run. The rest stay pending for
   the next run, and a note records how many.
 
@@ -408,16 +410,19 @@ Partly, and it is untested there: CI runs on Linux and macOS only.
 
 | Operation | Cost |
 |---|---|
-| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file, its directory and the state file. |
+| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file and the state file, and the chain directory when it creates a day file. |
 | `verify`, `anchor` | Linear in the chain. Every record is read into memory and re-hashed, and every archived file is decompressed and re-hashed. `--skip-archives` skips that last part. |
 | `report --date D` | Reads the day file for D. It also scans later day files for records whose real wall-clock day was D (`clock_regressed`). |
 | `status` | Reads the last 30 days of each chain. |
-| `tail`, `tune` | Read the whole history of the selected Bots. `tune --days` limits the analysis, not the read. Use `--bot` to narrow both. |
+| `tail` | Reads the newest day files of each chain until it has enough records. Use `--bot` to narrow it. |
+| `tune` | Reads from the start of the `--days` window or from 90 days ago, whichever is earlier, plus the `tune` records of any age. Use `--bot` to narrow it. |
 | `coverage`, `export` | Read from `--days` or `--since` onward. |
 | `sync` | git cost, plus a re-hash of the log, anchor-history and archive files to compare them with the commit. |
 
 Logs are split into one file per UTC day, so there is nothing to rotate. Do not delete old day
 files: the chain walk starts at the first record, and a missing prefix is a FAIL.
+
+The reference for these costs is the table in [`docs/DESIGN.md`](DESIGN.md), section 13.
 
 ### 36. Can several Bots write at the same time?
 

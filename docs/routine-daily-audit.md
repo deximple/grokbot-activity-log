@@ -22,7 +22,8 @@ Every day at 23:50 (my time zone), run the ledger audit. gblog days are UTC days
    `expected hash ... not found in chain`, or `no chain on disk` for a chain that was posted yesterday, is a ROLLBACK:
    report it under that word with the chain name and the full hash. Do not try to fix it.
    If there is no previous "Chain heads" block, say "no previous heads to check" and continue.
-2. `gblog verify --all --record`, then `gblog anchor` even if verify exited 1.
+2. `gblog verify --all --record`, then `gblog anchor --skip-archives` even if verify exited 1.
+   Do not add `--skip-archives` to `gblog verify --all --record`: it is the one step of this run that re-hashes archived files.
    Anchor is per chain: OK chains resume from their own previous anchor; a FAIL chain is stored with its break descriptor and both segment heads. Do not replace this with a whole-ledger skip.
    `PASS (N approved break(s))` exits 0 and means a discontinuity that was already sealed; report the count. It is not a clean chain.
    Lines that start with `!` under a chain are warnings (for example a missing or reset state file, or a missing witness note). They do not change the exit code. Report every `!` line verbatim, even when the chain says OK.
@@ -87,6 +88,10 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
   on its line. In step 2, `gblog verify --all --record` re-hashes every archived file. `gblog anchor` then
   verifies every chain again, archives included, before it writes the anchors. Two full passes in step 2
   are expected; do not drop one to save time.
+- **Archived files are re-hashed once per run, in step 2.** `gblog verify --all --record` decompresses
+  and re-hashes every archived file. The rollback check in step 1 only asks whether a head is still in
+  the chain, and `gblog anchor` verifies every chain again right after step 2, so both run with
+  `--skip-archives`. Without the flag every archive would be read three times per run.
 - **No capture step.** `gblog capture browser` and `gblog capture files` run in the weekly tune routine
   (`docs/routine-weekly-tune.md`, step 2) and nowhere else. The shell hook needs no routine.
 

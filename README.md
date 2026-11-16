@@ -474,8 +474,10 @@ is now refused with exit 3.
 
 **6. Auto-review rule and shell hook.** Replace a blanket *Allow automatically* rule for `gblog`
 with the allow-list in setup step 6. An upgrade does not update the shell hook in `~/.bashrc`:
-remove the block between `# >>> gblog shell hook >>>` and `# <<< gblog shell hook <<<`, then run
-`gblog capture shell-hook --bot <slug> --install` again to get the stricter skip rule.
+run `gblog capture shell-hook --bot <slug> --install` again; it replaces an older hook block (the
+lines between `# >>> gblog shell hook >>>` and `# <<< gblog shell hook <<<`) in place and prints
+`updated hook in <rc file>`. If the block still has no `# gblog hook v2` line afterwards, remove it
+by hand and run the command again.
 
 ## Development
 
