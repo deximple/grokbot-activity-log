@@ -76,9 +76,11 @@ for `gblog sync` only, not for `git` used directly.
 | A line that is not a JSON object, not UTF-8, or has wrong field types | corrupt-record rule |
 | A `break_ack` that is not the pinned incident (section 9) | verify-time pin |
 | An archived file modified, missing, addressed outside `archive/`, or stored under a name that is not `<sha256>.gz`; an `archive` record that has only one of `path` and a 64-hex `sha256` | re-hash, path check and address check. A record that names neither is a warning (section 7) |
-| The tail truncated, the chain emptied, or the chain rewritten, **while a witness survives** | state head mismatch (checked even when the walk finds zero records); anchor containment (section 8); `verify --contains` |
+| The tail truncated, the chain emptied, or the chain rewritten, **while a witness survives** | state head mismatch (checked even when the walk finds zero records); anchor containment, including the newest day rollup (section 8); `verify --contains` |
 | A whole chain deleted while `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, a day-rollup entry (`anchors/days/*.json`) or `state/<bot>.json` survives | missing-chain check in `verify --all`, and in `verify --bot <name>` for that exact name |
 | A `*.jsonl` entry under `logs/<bot>/` that is not a regular file (FIFO, directory, device) | regular-file check; the entry is never opened |
+| A state, anchor, anchor-history or archive file that is not a regular file (also behind a symlink) | regular-file check; the file is never opened. A non-regular alias registry, alert file or day rollup is treated as unreadable |
+| A chain directory that cannot be listed | `logs/<bot>: cannot be listed (<class>)`; it is not taken for an empty chain |
 | A directory under `logs/` whose name is not a valid chain key (`logs/my bot`, `logs/ops.`, `logs/---`) | invalid-directory check in `verify --all`. Its records are not verified, and readers ignore the directory |
 
 `gblog verify` prints a warning (a `!` line, exit code unchanged) when it has lost a witness:
@@ -101,7 +103,8 @@ This is a warning, not a FAIL. The chain is intact, and refusing to append would
 
 **One chain cannot hide the others.** `verify --all` and `anchor` treat an unexpected error while
 one chain is checked as a FAIL of that chain and continue with the next one. A poisoned line, file
-or side file never turns into a whole-ledger skip.
+or side file never turns into a whole-ledger skip. This covers `anchor`'s own pre-checks and
+writes: a failure there is the FAIL entry `anchor aborted: <class>` for that chain.
 
 **The "state missing" warning survives an append.** An append that adopts the log tail writes a
 fresh state file, which would end the warning above. The record that adopted the tail therefore
@@ -144,10 +147,13 @@ state/<bot>.json                   chain head (seq, head, updated) + last_sync +
 state/<bot>.lock                   flock target for that chain
 state/<bot>.alert.json             latest tail-mismatch refusal (page on this file)
 state/<bot>.alert.resolved-<stamp>.json   alert renamed after a complete spool replay
-state/capture-files-<bot>.json     file-capture snapshot (not committed; see .gitignore)
+state/capture-files-<bot>.json     file-capture snapshot (not committed; see .gitignore); one more
+                                   capture-files-<bot>.<tag>.json per additional --path
 state/aliases.json, aliases.lock   alias registry and its lock
 state/.anchors.lock                held for the whole run of `gblog anchor` (section 5)
-spool/<bot>/<stamp>-<id>.json      event preserved when an append was refused
+spool/<bot>/<stamp>-<nnnn>-<id>.json  event preserved when an append was refused; <nnnn> counts the
+                                   refusals of one second, so names sort in refusal order
+                                   (files written before 0.6.1 have no counter)
 spool/<bot>/replayed/              spool files after a successful replay
 anchors/<bot>.json                 latest anchor of that chain
 anchors/<bot>.history.jsonl        append-only anchor history
@@ -216,8 +222,13 @@ it is a UTF-8 JSON object whose `hash` equals the hash of its body.
 | present | present | tail self-consistent, `tail.prev == state.head`, `tail.seq == state.seq + 1` | **roll forward** |
 | present | present | anything else (state ahead, state far behind, tail corrupt) | **refuse** |
 
-"Unreadable" includes a state file that parses but is not a JSON object. In the first column,
-"present" means the file exists and parses to an object.
+"Unreadable" includes a state file that parses but is not a JSON object, an object whose `head` is
+not a string, and a path that is not a regular file. In the first column, "present" means the file
+exists and parses to an object with a string `head`.
+
+A state file that names the right `head` with a wrong `seq` falls under "anything else": `append`
+refuses. `verify` warns `state/<bot>.json: seq <n> does not match the last record (seq <m>);
+appends are refused until gblog state rebuild`, and `state rebuild` repairs it.
 
 A state file that exists but cannot be read follows exactly the same rule as a missing one, in
 `append` and in `update_state`. When a tail is adopted this way, the command prints one of these
@@ -238,7 +249,9 @@ itself appends before it verifies.
 between the two, or an `ENOSPC` while writing the state file, leaves state exactly one record behind
 a valid tail whose `prev` is the state head. That is the only mismatch a crash inside `append` can
 produce, so it is the only one repaired automatically. The append adopts the tail, prints
-`notice: recovered state/<bot>.json after an interrupted append` on stderr and continues. State
+`notice: recovered state/<bot>.json after an interrupted append` on stderr and continues. It writes
+the adopted tail to state before the new line, so a second failed state write appends nothing and
+leaves state exactly one record behind again. State
 *ahead* of the log cannot come from a crash inside `append`. It means the log was replaced or
 truncated outside the lock, and it is always refused.
 
@@ -277,20 +290,24 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
 - Reserved keys (`v`, `seq`, `bot`, `prev`, `hash`) supplied by the caller are ignored. `None` and
   `""` values are dropped.
 - Top-level string values pass through `redact()`. Text that cannot be encoded as UTF-8 is replaced
-  with backslash escapes instead of failing the append.
+  with backslash escapes instead of failing the append. The generated `path` and `sha256` of an
+  `archive` record are stored as written: a Bot name shaped like a key prefix (`xai-…`, `sk-…`)
+  used to turn the path into `archive/[REDACTED]/…`, a permanent FAIL. `verify` resolves such an
+  older record to the chain's own archive directory.
 - The text fields listed at the end of section 6 must be strings, and every number must be finite.
   A record that breaks either rule (a list as `task_id`, `NaN`) is refused before anything is
   written; the CLI exits 2. Records already on disk are not affected.
 - The line goes to `logs/<bot>/<ts[:10]>.jsonl`. If that file is non-empty and does not end in a
   newline, a newline is written first, so two records can never share a line.
-- No write follows a symlink at its final path component: day files, state, anchors, reports,
-  tuning files, snapshots, archive files and lock files. Temporary files have per-process names
-  (`<path>.<pid>.tmp`). A
-  symlink at such a path is an error (exit 2).
+- No write follows a symlink at its final path component. Day files, anchor histories, lock files,
+  reports and tuning files are opened with `O_NOFOLLOW`: a symlink there is an error (exit 2).
+  State, anchor, rollup, snapshot and archive files are written to a per-process temporary file
+  (`<path>.<pid>.tmp`, also opened with `O_NOFOLLOW`) that replaces the path, so a symlink there
+  is replaced by a regular file.
 - If the write of a line fails part-way (for example `ENOSPC`), the file is truncated back to the
   size it had before the call. That removes only bytes the failing call wrote. A process killed
   mid-write can still leave a torn line (see "Crash outcomes").
-- State is re-read, merged with `{seq, head, updated}` and replaced atomically. Other keys
+- The state object read under the lock (step 2) is merged with `{seq, head, updated}` and replaced atomically. Other keys
   (`last_sync`, `capture_browser_last`) are preserved, except a state-level `state_adopted` object,
   which moves onto the record (see "Other writers of state").
 
@@ -302,6 +319,11 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
 | during step 6 (torn line) | a partial last line | refused (corrupt tail). Not auto-repaired: restore the log from backup |
 | between 6 and 7 | line durable, state one behind | roll-forward |
 | after 7 | consistent | normal |
+
+Two known limits (CHANGELOG, "Known open findings"). When the interrupted append was the first
+record of a chain, there is no state file yet: the next append treats it as a missing state file,
+and its record carries `state_adopted`. While state is one record behind, `verify` reports the
+state-head mismatch as FAIL until the next append repairs it.
 
 ### Recovery tooling (append-only)
 
@@ -346,8 +368,7 @@ writes `state_adopted: <how>` on its record and drops the key from the state fil
 then on the marker is part of the hash chain, not of a file the adversary can edit, and `verify`
 reports it as a record-level warning like any other `state_adopted` record.
 
-`update_state` appends no record, so it marks the adoption in state itself: the key
-`state_adopted` with the object `{"how": "missing" | "unreadable", "seq": <tail seq>, "ts": <when>}`.
+`update_state` refuses a reserved name for a new chain, like `append` (section 10).
 
 ### Traces of a lost state file
 
@@ -357,14 +378,15 @@ different trace:
 | State re-created by | Trace | `verify` afterwards |
 |---|---|---|
 | `append` (any logging command) | field `state_adopted` (`missing` or `unreadable`) on the record that adopted the tail; part of the hashed body | `! <file>:<line>: appended while state/<bot>.json was <how>; truncation before seq <n> cannot be ruled out from state` |
-| `sync`, `capture browser` (through `update_state`) | key `state_adopted: {how, seq, ts}` in `state/<bot>.json`; no record is appended | `! state/<bot>.json was re-created from the log tail at seq <n> (it was <how>): truncation before that record cannot be ruled out from state` |
+| `sync`, `capture browser` (through `update_state`) | key `state_adopted: {how, seq, ts}` in `state/<bot>.json`, until the next `append` moves it onto its record (first row) | `! state/<bot>.json was re-created from the log tail at seq <n> (it was <how>): truncation before that record cannot be ruled out from state` |
 | `gblog state rebuild` (operator) | a `note` record with `source: auto` and the detail `state rebuilt from log tail (was seq - head missing)` (or `unreadable`) | no `!` line |
 
-Both `!` lines are permanent:
+The record-level `!` line is permanent. The state-level one lasts until the next append:
 
 - The record field is part of the hash chain and cannot be removed.
-- The state key is kept by every later `append` and by `state rebuild`, which merge into the
-  existing state object.
+- The state key is kept by `update_state`. The next `append` (also the note that `state rebuild`
+  writes) moves it onto its record and drops the key. The record value is the key's `how`, or
+  `unknown` when that is neither `missing` nor `unreadable`.
 
 Each line means the same thing: at that point the state witness was gone, so state cannot show
 whether the tail was cut just before. What to do with one:
@@ -379,7 +401,7 @@ whether the tail was cut just before. What to do with one:
 | Lock file | Mode | Held by |
 |---|---|---|
 | `state/<bot>.lock` | exclusive (`LOCK_EX`) | `append`, `update_state`, `state rebuild` |
-| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it snapshots the log lines (parsed record and raw text), `state/<bot>.json`, `anchors/<bot>.json` and the lines of `anchors/<bot>.history.jsonl` |
+| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it snapshots the log lines (parsed record and raw text), `state/<bot>.json`, `anchors/<bot>.json`, the lines of `anchors/<bot>.history.jsonl` and the newest day-rollup entry that names the chain |
 | `state/aliases.lock` | exclusive | `alias add`, `alias remove`, `alias strict`: the read, the change and the write of `state/aliases.json` happen in one hold |
 | `state/.anchors.lock` | exclusive | `anchor`, for its whole run: the verify of every chain, the anchor files and the read-merge-write of `anchors/days/<date>.json` |
 
@@ -399,10 +421,8 @@ Rules:
    make a running `verify` report a head that is "no longer in the chain".
 3. **No re-entry.** `flock` is per open file description. Code that already holds a bot lock must
    not call the public `append` for the same bot, because the second acquisition would deadlock.
-   `_Lock` still carries a per-thread table of exclusive holds (`_held`) from 0.6.0. It turns a
-   second request by the thread that already holds the exclusive lock into a no-op. No code path
-   nests a lock on the same file, and new code must not rely on the table: it is scheduled for
-   removal (CHANGELOG, "Known open findings").
+   `_Lock` keeps no re-entrancy state (the 0.6.0 table `_held` is gone). No code path nests a lock
+   on the same file.
 4. **`aliases.lock` is a leaf; `.anchors.lock` is an outer lock.** `aliases.lock` is taken alone
    and nothing else is acquired while it is held. `state/.anchors.lock` is not a leaf:
    - It is held for the whole `anchor` run, so `verify` takes each chain's shared bot lock while
@@ -452,7 +472,7 @@ Rules:
 | `spooled_at` | the record was replayed from the spool; time of the original refusal |
 | `spool_id` | name of the spool file it was replayed from |
 | `original_ts` | the `ts` the refused record carried, if any |
-| `state_adopted` | `missing` or `unreadable`: this append adopted the log tail because `state/<bot>.json` was absent or could not be read, or `update_state` had done so before it and left the marker in the state file (section 4). Written since 0.6.1. `verify` warns about such records: the first few one by one, then a count |
+| `state_adopted` | `missing` or `unreadable` (`unknown` when a marker moved from the state file had no usable `how`): this append adopted the log tail because `state/<bot>.json` was absent or could not be read, or `update_state` had done so before it and left the marker in the state file (section 4). Written since 0.6.1. `verify` warns about such records: the first few one by one, then a count |
 
 ### Per type
 
@@ -464,7 +484,7 @@ captured actions also carry:
 | Field | Meaning |
 |---|---|
 | `capture` | `browser` or `files` (shell-hook records have `source: auto` and no `capture`) |
-| `observed` | browser only: UTC time of the visit in the history database (`ts` is the import time) |
+| `observed` | browser: UTC time of the visit in the history database (`ts` is the import time). Files: modification time of a created or modified file; a `deleted` record carries `observed_from` (the time of the previous snapshot) instead |
 | `profile` | browser only: name of the profile directory the history came from |
 
 For browser records `target` is `scheme://host/path` and `detail` is the page title (first 120
@@ -484,7 +504,9 @@ auto`, and `outcome` derived from it (`allowed`/`auto` → `ok`, `denied` → `d
 - the seal witness on the `ledger` chain: `target` (the sealed bot), `break` (same descriptor as the
   ack) and `jay_approval_id`.
 
-**`sync`** — `target` `git` or `git push`, `outcome` `pending` or `denied`, `detail`.
+**`sync`** — `target` `git` (`outcome` `pending` before the commit; `fail` when the committed
+content differs from disk), `git push` (`denied`) or `git remote` (`ok`: `origin` was set or
+changed), and `detail`.
 
 **`verify`** — written by `verify --record`: `target` `chain`, `outcome` `ok` or `fail`, `detail`
 with the problems or the record count.
@@ -504,9 +526,9 @@ and:
 | `kind` | `transcript`, `message`, `artifact`, `other` |
 | `sha256` | SHA-256 of the stored (redacted, uncompressed) content |
 | `bytes` | length of the stored content |
-| `path` | `archive/<bot>/<date>/<sha256>.gz`, relative to the ledger root |
+| `path` | `archive/<bot>/<date>/<sha256>.gz`, relative to the ledger root; stored as written, never redacted |
 | `redacted` | `true` if redaction changed the content |
-| `scanned` | present and `false` whenever the content was stored without secret scanning: redaction was requested but the content was binary or not UTF-8, or `--no-redact` was given. Absent when the content was scanned |
+| `scanned` | present and `false` whenever the content was stored without secret scanning: redaction was requested but the content is not UTF-8 text and holds a NUL byte, or `--no-redact` was given. Absent when the content was scanned (text with stray invalid bytes is scanned) |
 
 **`break_ack`** — written only by `seal`.
 
@@ -520,7 +542,7 @@ Not stored on disk:
 
 - `chain`: added in memory when variant chains are merged under one slug.
 - `bot_field`: readers attribute a record to the chain directory it is stored in. When the stored
-  `bot` differs from that directory, the in-memory copy gets `bot` set to the directory name and
+  `bot` differs from that directory (also when it is not a string), the in-memory copy gets `bot` set to the directory name and
   `bot_field` set to the stored value. `gblog export` prints records as stored and never adds it.
   `verify` warns about such a record, and FAILs it with `--strict`.
 - `_dedup`: returned by `archive_file`.
@@ -541,7 +563,7 @@ The state file is not a record, but `append`, `verify` and `status` read it.
 | `seq`, `head`, `updated` | `append`, `state rebuild`, and `update_state` when it adopts the tail | position, hash and `ts` of the last record |
 | `last_sync` | `sync` | `{ts, commit, pushed}` of the last sync |
 | `capture_browser_last` | `capture browser` | one marker per history file path |
-| `state_adopted` | `update_state` only | `{how, seq, ts}`: state was missing or unreadable (`how`) and was re-created from the log tail at `seq`. Later writers keep the key, and `verify` warns about it for as long as it is there (section 4) |
+| `state_adopted` | `update_state` only | `{how, seq, ts}`: state was missing or unreadable (`how`) and was re-created from the log tail at `seq`. The next `append` moves it onto its record and drops the key; `verify` warns about it for as long as it is there (section 4) |
 
 ## 7. Verification
 
@@ -578,6 +600,12 @@ a directory, a device) is a problem (`<path>: not a regular file`) and is never 
 hang neither `verify` nor an
 `append` that holds the lock.
 
+The same rule covers the side files. A `state/<bot>.json`, `anchors/<bot>.json`,
+`anchors/<bot>.history.jsonl` or archived file that is not a regular file (also behind a symlink)
+is a problem and is never opened. Elsewhere such a state file, alias registry, alert file or day
+rollup is treated as unreadable. A chain directory that cannot be listed is the problem
+`logs/<bot>: cannot be listed (<class>)`, not an empty chain.
+
 Problem and warning lines can quote ledger content: a `bot` field, a file name, an anchor `ts`.
 Control characters in them are neutralised before printing, so a crafted value cannot erase or
 forge a line on a terminal. `tail`, `status`, `spool list` and `alias list` follow the same rule.
@@ -591,7 +619,8 @@ Warnings:
 - a record whose `bot` differs from its chain directory;
 - a `*.jsonl` file whose name is not `YYYY-MM-DD.jsonl`;
 - a record that carries `state_adopted`, or a state file that carries the key `state_adopted`
-  (section 4). Both lines are permanent;
+  (section 4). The record line is permanent; the state line lasts until the next append;
+- a state file that names the last record's hash with another `seq` (section 4);
 - a record with a non-string text field or a non-standard number (`NaN`, `Infinity`);
 - a line with duplicate keys;
 - an `archive` record that names neither a `path` nor a `sha256` (step 7);
@@ -599,14 +628,16 @@ Warnings:
 - a symlink among the chain's files: `logs/<bot>` and every entry in it, `state/<bot>.json`,
   `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, `archive/<bot>` and its day directories.
 
-The written form of `ts` is not checked in any mode yet (CHANGELOG, "Known open findings").
+The written form of `ts` is checked with `--strict` only (`ts is not in normalised form`), because
+records written with a free-form `--ts` before 0.6 are valid.
 
 Flags:
 
 - `--strict` turns the layout warnings into problems (`bot` field, file name, field types,
   non-standard numbers, duplicate keys, symlinks, an `archive` record that names no file), and
-  requires every raw line to equal the
-  canonical serialisation of its record. This catches reformatted lines. The state warnings and the
+  requires every raw line (without surrounding white space) to equal the
+  canonical serialisation of its record, and every `ts` to be in the normalised form. This catches
+  reformatted lines. The state warnings and the
   `state_adopted` warning stay warnings.
 - `--contains HASH` (repeatable, with `--bot`) fails with `expected hash <12 hex> not found in chain`.
   It is checked against the hashes of the same snapshot. Only a record whose `bot` field equals its
@@ -652,13 +683,13 @@ a name that has no chain. Exit codes are the same as without `--json`.
 | `problems` | list of strings | the `-` lines. A `--contains` miss is added to the last chain's entry |
 | `warnings` | list of strings | the `!` lines |
 | `missing` | bool | present and `true` only on a synthetic entry (no chain on disk for the name, logs missing while a witness survives, invalid directory). Treat an absent key as `false` |
-| `archives` | int | number of `archive` records in the chain (0 when the walk already had a problem) |
+| `archives` | int | number of `archive` records in the chain (0 when the walk already had a problem). A record that names no file is counted too, so the text suffix `(N archived file(s) intact)` can overstate (CHANGELOG, "Known open findings") |
 | `archives_checked` | bool | `false` when `--skip-archives` was given |
 | `approved_breaks` | int | 0 or 1 |
 | `approved` | list | descriptor of the approved break, if any |
 | `jay_approval_id` | string or null | id stored on the honoured ack |
 | `fixture_ack` | bool | `true` when the honoured ack is the fabricated test fixture (section 9). Always `false` for a live seal |
-| `breaks` | list | descriptors of unapproved breaks: the keys of the `break` object in section 6, plus `file_before` when the break spans two day files |
+| `breaks` | list | descriptors of unapproved breaks: the keys of the `break` object in section 6, plus `file_before` when the break spans two day files. A gap of more than 10 000 records has an empty `missing_seqs` and the key `missing_count` |
 | `segments` | list | one object per contiguous segment: `seq_start`, `seq_end`, `head`, `line_start`, `line_end`, `file_start`, `file_end`, `records`, `index_start`, `index_end` |
 | `state_problem` | string or null | the state-head mismatch text when that problem is in `problems`, otherwise `null`. `state rebuild` uses it to tell this one repairable problem from every other |
 | `record_error` | string | only with `--record`, and only when the `verify` record itself could not be appended (tail mismatch). `ok` is not changed by it, but the exit code is 1 |
@@ -667,7 +698,7 @@ A synthetic entry has exactly these keys: `bot`, `ok` (`false`), `records` (0), 
 `problems`, `warnings` (empty) and `missing` (`true`).
 
 A chain whose verification stopped on an unexpected internal error also gets an entry, with
-`ok: false` and one problem that names the error (`verify aborted: <class>[: <text>]`). The other
+`ok: false`, `aborted: true` and one problem that names the error (`verify aborted: <class>[: <text>]`). The other
 chains are verified as usual.
 
 ## 8. Anchor files and history
@@ -695,7 +726,9 @@ covers the read, the merge and the write (section 5).
 
 **Containment rule (checked by `verify`).** Every head named by `anchors/<bot>.json` (`head` when
 `ok`, otherwise each of `segment_heads`) and every `heads` entry in the history file must still be
-the `hash` of some record in the chain. If not, the problem is
+the `hash` of some record in the chain. So must the heads of the newest day-rollup entry
+(`anchors/days/<date>.json`) that names a head for the chain, which keeps a truncation detectable
+when only a rollup survives. If not, the problem is
 `anchors/<bot>.json: anchored head <12 hex> (<ts>) is no longer in the chain (history rewritten or
 tail truncated)`. A corrupt history line is itself a problem. Chains that were never anchored behave
 as before.
@@ -710,7 +743,9 @@ its anchor files, its day-rollup entries and its state file are removed too; the
 `gblog anchor` does not destroy such a witness itself. For a chain directory with no log file and
 no state file it used to replace `anchors/<bot>.json` with a `records: 0` entry. Since 0.6.1 an
 existing anchor that recorded more than zero records is left in place, and the chain is still
-reported as FAIL.
+reported as FAIL. Known limit: for a chain whose day files were emptied while its state file
+survives, the FAIL entry (`records: 0`) still replaces `anchors/<bot>.json`. The history file and
+the day rollups keep the old head, so `verify` keeps failing.
 
 **Off-box anchors.** Anchor files live beside the log, so an adversary who rewrites the log can
 rewrite them too. The files only raise the cost. The witnesses that count are outside the computer:
@@ -759,7 +794,8 @@ joins are evaluated. The break it claimed to approve still FAILs.
 An eligible ack must also:
 
 - be the only ack in the chain;
-- sit after the join, in the same file;
+- sit after the join. The two records of the join must share one day file; the ack may be in a
+  later file;
 - describe the on-disk join exactly (seqs, lines, the hash before, the orphan `prev`, the hash
   after);
 - lie inside a verified segment.
@@ -800,6 +836,10 @@ the name is sanitised, before the directory tree is created and before the lock 
 name therefore writes nothing: `gblog note --bot aliases --detail x` exits 2 and creates neither
 `logs/aliases/` nor a `state/aliases.json` that would overwrite the alias registry.
 
+`update_state`, `archive`, `capture browser`, `capture files` and `sync --bot` run the same check
+before their first side effect. `capture browser --bot ops.alert` used to create
+`state/ops.alert.json`, a false alert for `ops`.
+
 Two names are conventional, not reserved: `ledger` (the seal witness chain and the usual owner of
 the daily routine) and `system` (the default `--bot` of `sync`).
 
@@ -819,7 +859,7 @@ letter or digit at all) is not a chain:
 
 | Code | Meaning | Examples |
 |---|---|---|
-| 0 | Success | any write; `verify` with only `OK` / `PASS (N approved break(s))` lines (warnings do not change it); `sync --no-push`; a closed output pipe |
+| 0 | Success | any write; `verify` with only `OK` / `PASS (N approved break(s))` lines (warnings do not change it); `sync --no-push`; an output pipe that closed while the command was still writing (`gblog export` piped into `head`). A command that had finished keeps its own exit code |
 | 1 | Integrity FAIL, not pushed, or an unexpected internal error | `verify` / `anchor` with a FAIL chain; `verify --bot` or `anchor --bot` with no chain on disk; a chain whose logs are missing while its state file, anchor or anchor history survives; an invalid directory name under `logs/`; a `--contains` miss; `verify --record` whose record append was refused; `sync` that committed but did not push; `capture browser` with no readable history; an unexpected internal error (`error: internal error (…)`, see below) |
 | 2 | Usage or environment error (see below for what may have been written) | unknown flag or value; invalid, past or far-future `--ts`; an invalid date; `verify --contains` with `--all`; unregistered name under `alias strict on`; reserved name; alias conflict; unreadable `--file`; corrupt side file; an unreadable `state/aliases.json` that an `alias` command would overwrite; `git` failure; `seal` refusal; `state rebuild` refusal; unknown proposal id; `OSError` such as a full disk |
 | 3 | Policy refusal | `sync` would push to a public GitHub remote, or to one whose visibility cannot be confirmed |
@@ -850,6 +890,16 @@ Cases added in 0.6.1 by the security reviews:
   is a symlink; `capture files --limit` below 1; control characters in an alias display name or
   variant; a spooled event that `spool replay` will not replay.
 - Exit 3: a GitHub URL that cannot be mapped to one repository.
+
+Cases added by the deep reviews:
+
+- Exit 1: `sync` with no `origin` in the ledger repository, or with a ledger directory that is a
+  symbolic link (nothing is pushed); an `anchor aborted: <class>` entry; a chain directory that
+  cannot be listed; a state, anchor or archive file that is not a regular file.
+- Exit 2: `capture browser --hours` below 1; a reserved bot name on `capture`, `archive` or
+  `sync --bot`, before anything is written.
+- Exit 3: a GitHub URL with a bracketed or percent-encoded host or a `<transport>::` prefix, one
+  that cannot be parsed, and the wiki of a public repository.
 
 An unexpected internal error is printed as one line,
 `error: internal error (<class>[: <text>]); set GBLOG_DEBUG=1 for a traceback`, and exits 1. It
@@ -886,12 +936,20 @@ exception is raised with its traceback instead, also from inside `verify --all` 
 - **No containment check for symlinked directories.** gblog refuses a symlink at the final
   component of a path it writes. It does not refuse a ledger sub-directory that is a symlink to
   another disk, because existing setups rely on that. Do not run write commands on an untrusted
-  clone.
+  clone. `sync` cannot back such a directory up, because git stores the link and not the files: it
+  says so and pushes nothing (exit 1). Use a mount instead of a link.
 - **No future bound in the library.** `Ledger.append` still accepts an explicit future `ts`; tests
   and fixtures use fixed dates. The CLI bound, the warnings in section 2 and the `clock_regressed`
   rule of `report --date` cover the effect.
 - **No guard against `git` used directly.** `--replace-remote`, the visibility check and the
   committed-content check protect `gblog sync`. A same-user process can still run `git push`.
+- **No FAIL for an `archive` record that names no file.** `gblog log --type archive` writes one, a
+  chain cannot be repaired afterwards, and `gblog log` is on the Auto-review allow-list. Such a
+  record is a warning, and a problem only with `--strict`.
+- **No command that dismisses a `state_adopted` warning.** The marker exists because an append
+  erases the "state missing" evidence. The record-level marker is permanent (section 4).
+- **No read-only open of the copied browser database.** `capture browser` reads a private copy
+  that it deletes afterwards, and read-only mode on a copy with a `-wal` file can fail to open.
 
 ## 13. Cost on a large ledger
 
@@ -916,6 +974,9 @@ The daily routine (`docs/routine-daily-audit.md`) re-hashes archived files once 
 (`gblog verify --all --record`) does it, and the rollback check in step 1 and the `gblog anchor`
 call use `--skip-archives`.
 
+`verify` also reads the newest day rollup that names the chain (every rollup, for a chain that was
+never anchored).
+
 Two costs are kept on purpose:
 
 - The chain walk of `verify` is not streamed. It keeps the parsed records of one chain in memory,
@@ -923,10 +984,3 @@ Two costs are kept on purpose:
   every join.
 - `sync` re-hashes the evidence files on every run. A cache of "already verified" files would
   have to trust what the committed-content check exists to distrust.
-- **No FAIL for an `archive` record that names no file.** `gblog log --type archive` writes one, a
-  chain cannot be repaired afterwards, and `gblog log` is on the Auto-review allow-list. Such a
-  record is a warning, and a problem only with `--strict`.
-- **No command that dismisses a `state_adopted` warning.** The marker exists because an append
-  erases the "state missing" evidence. It is permanent (section 4).
-- **No read-only open of the copied browser database.** `capture browser` reads a private copy
-  that it deletes afterwards, and read-only mode on a copy with a `-wal` file can fail to open.

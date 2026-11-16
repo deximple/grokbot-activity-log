@@ -11,7 +11,7 @@ Every Monday at 09:00 (my time zone), run the bot-tune skill:
    `--source routine` is required: without it these runs are counted as manual repeats and proposed as a routine.
 1. `gblog verify --all` — stop and report if the exit code is non-zero (FAIL). `PASS (N approved break(s))` exits 0; report the count, do not seal, and do not edit logs.
    Lines that start with `!` under a chain are warnings. They do not change the exit code. Report every `!` line verbatim, even when the chain says OK, and continue.
-2. `gblog capture browser --bot <slug>` and `gblog capture files --bot <slug> --path /workspace` for every Bot, then `gblog coverage`.
+2. `gblog capture browser --bot <slug> --hours 168` and `gblog capture files --bot <slug> --path /workspace --exclude transcripts` for every Bot, then `gblog coverage`.
    This is the only routine that runs capture. All Bots share one browser profile and one /workspace, so read per-Bot coverage
    for browser and file actions as "someone on this computer did it", not as proof of which Bot did.
 3. `gblog tune --days 28`. Read the report.
@@ -35,7 +35,9 @@ If there are no proposals, say so in one line.
   manually on three or more days. Three weekly runs without the flag would be proposed as a routine.
   The follow-up in step 6 uses the same title and the same flag for the same reason.
 - **Capture runs here and nowhere else.** The daily audit routine has no capture step. Browser capture
-  resumes from its per-history marker, so a weekly run misses nothing.
+  resumes from its per-history marker. The first import of a history file is bounded by `--hours`
+  (default 24), so the prompt passes `--hours 168`. `--exclude transcripts` keeps the transcripts that
+  the daily routine exports under `/workspace` out of the file evidence.
 - **`!` lines and exit 4 are reported, not repaired.** `!` lines are warnings that leave the exit code
   unchanged. Exit 4 means an append was refused and the event is in `spool/<bot>/`; replaying it or
   rebuilding state needs the operator.

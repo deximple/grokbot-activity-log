@@ -66,4 +66,6 @@ After the seal, verify cross-checks the witness. If the pinned ack is honoured a
 
 Tail mismatch: CLI exit **4**, stderr `ALERT tail mismatch`, event JSON in `spool/<bot>/`, latest copy in `state/<bot>.alert.json`. gblog does not send mail or chat. Page on that exit code and file. Do not edit the log to make the next append succeed.
 
+Known limit: `seal` preflights the `ledger` chain only. If `kim-biseo` itself has a tail mismatch, step 7 exits 4 and the `break_ack` goes to `spool/kim-biseo/`. `gblog spool replay` never appends a `break_ack`, so do not replay it. Report and wait. A later version will refuse with exit 2 before anything is spooled (CHANGELOG, "Known open findings").
+
 `gblog spool list` shows the refused events and is read-only. Within this procedure do not go further than that: no `gblog spool replay`, no `gblog state rebuild`. Report the alert and wait for the operator.

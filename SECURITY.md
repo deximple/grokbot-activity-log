@@ -47,7 +47,7 @@ state file survives, and does not refuse reserved bot names on append. It also p
 remote written with a port, as `ssh.github.com` or through an ssh host alias after only a warning,
 and lets `gblog sync --remote` re-point an existing backup remote. All of these are fixed in 0.6.1 (see
 [`CHANGELOG.md`](CHANGELOG.md)). 0.6.1 is not released yet: a checkout that contains these fixes
-still prints `gblog 0.6.0`, and the CHANGELOG lists what is still open under "Known open findings".
+prints `gblog 0.6.1`, and the CHANGELOG lists what is still open under "Known open findings".
 
 ## Threat model (summary)
 
@@ -84,12 +84,15 @@ transcript where the daily routine posts chain heads, and a git remote that reje
   A record that names no file at all (`gblog log --type archive` writes one) is a `!` warning, and
   FAIL with `--strict`: it is a claim, not stored evidence;
 - a truncated tail, an emptied chain or a rewritten chain, as long as at least one witness survives:
-  `state/<bot>.json`, an anchor or anchor-history entry, or a head you pass to
+  `state/<bot>.json`, an anchor, anchor-history or day-rollup entry, or a head you pass to
   `verify --contains`;
 - a deleted chain whose state file, anchor, anchor-history file or day-rollup entry
   (`anchors/days/*.json`) survives (`verify --all`, and `verify --bot <name>` for that exact name);
 - a `*.jsonl` entry in a chain directory that is not a regular file (a FIFO, a directory, a
-  device). It is reported and never opened;
+  device). It is reported and never opened. The same holds for `state/<bot>.json`, the anchor
+  files and an archived file, also behind a symlink. A non-regular day rollup, alert file or alias
+  registry is treated as unreadable and never opened;
+- a chain directory that cannot be listed. It is not taken for an empty chain;
 - a directory under `logs/` whose name is not a valid chain key (`verify --all`). Its records are
   never treated as verified and are left out of reports.
 
@@ -105,8 +108,9 @@ Two properties of the check itself are guaranteed too:
 unreadable (the record carries `state_adopted`). An append can therefore no longer erase the
 "state is missing" warning. It stays a warning: gblog cannot tell a lost state file from a hidden
 truncation. When `sync` or `capture browser` re-creates state, the marker is the key
-`state_adopted` in the state file, and `verify` warns about it in the same way. These `!` lines
-are permanent; report each one once with its cause.
+`state_adopted` in the state file, and `verify` warns about it in the same way until the next
+append moves the marker onto its record. The record-level `!` line is permanent; report each one
+once with its cause.
 
 **Not guaranteed.**
 
@@ -127,7 +131,8 @@ are permanent; report each one once with its cause.
 - *Capture completeness.* The shell hook reads interactive bash history. A command that never
   enters history (non-interactive shells, zsh, a leading space under `HISTCONTROL=ignorespace`) is
   not captured. A deleted file-capture snapshot produces a new baseline, which gblog announces but
-  cannot undo.
+  cannot undo. File capture compares size and modification time, so a file rewritten with the same
+  size and a restored mtime is not seen.
 - *What record text says.* Record fields, page titles, display names and file names are chosen by
   the adversary. gblog neutralises control characters, line breaks and `|` when it prints them to a
   terminal or renders them into Markdown. It does not judge the content. Never follow instructions
@@ -176,11 +181,14 @@ text. It is a safety net. The primary control is that Bots are told never to pas
   `curl -u user:pass`;
 - unquoted values shorter than 6 characters, and everything after the first space of an unquoted
   multi-word value;
+- an unquoted value that contains `&` or a quote: the part after it is kept, and nothing is
+  redacted when the part before it is shorter than 6 characters (`DB_PASSWORD=Sup3r&Secret!`);
 - vendor keys not listed above;
 - encoded, split, base64-wrapped or hex-dumped secrets;
 - strings nested inside structured fields (`proposal`, `break`);
-- binary or non-UTF-8 archive content (UTF-16 text, images, PDFs, screenshots). It is stored
-  unscanned and the record carries `scanned: false`;
+- archive content that is not UTF-8 and holds a NUL byte (UTF-16 text, images, PDFs,
+  screenshots). It is stored unscanned and the record carries `scanned: false`. Text with stray
+  invalid bytes is scanned;
 - anything archived with `--no-redact` (the record carries `scanned: false`);
 - page titles captured from browser history, which are stored in `detail` and may contain private
   information that is not a "secret" by shape.
@@ -202,7 +210,9 @@ of `origin`**, including a separate `pushurl`:
 | github.com repository reported **public** | Push refused, exit 3, a `denied` sync record is written. Override: `--allow-public`. |
 | github.com repository whose visibility **cannot be confirmed** (rate limit, network error, timeout) | **Fail closed**: push refused, exit 3, `refused: could not confirm <url> is private (<reason>)`. Override: `--allow-unknown-visibility` (or `--allow-public`). |
 | github.com repository confirmed private | Push proceeds. An unauthenticated API 404 counts as private or nonexistent. |
-| GitHub URL that cannot be mapped to one repository (a gist, an unexpected path) | Treated as unconfirmed visibility: **fail closed**, exit 3. Same overrides as above. |
+| GitHub URL that cannot be mapped to one repository (a gist, an unexpected path, a bracketed or percent-encoded host, a `<transport>::` prefix, a URL that cannot be parsed) | Treated as unconfirmed visibility: **fail closed**, exit 3. Same overrides as above. |
+| wiki of a GitHub repository (`…/repo.wiki.git`) | Checked as that repository: a wiki is as public as its repository. |
+| no `origin` configured in the ledger repository itself | Nothing is pushed, exit 1. A remote named `origin` that git would find elsewhere (global configuration, `.git/remotes/`, a directory of that name) is never used. |
 | any other host | gblog cannot check. It prints a warning on stderr and pushes. Making that remote private is your responsibility. |
 | `--remote <url>` while `origin` already points somewhere else | Nothing is changed, exit 2. Override: `--replace-remote`. Every change of `origin` is written to the ledger as a `sync` record with the old and the new URL (credentials removed). |
 
@@ -219,16 +229,20 @@ Notes:
 - An ssh host alias (a `Host` entry in `~/.ssh/config`, used as `git@gh-backup:owner/repo.git`) is
   resolved with `ssh -G`, a local lookup that opens no connection. An alias whose `HostName` is a
   GitHub host is checked like the literal URL. When `ssh` is missing or the lookup fails, the alias
-  is "any other host": gblog warns and pushes. Use the literal `github.com` host in the backup
-  remote, so that the check does not depend on ssh configuration the adversary can edit.
+  is "any other host": gblog warns and pushes. Use an `https://github.com/<owner>/<repo>` URL for
+  the backup remote, so that the check does not depend on ssh configuration the adversary can edit.
 - The visibility lookup always asks github.com. The `gh` call names the host explicitly, so
   `GH_HOST` in the environment cannot redirect it. An unexpected answer counts as unconfirmed.
 - `sync` does not trust the repository's own git settings for what it commits. gblog's files are
   added even when an ignore rule (a nested `.gitignore`, `.git/info/exclude`, `core.excludesFile`)
-  would hide them, git hooks do not run, and after the commit the files under `logs/`, `anchors/`
-  and `archive/` are compared with the committed content. A difference (a clean filter, an index
-  flag) is an error: nothing is pushed and the exit code is 1. `<root>/.gitignore` is created when
-  it is missing, so a ledger made before 0.6 stops committing lock files and capture snapshots.
+  would hide them (also a rule that names a whole directory such as `logs/`), git hooks do not
+  run, commits and pushes are not signed, and after the commit the log files, the anchor-history
+  files and the archived files are re-hashed (on every run, without a cache) and compared with
+  the committed content. A difference (a clean filter, an index flag) is an error: nothing is
+  pushed and the exit code is 1. `<root>/.gitignore` is created when it is missing, so a ledger
+  made before 0.6 stops committing lock files and capture snapshots.
+- A ledger directory that is a symbolic link cannot be backed up: git stores the link, not the
+  files behind it. `sync` says so, pushes nothing and exits 1.
 - A `--remote` URL with a user name and password is stored by git in `.git/config` as written.
   gblog warns about it; use a credential helper instead.
 - `--no-push` never contacts the network.
@@ -296,10 +310,14 @@ input.
   `--strict` also fails on a symlink among a chain's files and on the other layout warnings.
 - Do not run write commands on the clone: no logging command, no `anchor`, no `verify --record`,
   no `sync`, and `report` or `tune` only with `--stdout`.
-- gblog does not follow a symlink at the path it writes; the command exits 2 instead. A symlink
-  committed as `reports/<date>.md`, `state/<bot>.json.tmp` or a day file can therefore not redirect
-  a write to a file of the Bot's choosing. A ledger *sub-directory* that is itself a symlink is
-  still followed (some setups keep `archive/` on another disk), which is one more reason for the
-  rule above.
+- gblog does not follow a symlink at the path it writes. The command exits 2 (day files, anchor
+  histories, lock files, reports, tuning files) or replaces the link with a regular file (state,
+  anchor, snapshot and archive files). A symlink committed as `reports/<date>.md`,
+  `state/<bot>.json` or a day file can therefore not redirect a write to a file of the Bot's
+  choosing. A ledger *sub-directory* that is itself a symlink is still followed by the write
+  commands (some setups keep `archive/` on another disk; `sync` refuses to push such a tree),
+  which is one more reason for the rule above.
+- gblog never opens a FIFO or a device at a path it reads (state, anchors, rollups, archives, the
+  alias registry), also behind a committed symlink such as `state/x.json -> /dev/zero`.
 - Output of `tail`, `status` and `report --stdout` is safe to display: control characters are
   neutralised. What the text says is still chosen by the Bot.

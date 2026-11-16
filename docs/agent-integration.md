@@ -97,7 +97,8 @@ Flag values:
 - `--source` is one of `self`, `auto`, `routine`. `self` is the default and is not stored.
   - Use `--source routine` on `task-start` in a routine run.
   - Leave `auto` to the capture commands and the shell hook.
-  - `archive` accepts the flag but does not store it; it prints a warning.
+  - `archive` accepts the flag but does not store it; it prints a warning. `--task` on `archive`
+    is not stored either, and prints no warning.
 - `--kind` (archive) is one of `transcript`, `message`, `artifact`, `other`. The default is `other`.
 - `--task-id` on `task-start` lets you choose the id. Without it gblog generates 10 lowercase hex
   characters.
@@ -247,7 +248,8 @@ Notes:
 
 - When several codes apply to `sync`, a refusal (3) is reported before a tail mismatch (4). With
   exit 4, `sync` still made its commit.
-- A closed output pipe (`gblog export | head`) exits 0.
+- An output pipe that closes while gblog is still writing (`gblog export | head`) exits 0. A
+  command that had finished keeps its exit code: a `verify` FAIL whose reader went away is still 1.
 - Set `GBLOG_DEBUG=1` only when the operator asks for a traceback of an internal error.
 
 ## 6. stderr lines worth knowing
@@ -284,6 +286,8 @@ One Bot has one canonical ASCII **slug**. The slug is the chain key: records go 
   3. display name;
   4. alias;
   5. alias, ignoring letter case.
+- A name that matches none of these, but whose sanitised form is a registered slug
+  (`OPS BOT` → `ops-bot`), resolves to that slug.
 - While the registry is empty, every name is its own chain, there is no warning, and letter case
   matters (`Ops` and `ops` are two chains).
 - Once at least one Bot is registered, an unregistered name is logged under its sanitised form
@@ -364,7 +368,7 @@ Common rules:
 |---|---|---|
 | 0 | `test -d "$GBLOG_ROOT/logs"` | Run this before any gblog command. If it fails, report "ledger missing" and stop. |
 | 1 | `gblog verify --bot <chain> --skip-archives --contains <yesterday's 64-hex head>` | One call per chain posted on the previous run. `expected hash … not found in chain` or `no chain on disk` means a rollback. Archived files are re-hashed in step 2. |
-| 2 | `gblog verify --all --record`, then `gblog anchor` | Run `anchor` even if `verify` exited 1. `anchor` verifies every chain again, so two full passes are expected. |
+| 2 | `gblog verify --all --record`, then `gblog anchor --skip-archives` | Run `anchor` even if `verify` exited 1. `anchor` walks every chain again; archived files are re-hashed once, by `verify --all --record`. |
 | 3 | Post a "Chain heads" block | Take the full heads from `anchors/<chain>.json`: `head`, or every entry of `segment_heads` for a FAIL chain. |
 | 4 | `gblog status`, `gblog spool list` | Include `ALERT` and `CLOCK` lines and the names of the alert files. |
 | 5 | `gblog archive --bot ledger --kind transcript --file <file> --detail "<slug> transcript"` | One call per exported transcript. |
@@ -378,7 +382,7 @@ Common rules:
 |---|---|---|
 | 0 | `gblog task-start --bot <slug> --source routine --task "Weekly tune"` | |
 | 1 | `gblog verify --all` | A non-zero exit stops the tune. |
-| 2 | `gblog capture browser --bot <slug>`, `gblog capture files --bot <slug> --path /workspace`, then `gblog coverage` | This is the only routine that runs capture. |
+| 2 | `gblog capture browser --bot <slug> --hours 168`, `gblog capture files --bot <slug> --path /workspace --exclude transcripts`, then `gblog coverage` | This is the only routine that runs capture. `--hours` bounds the first import of a history file only. |
 | 3 | `gblog tune --days 28` | Writes `tuning/<UTC date>.md` and `tuning/proposals.json`. |
 | 4 | Draft the edits and ask the user | Change nothing before the answer. |
 | 5 | `gblog tune --apply <id> --detail "…"` or `gblog tune --reject <id> --detail "…"` | One id per call; the two flags cannot be combined. |
@@ -405,7 +409,8 @@ Common rules:
   receiving Bot opens its own task under its own slug. gblog does not link the two tasks, so put
   the other task id in `--detail` if you want the link.
 - **Capture on a shared computer.** All Bots share one browser profile and one `/workspace`.
-  `capture browser` and `capture files` therefore cannot say which Bot acted.
+  `capture browser` and `capture files` therefore cannot say which Bot acted. `coverage` takes a
+  captured record out of a Bot's count when another Bot reported that action.
 - **Reading across Bots.**
   - `gblog status` shows one row per Bot, with chains merged by alias. `--chains` gives the
     per-chain view and `--bot NAME` filters.
@@ -478,7 +483,7 @@ step gblog verify --bot ops --skip-archives --contains "<64-hex head of ops post
 
 # 2. Verify and anchor every chain. A FAIL (exit 1) is reported, and the run continues.
 step gblog verify --all --record
-step gblog anchor
+step gblog anchor --skip-archives
 
 # 3. The "Chain heads" block: full heads, never shortened.
 python3 - "$ROOT" <<'PY'

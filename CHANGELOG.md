@@ -23,38 +23,119 @@ are not repeated below: `A:H-1` and `B:H1` (R-01), `A:H-3` and `B:M6` (R-09), `A
 `B:L7` (R-06), and the crash paths of `A:M-3`, `B:M1` and `B:L1` covered by R-05, R-06 and R-10.
 
 A few entries carry an id of the form `W-…`. They come from the round-3 audit of the same day.
+Entries with an id of the form `D1-…` to `D6-…` come from the six deep subsystem reviews of this
+tree (verify and anchors; append and recovery; sync and remotes; capture, coverage and tune; the
+CLI layer; archive, readers and aliases).
+
+### Deep subsystem reviews (D1 … D6)
+
+The round-3 items that this section used to list as open are in the code: the version string, the
+`--strict` check of the `ts` form, `capture files --record-baseline`, hook v2, `sync` and invalid
+chain directories, `alias list` / `anchor` output, clamped records in one daily report, and the
+dead-code removal. Every deep-review finding rated Medium or higher is fixed in this branch:
+
+- **Side files that are not regular files are never opened (D1-01, D6-02).** A FIFO, a device or a
+  directory (also behind a symlink) at `state/<bot>.json`, `state/aliases.json`, an anchor file, a
+  day rollup or an archive address used to hang or exhaust `verify --all`, `anchor`, `status` and
+  `append`. A state, anchor, anchor-history or archive file of that kind is now a `verify` problem;
+  elsewhere such a file counts as unreadable.
+- **A large `seq` gap is described by its size (D1-02).** A break of more than 10 000 records has an
+  empty `missing_seqs` and the additive key `missing_count`. `verify` used to build the whole list.
+- **`anchor` isolates each chain completely (D1-03).** A failing pre-check or write for one chain is
+  the FAIL entry `anchor aborted: <class>`; the other chains and the day rollup are still written.
+- **A chain directory that cannot be listed is FAIL (D1-04)**: `logs/<bot>: cannot be listed
+  (<class>)`. Without a state file it used to verify as `OK … 0 records`.
+- **Day rollups are checked for containment (D1-05).** The heads of the newest
+  `anchors/days/<date>.json` entry of a chain must still be in the chain, so a truncation is
+  detected when only a rollup survives.
+- **A state file with a wrong `seq` or a non-text `head` can be repaired (D1-06).** `verify` warns
+  `state/<bot>.json: seq <n> does not match the last record (seq <m>); appends are refused until
+  gblog state rebuild`. `append` treats a `head` that is not a string like an unreadable state file
+  (it adopts the tail, with the `state_adopted` marker). `state rebuild` repairs both cases.
+- **Two failed state writes in a row no longer brick a chain (D2-01).** A roll-forward is written
+  to state before the new line.
+- **Reserved bot names are refused before any side effect (D2-02, D5-01)**, also by
+  `capture browser`, `capture files`, `archive` and `sync --bot`. `capture browser --bot ops.alert`
+  used to exit 0 and create a false `ALERT ops`.
+- **Spooled events replay in the order they were refused (D2-03).** Spool files are named
+  `<stamp>-<nnnn>-<id>.json`; older names still replay.
+- **Public-remote guard (D3-01, D3-02, D3-03).** A GitHub URL with a bracketed or percent-encoded
+  host, a `<transport>::` prefix or one that cannot be parsed counts as unconfirmed visibility
+  (exit 3). A wiki (`…/repo.wiki.git`) is checked as its repository. Without an `origin` in the
+  ledger repository itself nothing is pushed (exit 1); `sync` used to warn and let git resolve the
+  name elsewhere.
+- **`sync` robustness (D3-04, D3-06, D3-07).** An ignore rule that names a whole ledger directory
+  no longer aborts the run; undecodable bytes in git output no longer end in `internal error` after
+  a successful push; commits and pushes are never signed.
+- **`sync` re-hashes on every run (D3-05).** The cache of already verified files (in this tree
+  only, never released) is removed.
+- **A symlinked ledger directory is named, not blamed on git (D3-08).** git stores the link, not
+  the files behind it. `sync` now says `<dir> is a symbolic link: …; not pushed` and exits 1. 0.6.0
+  pushed such a ledger without the files behind the link. Use a mount instead.
+- **Capture (D4-01 … D4-05, D5-02).**
+  - file records carry `observed` (the file's mtime; `observed_from` on `deleted`), so `file`
+    coverage works with a weekly capture run;
+  - the shell hook logs nothing at the first prompt of a new interactive shell. Run
+    `gblog capture shell-hook --bot <slug> --install` again to get the new hook text;
+  - `capture browser --hours` below 1 exits 2, and a marker dated more than a day ahead is ignored
+    with a notice;
+  - `capture files` keeps one snapshot per `--path` (`state/capture-files-<bot>.<tag>.json` for an
+    additional path), and changes left over behind `--limit` are logged first on the next run.
+- **Coverage and tune (D4-06 … D4-10).** Failures and the `fail` metric count the Bot's own reports
+  only. `auto` decisions are not approvals. Applying a `revert` proposal reopens the original one.
+  A captured record that another Bot reported is left out of a Bot's count (`coverage` key
+  `elsewhere`). `--days` selects the captured records; an older self-report can still match one.
+  Baselines stored before this change may include auto records.
+- **A closed stdout pipe no longer turns a finished command's exit code into 0 (D5-03).**
+- **The `path` of an archive record is never redacted (D6-01).** For a Bot named like a key prefix
+  (`xai-…`, `sk-…`) every archive used to make the chain FAIL for good. `verify` resolves a path
+  that was already stored as `archive/[REDACTED]/…` to the chain's own directory.
+- **Readers no longer drop a record whose `bot` field is not a string (D6-03).**
+- **Aliases (D6-04, D6-05).** A name whose sanitised form is a registered slug resolves to it.
+  `alias add` refuses a new slug that equals another Bot's display name.
 
 ### Known open findings
 
-The round-3 audit of 2026-11-16 (finding ids `T-…`, work items `W-…`) compared this section with
-the code. The items below are **not** in the code yet. They were taken out of the lists further
-down and return there when their fix is merged. 0.6.1 stays "Unreleased" until then.
+Rated below Medium by the deep reviews and **not** in the code yet. 0.6.1 stays "Unreleased" until
+they are decided.
 
-- **Version string (T-03, W-01).** `gblog --version` in this tree still prints `gblog 0.6.0`,
-  although the fixes listed below are present. The number changes with the release step.
-- **`ts` form (T-01 e, W-03).** `verify` does not check that `ts` is written in the normalised form
-  `YYYY-MM-DDTHH:MM:SSZ`, in any mode. The planned check is `--strict` only, because records
-  written with a free-form `--ts` before 0.6 are valid.
-- **`capture files` baseline (T-11, W-07).** There is no `--record-baseline` flag. A new baseline
-  is announced on stderr only; the stdout line still reads `files: 0 change(s) …`. The very first
-  run for a chain prints no notice.
-- **Shell hook and variables (T-04, W-10).** The hook's skip rule treats every `$` as a possible
-  substitution. A plain `gblog log --bot "$BOT" --task-id "$TID" …` typed at a prompt is therefore
-  logged as an auto shell action, which lowers shell coverage.
-- **`sync` and invalid chain directories (T-09, W-05).** `sync` stamps `last_sync` on every
-  directory under `logs/`, including one whose name is not a valid chain key, and so creates
-  `state/<dir>.json` and `state/<dir>.lock` for it.
-- **`alias list` and `anchor` output (T-12, W-11).** `alias list` exits 2 when a directory such as
-  `logs/---` exists and at least one Bot is registered. `anchor` prints the problem lines of a
-  missing chain without neutralising control characters.
-- **Clamped records in two daily reports (T-14, W-12).** A record whose `ts` day and
-  `clock_regressed` day differ is listed by `report --date` for both days. `status` counts it once.
-- **Dead code (R-15, T-05, W-15).** `_exit2`, `_assert_tail_matches`, `_BREAK_KEYS` and the
-  re-entrancy table `_Lock._held` are still in `gblog.py`. Behaviour is not affected.
+- **verify / anchor.** `verify --bot <Bot>` does not report a deleted variant chain whose witness
+  survives; `verify --all` does (D1-07). A renamed day file passes `--strict` (D1-08). After a
+  pre-0.6 tail with a UTC offset, `append` can write a record that fails `verify` (D1-09).
+  `anchor` still replaces `anchors/<bot>.json` with a 0-record entry when day files were emptied
+  (D1-10, D3-13). A record key `_corrupt` bricks its chain (D1-12). `(N archived file(s) intact)`
+  counts `archive` records that name no file (D1-13; `tests/PENDING.txt`).
+- **seal.** `seal` does not preflight the sealed chain's own tail: a mismatch spools a `break_ack`
+  that `spool replay` never appends. An ack without its witness cannot be completed (D1-11, D2-08).
+- **append / recovery.** The `ALERT` line shows the latest refusal, and a spool without an alert
+  file prints none (D2-06). Capture events refused during an alert are imported again after
+  recovery (D2-07, D4-17). An interrupted first append leaves a `state_adopted` marker (D2-09).
+  `verify` reports FAIL, without a hint, while state is one record behind (D2-10). Directory fsync
+  (D2-11), `state rebuild` without its note (D2-12), a removed lock file (D2-13), side files taken
+  for chains by `verify --bot` (D2-14, D4-11).
+- **sync.** `GIT_DIR` and `GIT_CONFIG_COUNT` are inherited (D3-09). `origin` can change before its
+  record is written (D3-10). Multi-URL origins and `pushurl` (D3-11). A token used as URL user name
+  (D3-12). `NAME=value` redaction stops at `&` or a quote (D3-14).
+- **capture / tune.** `--history` spelling and non-database files (D4-12), a symlinked `--path`
+  (D4-15), an excluded file logged as `deleted` (D4-16), ports dropped from browser targets
+  (D4-19), `$?` after the hook and operator commands at a prompt (D4-14, D4-21), task bookkeeping
+  commands counted as unreported (D4-18), proposal caps, decisions after `alias add` and changes
+  older than 90 days (D4-13, D4-20, D4-22).
+- **CLI and readers.** `verify --record` stops at an `OSError` (D5-04). Dates are checked by shape
+  only (D5-05). `spool replay --bot <typo>` exits 0 (D5-06). `tune --bot` overwrites the all-Bots
+  tuning file (D5-07). Raw control characters in `ALERT tail mismatch`, `error:`, `ANCHOR FAIL` and
+  git error lines (D5-08). `~` in the root is not expanded (D5-12). `chains_for` and `alias list`
+  versus `resolve` (D6-06). Report labels, task detail, the twin hint and the `(no task)` bucket
+  (D6-07 … D6-10). `archive` argument edges (D6-13). `report --date` with `--since` (D6-15).
 
-The other fixes that the round-3 audit listed as missing (T-01 a to d and f, the duplicate-key
-warning of T-01 e, and the symlink findings of T-02) are in the code, and their tests carry no
-`expectedFailure` marker.
+Future work (design changes, not planned for 0.6.1):
+
+- `seal` rerun with the same approval id adds only a missing witness note. This changes the live
+  procedure and needs the operator's sign-off.
+- Capture events raise the alert without being spooled.
+- A genesis state file written before a chain's first line.
+- Records bound to their day file, as a `--strict` check.
+- `sync` with a scrubbed git environment and a lock of its own (`state/.sync.lock`).
 
 ### Behaviour changes
 
@@ -133,8 +214,8 @@ Read these before upgrading a routine or a script that branches on output or exi
     is "another host". 0.6.0 looked up `o/r` on GitHub and could record the push as going to a
     private repository.
 - **`sync` checks what it commits (B:M4).** gblog's own files are added even when a git ignore rule
-  would hide them, git hooks do not run, and after the commit the files under `logs/`, `anchors/`
-  and `archive/` are compared with the committed content. When they differ (a clean filter, an
+  would hide them, git hooks do not run, and after the commit the log files, the anchor-history
+  files and the archived files are compared with the committed content. When they differ (a clean filter, an
   index flag) `sync` reports an error, pushes nothing and exits 1. `sync` also creates
   `<root>/.gitignore` when it is missing.
 - **`verify --contains` is chain-exact (B:M3).** A hash counts only when it belongs to a record
@@ -155,8 +236,10 @@ Read these before upgrading a routine or a script that branches on output or exi
   Records already on disk are unaffected.
 - **Symlinks are not followed on write (A:M-4, B:L8).** Day files, state, anchor, report, tuning,
   snapshot, archive and lock files are opened without following a symlink at the final path
-  component, and temporary files get per-process names (`<path>.<pid>.tmp`). A planted symlink makes the command exit 2
-  instead of writing through it.
+  component, and temporary files get per-process names (`<path>.<pid>.tmp`). A planted symlink at a
+  day file, an anchor history, a lock file, a report or a tuning file makes the command exit 2. A
+  symlink at a file that gblog replaces atomically (state, anchor, rollup, snapshot, archive) is
+  replaced by a regular file. Nothing is written through either.
 - **A `*.jsonl` entry that is not a regular file is FAIL (B:L2).** A FIFO, directory or device in a
   chain directory is reported by `verify` and never opened. It used to hang `append` (while holding
   the lock) and `verify --all`.
@@ -176,7 +259,9 @@ Read these before upgrading a routine or a script that branches on output or exi
   - a run with more changes than `--limit` no longer forgets the changes it did not list;
   - a new baseline is announced with a `notice:` line on stderr: for an unreadable snapshot, a
     changed `--path`, and a snapshot that is missing although the chain already holds
-    file-capture records. The stdout line is unchanged (see "Known open findings").
+    file-capture records. The stdout line keeps its `files: <n> change(s) …` prefix and ends with
+    ` (new baseline: <reason>)`, and with `, <n> pending` when changes were left over.
+    `--record-baseline` also appends an `auto` note (W-07).
 - The shell hook skips only a plain `gblog …` command. A command line that merely contains the word
   `gblog`, or chains it with `;`, `&`, `|`, a redirection or a command substitution (`$( … )`,
   backticks), is logged. A plain command may use variables (`--bot "$BOT"`). A command that starts
@@ -192,8 +277,9 @@ Read these before upgrading a routine or a script that branches on output or exi
   warning disappeared with the first append (B:M8).
   `sync` and `capture browser` append no record when they re-create state from the log tail. They
   write the key `state_adopted` (`how`, `seq`, `ts`) into `state/<bot>.json` instead, and `verify`
-  warns about that key too. Both markers are permanent: later appends and `state rebuild` keep
-  them. Report the `!` line once with its cause (`docs/DESIGN.md`, section 4).
+  warns about that key too. The next `append` to the chain moves that marker onto its record and
+  drops the key from state (W-15). The record field is permanent.
+  Report the `!` line once with its cause (`docs/DESIGN.md`, section 4).
 - Terminal output (`tail`, `status`, `spool list`, `alias list`, `verify` problem and warning lines)
   no longer contains raw control characters taken from records, file names or display names. Text
   without control characters prints as before (A:L-1, B:M7).
@@ -265,6 +351,11 @@ Read these before upgrading a routine or a script that branches on output or exi
 - `tune` records store `count` in the `proposal` snapshot (R-11).
 - In-memory record key `bot_field` (R-04).
 - `sync --replace-remote` (B:H3).
+- `anchor --skip-archives` (W-12), `capture files --record-baseline` (W-07), and the key
+  `orphan_alerts` in `status --json` (W-14).
+- Additive keys from the deep reviews: `missing_count` in break descriptors (D1-02), `elsewhere`
+  in `coverage --json` (D4-09), and the record fields `observed` / `observed_from` on file-capture
+  records (D4-01).
 - Record field `state_adopted` (`missing` or `unreadable`), and the key `state_adopted` in
   `state/<bot>.json` (B:M8).
 - `GBLOG_DEBUG` environment variable (A:M-3).
@@ -335,6 +426,10 @@ Read these before upgrading a routine or a script that branches on output or exi
   the two `state_adopted` markers and their permanence, the archive-record rules, the day-rollup
   problem text and the `verify` warning list. Step 1 of the daily routine now uses
   `--skip-archives`.
+- Deep-review documentation pass (D1-14, D2-16, D3-15, D4-24, D5-16, D6-16). Removed: the stale
+  "Known open findings", and contradictory text about `state_adopted` permanence, archive
+  scanning, symlinks at written paths, the closed-pipe exit code, the `sync` comparison and the
+  `capture files` output. The weekly routine passes `--hours 168` and `--exclude transcripts`.
 
 ## [0.6.0] - 2026-11-16
 

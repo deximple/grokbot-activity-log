@@ -68,7 +68,7 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
   changed by whoever writes the ledger. `gblog verify --bot <slug> --contains <head>` exits 1 with
   `expected hash <12 hex> not found in chain` when yesterday's head is no longer part of the chain, which
   means history was rewritten or the tail was cut off. `verify` also checks `anchors/<bot>.json` and
-  `anchors/<bot>.history.jsonl` on its own, and `verify --all` reports a chain that was anchored but whose
+  `anchors/<bot>.history.jsonl` (and the newest day rollup) on its own, and `verify --all` reports a chain that was anchored but whose
   `logs/<bot>` directory is gone; the posted heads cover the case where those files were changed as well.
   A chain that is already FAIL exits 1 either way: look for the `expected hash` line specifically.
 - **`!` lines are warnings, not noise.** Examples: `state/<bot>.json missing or unreadable: tail truncation
@@ -83,15 +83,11 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
   4 tail mismatch. After exit 2, a usage error (an argparse message, `error: --…`) wrote nothing. An
   environment error (`error: <system message>`) may already have written the record: check
   `gblog tail -n 1` before retrying.
-- **Step 1 skips archives; step 2 is two full passes.** The rollback check only needs the chain walk, so
-  step 1 passes `--skip-archives`. A chain that has archive records then prints `(archives not checked)`
-  on its line. In step 2, `gblog verify --all --record` re-hashes every archived file. `gblog anchor` then
-  verifies every chain again, archives included, before it writes the anchors. Two full passes in step 2
-  are expected; do not drop one to save time.
 - **Archived files are re-hashed once per run, in step 2.** `gblog verify --all --record` decompresses
   and re-hashes every archived file. The rollback check in step 1 only asks whether a head is still in
-  the chain, and `gblog anchor` verifies every chain again right after step 2, so both run with
-  `--skip-archives`. Without the flag every archive would be read three times per run.
+  the chain, and `gblog anchor` walks every chain again right after `verify --all --record`, so both
+  run with `--skip-archives`. A chain that has archive records then prints `(archives not checked)`
+  on its line. Without the flag every archive would be read three times per run.
 - **No capture step.** `gblog capture browser` and `gblog capture files` run in the weekly tune routine
   (`docs/routine-weekly-tune.md`, step 2) and nowhere else. The shell hook needs no routine.
 

@@ -27,12 +27,13 @@ finding. Typical problems:
 | `not valid JSON`, `malformed record fields` | A damaged or hand-written line. |
 | `timestamp goes backwards` | A record is dated earlier than its predecessor. |
 | `state/<bot>.json: head does not match last record (state tampered or log truncated)` | The log tail and the state file disagree. |
-| `anchored head … is no longer in the chain (history rewritten or tail truncated)` | A head recorded by `gblog anchor` is gone. |
+| `anchored head … is no longer in the chain (history rewritten or tail truncated)` | A head recorded by `gblog anchor` (latest anchor, history or newest day rollup) is gone. |
 | `<path>: archived file missing`, `content hash mismatch (file modified after archiving)` | An evidence file was removed or changed. |
 | `break_ack is not the pinned kim-biseo 2026-11-02 approval` | A forged or misplaced acknowledgement. |
 | `no chain on disk for '<name>'` | The name is wrong (a typo, or an unregistered variant). |
 | `chain was anchored … but logs/<bot> is missing`, `state/<bot>.json records seq … but logs/<bot> is missing` | A whole chain was deleted while a witness survived. |
 | `logs/<dir>: directory name is not a valid chain key; its records are not verified` | A directory under `logs/` that gblog would never create. |
+| `<path>: not a regular file`, `logs/<bot>: cannot be listed (…)`, `anchor aborted: …` | A FIFO, device or directory where gblog expects a file (it is never opened), or a chain directory gblog cannot read. |
 
 Report the lines verbatim. Do not edit log files, and do not describe the ledger as verified.
 
@@ -59,6 +60,8 @@ Warnings. They do not change the exit code. Examples:
 - `<file>:<line>: appended while state/<bot>.json was missing; …`
 - `witness note missing on ledger chain`
 - `bot field '<x>' does not match chain '<y>'`
+- `state/<bot>.json: seq <n> does not match the last record (seq <m>); …` (appends are refused
+  until the operator runs `gblog state rebuild`)
 
 A warning usually means a witness was lost, so report it verbatim even when the chain says `OK`.
 
@@ -66,7 +69,7 @@ A warning usually means a witness was lost, so report it verbatim even when the 
 
 | Flag | Use |
 |---|---|
-| `--strict` | Auditing. Also FAILs on a `bot` field that differs from the chain, a `*.jsonl` file that is not named `YYYY-MM-DD.jsonl`, a non-string text field, a non-finite number, and any line that is not byte-for-byte what gblog writes. |
+| `--strict` | Auditing. Also FAILs on a `bot` field that differs from the chain, a `*.jsonl` file that is not named `YYYY-MM-DD.jsonl`, a non-string text field, a non-finite number, a symlink among the chain's files, a `ts` that is not in the normalised form, and any line that is not what gblog writes (surrounding white space is ignored). |
 | `--skip-archives` | A quick chain-only check. Archived files are not re-hashed, and the line says `(archives not checked)`. |
 | `--json` | Scripts. Prints one JSON list with an entry per chain block; the exit codes are unchanged. |
 | `--record` | Appends a `verify` record with the result to each verified chain. |
@@ -102,7 +105,7 @@ Nothing here rewrites a log line. An agent must not run these steps on its own.
 
    | Situation | Fix |
    |---|---|
-   | The chain verifies apart from `state/B.json: head does not match last record`, and state is behind the log or reset to genesis | `gblog state rebuild --bot B`. It rewrites state from the log tail and appends a `note` saying what state said before. |
+   | The chain verifies apart from `state/B.json: head does not match last record`, and state is behind the log or reset to genesis; or `verify` warns that the state `seq` does not match; or the state `head` is not text | `gblog state rebuild --bot B`. It rewrites state from the log tail and appends a `note` saying what state said before. |
    | `state rebuild` answers `… is ahead of the log or names a record that is not in it; restore the log from backup` | The log lost records. Restore the files under `logs/B/` from the backup. |
    | `verify` reports a damaged last line (`not valid JSON`, `hash mismatch`); the alert shows `"corrupt": true` | Restore the day file from the backup. gblog never trims a torn line. |
 
@@ -123,7 +126,9 @@ forward. Your record was written.
 The state file was gone (or unreadable) and gblog re-created it from the last log line. The append
 succeeded, but the state witness was lost: a truncation before that record cannot be ruled out
 from state. The record written by that append carries `state_adopted`, and every later `verify`
-prints a `!` line for it. Compare with a head kept off the computer (question 12).
+prints a `!` line for it. When `sync` or `capture browser` re-created the state file, the marker
+first sits in the state file, and the next append moves it onto its record. Compare with a head
+kept off the computer (question 12).
 
 ### 11. `gblog status` shows an `ALERT` for a problem that was fixed long ago. How do I clear it?
 
@@ -141,7 +146,8 @@ has the exact procedure.
 - `anchors/<chain>.history.jsonl`: one appended line per run;
 - `anchors/days/<UTC date>.json`: a per-day rollup of all chains.
 
-`verify` then FAILs when an anchored head is no longer in the chain. `verify --all` FAILs for a
+`verify` then FAILs when an anchored head is no longer in the chain (it checks the latest anchor,
+the history and the newest day rollup). `verify --all` FAILs for a
 chain whose `logs/<chain>` directory is gone while its anchor file, anchor history, day-rollup
 entry or state file survives.
 
@@ -273,6 +279,10 @@ Policy refusal. Every push URL of `origin` is checked:
 
 - GitHub is recognised by the parsed host: `github.com` and any `*.github.com`, on any port, and
   an ssh-config alias that `ssh -G` resolves to one.
+- A GitHub URL with a bracketed or percent-encoded host or a `<transport>::` prefix maps to no
+  repository and is refused. Write it as `https://github.com/<owner>/<repo>`.
+- The wiki of a repository is checked as that repository.
+- A push needs an `origin` in the ledger repository itself (question 26).
 - The local commit is made even when the push is refused, and a `sync` record with outcome
   `denied` is written.
 - The override flags are per-invocation operator decisions. Never put them in a routine prompt.
@@ -289,14 +299,18 @@ Every change of `origin` is written to the ledger as a `sync` record with the ol
 
 ### 25. `sync` printed `committed content differs from disk … not pushed`. Why?
 
-After committing, `sync` compares the committed bytes of the files under `logs/`, `anchors/` and
-`archive/` with the files on disk. A git ignore rule, a filter or an index flag can keep records
-out of a commit while git reports success. In that case `sync` pushes nothing and exits 1. Inspect
+After committing, `sync` compares the committed bytes of the log files, the anchor-history files
+and the archived files with the files on disk. A git filter or an index flag can keep records out
+of a commit while git reports success. In that case `sync` pushes nothing and exits 1. Inspect
 the git configuration of the ledger repository.
+
+A ledger directory that is a symbolic link gives a message of its own (`… is a symbolic link …;
+not pushed`): git stores the link, not the files behind it. Use a mount instead.
 
 ### 26. `sync` says `(not pushed)` and exits 1. What are the usual causes?
 
-- No `origin` is configured.
+- No `origin` is configured in the ledger repository itself. A remote of that name in the global
+  git configuration is not used.
 - The push was rejected or authentication failed. The error follows `push error:`.
 - `detached HEAD; pass --branch`.
 
@@ -317,6 +331,8 @@ Not captured:
 - non-interactive tool shells and zsh;
 - commands that bash keeps out of history;
 - a command identical to the one just before it;
+- whatever history shows at the first prompt of a new interactive shell (it was typed in an
+  earlier session);
 - a plain `gblog …` call, with or without variables such as `"$BOT"`. A `gblog` command line that
   contains `;`, `&`, `|`, `$(`, a backtick, `<`, `>` or a line break is logged.
 
@@ -328,7 +344,8 @@ only in `gblog status`.
 It copies each history database it finds (Chromium-family `History` files and Firefox
 `places.sqlite`; add more with `--history PATH` or `GBLOG_BROWSER_HISTORY`) and imports visits
 newer than its per-history marker. The first import of a history file is bounded by `--hours`
-(default 24).
+(default 24; a value below 1 exits 2). A marker dated more than a day in the future is ignored
+with a notice.
 
 Each record stores `scheme://host/path` without query string or fragment, the page title (first
 120 characters), the visit time as `observed`, and the profile directory name. Only `http` and
@@ -344,12 +361,15 @@ the snapshot in `state/capture-files-<bot>.json`.
 - The walk skips the ledger itself, `.git`, `__pycache__`, `node_modules`, `.cache`, `.venv` and
   the names given with `--exclude`.
 - Each difference is logged as `created`, `modified` or `deleted`.
-- The first run, a run after the snapshot was lost or became unreadable, and a run with a
-  different `--path` take a new baseline and log nothing. The output line then ends with
+- The first run, a run after the snapshot was lost or became unreadable, and the first run with
+  another `--path` (each path keeps a snapshot of its own) take a new baseline and log nothing.
+  The output line then ends with
   ` (new baseline: <reason>)`, and for every reason except a first run gblog also says so on
   stderr. Add `--record-baseline` to append an `auto` note to the ledger as well.
-- At most `--limit` changes (default 200, minimum 1) are logged per run. The rest stay pending for
-  the next run, and a note records how many.
+- At most `--limit` changes (default 200, minimum 1) are logged per run. The rest stay pending,
+  are logged first on the next run, and a note records how many.
+- `created` and `modified` records carry the file's modification time as `observed`. Coverage
+  matches on that time, not on the time of the capture run.
 
 ### 30. What does `gblog coverage` measure?
 
@@ -358,7 +378,9 @@ Two records match when they have the same Bot, the same action kind and the same
 (host, command name or file name) and lie within `--window` minutes (default 30) of each other.
 `--days` (default 7) sets the period.
 
-On a shared computer, browser and file activity cannot be attributed to one Bot.
+On a shared computer, browser and file activity cannot be attributed to one Bot. A captured record
+that another Bot reported is left out of this Bot's count. `--days` selects the captured records;
+an older self-report can still match one.
 
 ## Tune loop
 
@@ -379,7 +401,9 @@ On a shared computer, browser and file activity cannot be attributed to one Bot.
 
 Proposals are heuristics over self-reported data: repeated failures, repeated denials, tasks
 started manually on three or more days, recurring 3-step sequences, slow tasks, lessons in notes,
-tasks never closed, and coverage below 80%.
+tasks never closed, and coverage below 80%. Failures count the Bot's own reports only, a decision
+recorded as `auto` is not an approval by a person, and applying a `revert` proposal reopens the
+original one.
 
 ### 32. Why did a proposal disappear, or come back?
 
