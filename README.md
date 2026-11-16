@@ -37,6 +37,8 @@ OK    ops                       5 records  head 3c4241c25eb5
 | Tests + CI | `tests/`, `.github/workflows/ci.yml` | Unit tests incl. tamper detection, forged-ack and rollback detection, crash recovery, coverage matching and the tune loop; Python 3.8 to 3.14 on Linux, 3.12 on macOS; shellcheck |
 | Design + policy | `docs/DESIGN.md`, `SECURITY.md`, `CHANGELOG.md` | Threat model, append state machine, record field reference, exit codes; reporting and private-remote policy; per-version behaviour changes |
 
+Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integration.md`](docs/agent-integration.md). Common questions are answered in [`docs/faq.md`](docs/faq.md).
+
 ## How it works
 
 - **One chain per Bot.** Records go to `logs/<bot>/YYYY-MM-DD.jsonl`. Each record has `seq`,
