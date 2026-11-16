@@ -251,7 +251,7 @@ class CaptureCoverageTuneTest(unittest.TestCase):
 
     def test_tune_proposals_apply_and_effect(self):
         L = self.ledger
-        now = gblog._dt.datetime.utcnow()
+        now = gblog._dt.datetime.now(gblog._dt.timezone.utc).replace(tzinfo=None)
         def ts(days_ago, hour=9, minute=0):
             return (now - gblog._dt.timedelta(days=days_ago)).replace(hour=hour, minute=minute, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
         for d in (6, 5, 4):
@@ -469,13 +469,27 @@ class AliasArchiveSyncTest(unittest.TestCase):
         self.assertTrue(calls[0].endswith("github.com/someone/public-repo.git"), calls)  # git may rewrite the URL via insteadOf
         self.assertEqual(self.ledger.records("system")[-1]["outcome"], "denied")
         # --no-push never contacts the network; --allow-public attempts the push
+        # The real push goes to a local bare repository: no network, no credential prompt.
+        bare = tempfile.mkdtemp(prefix="gblog-bare-")
+        git_env = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_ALLOW_PROTOCOL": "file"}
+        saved_env = {k: os.environ.get(k) for k in git_env}
+        os.environ.update(git_env)
         gblog.remote_visibility = lambda remote, timeout=6.0: calls.append("again") or {"public": True, "reason": "test"}
         try:
             rc, out, err = run(["sync", "--no-push"], self.root)
             self.assertEqual(rc, 0, out + err)
+            subprocess.run(["git", "init", "--bare", "-q", bare], check=True, capture_output=True)
+            subprocess.run(["git", "-C", self.root, "remote", "set-url", "origin", bare], check=True, capture_output=True)
             rc, out, err = run(["sync", "--allow-public"], self.root)
         finally:
             gblog.remote_visibility = orig
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            shutil.rmtree(bare, ignore_errors=True)
         self.assertNotEqual(rc, 3)
 
     def test_remote_visibility_parses_urls(self):
@@ -492,13 +506,15 @@ class AliasArchiveSyncTest(unittest.TestCase):
         conn = sqlite3.connect(hist)
         conn.executescript("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT);"
                            "CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);")
-        now_webkit = int((gblog._dt.datetime.utcnow().timestamp() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
+        now_webkit = int((gblog._dt.datetime.now(gblog._dt.timezone.utc).replace(tzinfo=None).timestamp() + gblog._WEBKIT_EPOCH_OFFSET) * 1_000_000)
         conn.execute("INSERT INTO urls VALUES (1, 'https://mail.google.com/mail/u/0/?token=zzz#inbox', 'Inbox')")
         conn.execute("INSERT INTO urls VALUES (2, 'chrome://newtab/', 'New tab')")
         conn.execute("INSERT INTO visits VALUES (1, 1, ?)", (now_webkit - 60_000_000,))
         conn.execute("INSERT INTO visits VALUES (2, 2, ?)", (now_webkit - 30_000_000,))
         conn.execute("INSERT INTO visits VALUES (3, 1, ?)", (now_webkit - 1_000_000,))
         conn.commit(); conn.close()
+        saved_globs = gblog.BROWSER_HISTORY_GLOBS
+        gblog.BROWSER_HISTORY_GLOBS = ()  # scan only GBLOG_BROWSER_HISTORY, never the developer's real profiles
         os.environ["GBLOG_BROWSER_HISTORY"] = os.path.join(self.root, "google-chrome*", "*", "History")
         try:
             found = gblog.find_browser_histories()
@@ -509,6 +525,7 @@ class AliasArchiveSyncTest(unittest.TestCase):
             self.assertEqual(res["added"], 0)  # marker per history file
         finally:
             del os.environ["GBLOG_BROWSER_HISTORY"]
+            gblog.BROWSER_HISTORY_GLOBS = saved_globs
         rec = self.ledger.records("ops")[-1]
         self.assertEqual(rec["target"], "https://mail.google.com/mail/u/0/")
         self.assertEqual(rec["profile"], "Profile 2")
