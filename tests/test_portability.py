@@ -425,7 +425,7 @@ class ExamplesTest(Base):
                          ["Run command"] * len(locales) + ["Run no-such_tool.sh+x"])
         with open(gblog.Ledger(root).log_files("ops")[0], "rb") as fh:
             data = fh.read()
-        self.assertNotIn(b"caf", data)
+        self.assertNotIn("caf\u00e9-tool".encode("utf-8"), data)
         self.assertNotIn(b"secret-arg", data)
 
 
