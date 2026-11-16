@@ -134,6 +134,8 @@ class _VerifyResult(dict):
     hashes: frozenset = frozenset()
     # The subset whose ``bot`` field names the chain they are stored in: what ``verify --contains`` accepts.
     own_hashes: frozenset = frozenset()
+    # K8-09: how a mismatching state head relates to the chain (``one_behind``, ``behind``, ``not_in_chain``) or None.
+    state_relation: Optional[str] = None
 
 RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune", "archive")
 SOURCES = ("self", "auto", "routine")
@@ -493,6 +495,34 @@ def _one_behind(bot: str, raw_state: Optional[Dict], last_rec: object) -> Option
     return None
 
 
+# K8-01: what an append refusal appends after ``; cause: `` ({b} chain, {f} observed file, {n} records behind).
+_CAUSE_TEXT = {
+    "state_behind": "state is {n} record(s) behind the log; operator: gblog verify --bot {b}, then gblog state rebuild --bot {b}",
+    "state_seq_mismatch": "state names the last record under another seq; operator: gblog verify --bot {b}, "
+                          "then gblog state rebuild --bot {b}",
+    "state_ahead": "state is ahead of the log (records are missing at the end of {f}); restore logs/{b}/ from backup; "
+                   "state rebuild will refuse",
+    "tail_rewritten": "the last record of {f} is not the one state names; restore that day file from backup",
+    "tail_corrupt": "the last line of {f} is not a valid record; restore that day file from backup (gblog never trims a line)",
+    "logs_missing": "state names a head but logs/{b}/ holds no log record; restore logs/{b}/ from backup",
+    "state_not_regular": "state/{b}.json is a directory; remove it, then operator: gblog state rebuild --bot {b}",
+    "day_file_not_regular": "{f} is not a regular file; remove it (the log tail and state agree)",
+}
+
+
+def _cause_text(bot: str, observed: Dict) -> str:
+    fmt = _CAUSE_TEXT.get(str(observed.get("cause") or ""))
+    if not fmt:
+        return ""
+    n = observed.get("behind")
+    return fmt.format(b=bot, f=observed.get("file") or "logs/%s" % bot, n=n if _is_int(n) else "?")
+
+
+def _require_ledger() -> bool:
+    """K8-11: with GBLOG_REQUIRE_LEDGER set, a missing ledger is an error and is never created implicitly."""
+    return os.environ.get("GBLOG_REQUIRE_LEDGER", "") not in ("", "0")
+
+
 def _anchor_entry_heads(entry: Dict) -> List[str]:
     """The heads one anchor or day-rollup entry names."""
     heads = [entry.get("head")] if entry.get("ok") else entry.get("segment_heads")
@@ -638,6 +668,9 @@ def _marker_int(value: object) -> int:
 
 # Paths of alias registries already reported as unreadable (one warning per process; main() resets it per run).
 _ALIASES_WARNED: set = set()
+# The subcommand of the current run (set by _main; main() uses it for its last-resort messages).
+_RUN: Dict[str, Optional[str]] = {"cmd": None}
+_LOGGING_CMDS = ("task-start", "log", "approval", "task-end", "note", "archive", "capture")
 
 
 def _tolerant_streams() -> None:
@@ -1232,6 +1265,8 @@ class Ledger:
     def ensure(self) -> None:
         if not all(os.path.isdir(d) for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir, self.archive_dir, self.anchors_dir, self.spool_dir)):
             fresh = not os.path.isdir(self.logs_dir)
+            if fresh and _require_ledger():
+                _die("no ledger at %s; run `gblog init` there or fix --root / $GBLOG_ROOT" % self.root)
             self.init()
             if fresh:
                 sys.stderr.write("notice: initialized new ledger at %s\n" % self.root)
@@ -1483,6 +1518,9 @@ class Ledger:
     # Updates never use the cached copy: they read the file again under aliases.lock (_aliases_for_update).
     cache_aliases = False
     _aliases_cached: Optional[Tuple[Dict, bool]] = None
+    # Set by the CLI for read commands (K8-16): a name without ASCII letters or digits that is not registered
+    # selects nothing; it is not a usage error with a write-side remedy.
+    lenient_names = False
 
     def aliases(self) -> Dict:
         if self.cache_aliases and self._aliases_cached is not None:
@@ -1657,6 +1695,8 @@ class Ledger:
                 return slug, True
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")
         if not cleaned:
+            if self.lenient_names:
+                return raw, False
             _die("'%s' has no ASCII letters or digits; register it first: "
                              "gblog alias add --slug <ascii-slug> --display '%s'" % (raw, raw))
         for slug in bots:
@@ -1815,7 +1855,11 @@ class Ledger:
         data = line.encode("utf-8")
         # A new day file is private (0o600). O_RDWR only so the last byte can be inspected.
         # O_NOFOLLOW: a day file (or anchor history) that is a symbolic link is refused, never written through.
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError as exc:
+            exc.gblog_unwritten = True  # type: ignore[attr-defined]  # nothing reached the file (K8-05, K8-13)
+            raise
         try:
             size = os.fstat(fd).st_size
             if size > 0:
@@ -1894,6 +1938,7 @@ class Ledger:
             "ts": now_iso(),
             "bot": bot,
             "reason": "file tail does not match state head/hash/seq; append refused",
+            "cause": observed.get("cause"),
             "expected_seq": expected_seq,
             "expected_head": expected_head,
             "observed": observed,
@@ -1908,14 +1953,19 @@ class Ledger:
                 self._atomic_json(target, payload)
             except OSError as exc:
                 failed.append("%s not written (%s)" % (what, exc.__class__.__name__))
-        raise TailMismatchError(
-            # the observed values come from the last log line as written: no raw control characters in the message
-            _term(("bot %s tail seq/hash %s/%s != state %s/%s" + "".join("; " + text for text in failed)) % (
-                bot, observed.get("seq"), str(observed.get("hash") or "")[:12], expected_seq, str(expected_head)[:12],
-            )),
-            spool_path, alert_path,
-            {"seq": expected_seq, "head": expected_head}, observed,
-        )
+        # K8-01: the sentence stays as a prefix; the cause and its remedy follow on the same line.
+        state_txt = ("-/%s" % observed["state"]) if observed.get("state") else "%s/%s" % (expected_seq, str(expected_head)[:12])
+        text = "bot %s tail seq/hash %s/%s != state %s" % (
+            bot, observed.get("seq"), str(observed.get("hash") or "")[:12], state_txt)
+        why = _cause_text(bot, observed)
+        if why:
+            text += "; cause: " + why
+        text += "".join("; " + item for item in failed)
+        # the observed values come from the last log line as written: no raw control characters in the message
+        refusal = TailMismatchError(_term(text), spool_path, alert_path,
+                                    {"seq": expected_seq, "head": expected_head}, observed)
+        refusal.bot, refusal.cause = bot, observed.get("cause")  # type: ignore[attr-defined]
+        raise refusal
 
     def _append_head(self, bot: str, seen: Optional[List] = None) -> Tuple[int, object, Optional[Dict], Optional[Dict], str]:
         """Decide what the next append links to. Reads only; never spools.
@@ -1943,26 +1993,41 @@ class Ledger:
         if state_exists and _real_dir(state_path):
             # A directory where the state file belongs cannot be replaced (K2-08). Without this refusal every
             # append would write its line, fail on the state write and exit 2: the chain grows one "error" at a time.
-            return 0, GENESIS, tail, {"seq": None, "hash": None, "file": "state/%s.json" % bot, "corrupt": True}, ""
+            return 0, GENESIS, tail, {"seq": None, "hash": None, "file": "state/%s.json" % bot, "corrupt": True,
+                                      "cause": "state_not_regular", "state": "directory"}, ""
         # A state object whose head is not a string is treated like an unreadable file (verify does the same).
         state = raw if _usable_head(raw) else None
         seq, head = _state_head(state)
         if path is None or tail is None:
             if not state_exists or (head == GENESIS and (seq == 0 or not self.log_files(bot))):
                 return 0, GENESIS, None, None, ""
-            return seq, head, None, {"seq": None, "hash": None, "file": None, "corrupt": False}, ""
+            return seq, head, None, {"seq": None, "hash": None, "file": None, "corrupt": False,
+                                     "cause": "logs_missing"}, ""
         rel = os.path.relpath(path, self.root).replace(os.sep, "/")
         corrupt = not _self_consistent(tail)
         observed = {"seq": tail.get("seq"), "hash": tail.get("hash"), "file": rel, "corrupt": corrupt}
         if state is None:
             # No usable state file: missing, or present but not a JSON object. One rule for both.
             if corrupt:
+                observed.update({"cause": "tail_corrupt", "state": "unreadable" if state_exists else "missing"})
                 return 0, GENESIS, tail, observed, ""
             return tail["seq"], tail["hash"], tail, None, ("unreadable" if state_exists else "missing")
         if not corrupt and tail["seq"] == seq and tail["hash"] == head:
             return seq, head, tail, None, ""
         if not corrupt and tail["prev"] == head and tail["seq"] == seq + 1:
             return tail["seq"], tail["hash"], tail, None, "interrupted"
+        # K8-01: say which of the mismatches this is (additive key; lands in the spool and alert files).
+        if corrupt:
+            observed["cause"] = "tail_corrupt"
+        elif tail["hash"] == head:
+            observed["cause"] = "state_seq_mismatch"
+        elif seq > tail["seq"]:
+            observed["cause"] = "state_ahead"
+        elif seq == tail["seq"]:
+            observed["cause"] = "tail_rewritten"
+        else:
+            observed["cause"] = "state_behind"
+            observed["behind"] = (tail["seq"] - seq) if seq >= 0 else None
         return seq, head, tail, observed, ""
 
     def _tail_ok(self, bot: str) -> bool:
@@ -2063,9 +2128,15 @@ class Ledger:
                 # A FIFO, directory or device planted at the day file (K2-10): the tail check cannot see it.
                 # The event is spooled (exit 4), never lost with exit 2. A symlink keeps its plain refusal.
                 self._refuse_tail(bot, record, seq, head, {
-                    "seq": None, "hash": None, "corrupt": True,
+                    "seq": None, "hash": None, "corrupt": True, "cause": "day_file_not_regular",
                     "file": os.path.relpath(path, self.root).replace(os.sep, "/")})
-            self._append_line(path, json.dumps(full, ensure_ascii=False, sort_keys=True) + "\n")
+            try:
+                self._append_line(path, json.dumps(full, ensure_ascii=False, sort_keys=True) + "\n")
+            except OSError as exc:
+                # K8-05: the CLI says whether a retry could log the record twice.
+                exc.gblog_append = ("unwritten" if getattr(exc, "gblog_unwritten", False) else "unknown",  # type: ignore[attr-defined]
+                                    bot, full["seq"], full["hash"])
+                raise
             # The state read at the top of this lock hold is still current (state writers take this lock),
             # so the file is not read a second time.
             state = seen[0] if seen else self._load_state(bot)
@@ -2074,7 +2145,11 @@ class Ledger:
             state.update({"seq": full["seq"], "head": full["hash"], "updated": ts})
             if isinstance(seeded, dict):
                 state.pop("state_adopted", None)  # the record just written carries the marker now
-            self.write_state(bot, state)
+            try:
+                self.write_state(bot, state)
+            except OSError as exc:
+                exc.gblog_append = ("written", bot, full["seq"], full["hash"])  # type: ignore[attr-defined]
+                raise
             return full
 
     def _chain_items(self, bot: str) -> List[Tuple[str, int, Dict]]:
@@ -2323,6 +2398,8 @@ class Ledger:
         bare: List[Tuple[str, int]] = []
         linked_archives: List[str] = []
         n_items = n_adopted = n_bare = count = 0
+        pre_head = raw_state.get("head") if raw_state is not None else None  # K8-09: is the state head a record?
+        state_seen = False
         expected_prev: object = GENESIS
         expected_seq = 1
         last_ts = ""
@@ -2407,11 +2484,13 @@ class Ledger:
 
         def feed() -> Iterator[Tuple]:
             """Every line of the snapshot, once: collects what verify needs and hands the line on to the layout checks."""
-            nonlocal n_items, n_adopted, n_bare
+            nonlocal n_items, n_adopted, n_bare, state_seen
             for i, item in enumerate(self._snapshot_lines(extents, strict, dup_lines, snap_problems)):
                 rel, lineno, rec, _text = item
                 n_items = i + 1
                 h = rec.get("hash")
+                if isinstance(h, str) and h == pre_head:
+                    state_seen = True
                 if isinstance(h, str) and (needed is None or h in needed):
                     hashes.add(h)
                     b = rec.get("bot")
@@ -2569,6 +2648,10 @@ class Ledger:
         })
         res.hashes = hashes  # type: ignore[assignment]
         res.own_hashes = own_hashes  # type: ignore[assignment]
+        if state_problem:
+            last_rec = prev_item[2] if prev_item is not None else {}
+            res.state_relation = ("not_in_chain" if not state_seen else
+                                  "one_behind" if last_rec.get("prev") == state_head else "behind")
         return res
 
     # The whole-list implementation that ``verify`` replaced (K4-02). gblog does not call it; it is kept as the
@@ -3145,9 +3228,21 @@ class Ledger:
                 raise SealError("refusing: copy fixture must use the kim-biseo 2026-11-02 coordinates")
             if not _same_break(desc, KIM_BISEO_FIXTURE_BREAK):
                 raise SealError("refusing: copy fixture hashes do not match the committed fixture")
-        found = self.verify(bot).get("breaks") or []
+        res = self.verify(bot)
+        found = res.get("breaks") or []
+        if res.get("approved_breaks"):
+            # K8-02: a sealed chain has no unapproved break left; say what it is instead of "does not match".
+            raise SealError("refusing: a break_ack is already present (%s is already sealed, jay_approval_id=%s); "
+                            "nothing was appended" % (bot, res.get("jay_approval_id")))
+        base = "refusing: on-disk chain does not match the pinned discontinuity"
+        if not self.log_files(bot):
+            raise SealError("%s (no chain on disk for %s under %s; check --root / $GBLOG_ROOT)" % (base, bot, self.root))
+        if not found:
+            raise SealError("%s (%s has no discontinuity: nothing to seal)" % (base, bot))
         if len(found) != 1 or not _same_break(found[0], desc):
-            raise SealError("refusing: on-disk chain does not match the pinned discontinuity")
+            first = found[0]
+            raise SealError("%s (%d break(s) found; first at %s:%s seq %s->%s)" % (
+                base, len(found), first.get("file"), first.get("line_after"), first.get("seq_before"), first.get("seq_after")))
         if any(rec.get("type") == "break_ack" for _p, _n, rec in self.iter_records(bot)):
             raise SealError("refusing: a break_ack is already present")
         # A tail mismatch on the sealed chain itself would spool a break_ack that `spool replay` never replays.
@@ -3314,6 +3409,7 @@ class Ledger:
         replayed: List[Dict] = []
         skipped: List[str] = []
         rejected: List[str] = []
+        invalid: List[Tuple[str, str]] = []  # K8-12: events append refused by content, with the reason
         refused = False
         files = self.spool_files(bot)
         # One index of the spool ids already in the chain for the whole run (K4-07). It starts at the oldest
@@ -3370,8 +3466,8 @@ class Ledger:
                     pass
                 refused = True
                 break
-            except RecordError:
-                skipped.append(path)  # a planted or damaged event: left in place, like an unreadable file
+            except RecordError as exc:
+                invalid.append((path, str(exc)))  # a planted or damaged event: left in place
                 continue
             _makedirs(done_dir)
             try:
@@ -3389,7 +3485,7 @@ class Ledger:
             except FileNotFoundError:
                 resolved = None  # a concurrent replay resolved the alert first
         return {"bot": bot, "replayed": replayed, "skipped": skipped, "refused": refused,
-                "remaining": len(remaining), "alert_resolved": resolved, "rejected": rejected}
+                "remaining": len(remaining), "alert_resolved": resolved, "rejected": rejected, "invalid": invalid}
 
     def _anchor_file(self, bot: str) -> str:
         return os.path.join(self.anchors_dir, bot + ".json")
@@ -3512,6 +3608,11 @@ class Ledger:
                 chains.append({"bot": bot, "ok": False, "status": "FAIL", "records": 0, "head": None,
                                "problems": ["anchor aborted: %s" % exc.__class__.__name__], "break": None,
                                "segments": [], "segment_heads": [], "ts": now_iso()})
+                if isinstance(exc, OSError) and isinstance(exc.filename, str) and exc.filename:
+                    # K8-08: name the file as well (additive key; ``problems`` stays as it was)
+                    chains[-1]["aborted_detail"] = "%s: %s" % (
+                        os.path.relpath(exc.filename, self.root).replace(os.sep, "/"),
+                        exc.strerror or exc.__class__.__name__)
         rollup = {"mode": "per-chain", "whole_ledger_skip": False, "ts": now_iso(), "chains": chains}
         if bots is None:
             # A chain whose logs/<bot> directory is gone while a witness survives is reported, not skipped.
@@ -4454,8 +4555,25 @@ def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def _git_call(root: str, args: Tuple[str, ...], check: bool) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.autocrlf=false", "-C", root, *args],
-                          check=check, encoding="utf-8", errors="replace", capture_output=True, env=_git_env())
+    # advice.pushUpdateRejected=false (K8-04): git's "integrate the remote changes (git pull)" hint is never produced.
+    try:
+        return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.autocrlf=false",
+                               "-c", "advice.pushUpdateRejected=false", "-C", root, *args],
+                              check=check, encoding="utf-8", errors="replace", capture_output=True, env=_git_env())
+    except FileNotFoundError:
+        raise _UsageError("git was not found on PATH; `gblog sync` needs it")
+
+
+def _git_sub(cmd: object) -> str:
+    """The git subcommand of an argv list (``-c x`` and ``-C dir`` pairs are skipped)."""
+    toks = [str(t) for t in cmd[1:]] if isinstance(cmd, (list, tuple)) else []
+    i = 0
+    while i < len(toks):
+        if toks[i] in ("-c", "-C"):
+            i += 2
+            continue
+        return toks[i]
+    return "?"
 
 
 _SYNC_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\Z")  # every file gblog itself writes has such a path
@@ -4786,7 +4904,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
                     raise _UsageError(".git/%s/origin defines a legacy remote named origin; remove that file "
                                       "before setting origin with --remote (origin was not changed)" % legacy)
         if current and not same and not replace_remote:
-            raise _UsageError("origin is already %s; pass --replace-remote to send backups to %s instead"
+            raise _UsageError("origin is already %s; sending backups to %s instead is an operator decision: --replace-remote"
                               % (_safe_url(current[0]), _safe_url(remote)))
         # Another spelling of the current origin (…/r for …/r.git, https for ssh) is not a change: .git/config
         # stays as it is and the run goes on (K3-04). --replace-remote stores the new spelling.
@@ -4901,11 +5019,21 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         result["visibilities"] = [{"url": _safe_url(u), "public": v.get("public"), "reason": v.get("reason")} for u, v in checks]
         refusal = None
         if public and not allow_public:
-            refusal = "refused: remote %s is PUBLIC (%s); backups must be private. Use --allow-public to override." % (
+            refusal = "refused: remote %s is PUBLIC (%s); backups must be private (operator decision: --allow-public)." % (
                 _safe_url(public[0][0]), public[0][1].get("reason"))
         elif unknown_github and not (allow_public or allow_unknown):
+            why = str(unknown_github[0][1].get("reason") or "")
             refusal = "refused: could not confirm %s is private (%s)" % (_safe_url(unknown_github[0][0]), unknown_github[0][1].get("reason"))
-            sys.stderr.write("hint: retry later, or pass --allow-unknown-visibility if you know the repository is private\n")
+            # K8-07: "retry later" only where a retry can help.
+            if why.startswith("github.com URL that cannot be mapped"):
+                hint = ("this URL form cannot be checked; the operator rewrites origin as https://github.com/<owner>/<repo> "
+                        "(gblog sync --remote <url> --replace-remote)")
+            elif "HTTP 403" in why or "HTTP 429" in why:
+                hint = ("the GitHub API refused the lookup (rate limit); sign in with `gh auth login` on this computer, "
+                        "or retry later")
+            else:
+                hint = "the lookup failed (%s); retry later" % (redact(why) or why)
+            sys.stderr.write("hint: %s (overriding is an operator decision: --allow-unknown-visibility)\n" % _term(hint))
         if refusal:
             result["refused"] = True
             result["error"] = redact(refusal)
@@ -4917,8 +5045,14 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             result["error"] = "no origin configured in the ledger repository; set one with `gblog sync --remote <url>`"
             push = False
         else:
-            for _url, vis in unknown:
-                sys.stderr.write("warning: could not confirm the remote is private (%s)\n" % vis.get("reason"))
+            for url, vis in unknown:
+                if github_remote(targets[url])[0]:
+                    sys.stderr.write("warning: could not confirm %s is private (%s)\n"
+                                     % (_term(_safe_url(url)), vis.get("reason")))
+                else:
+                    sys.stderr.write("warning: could not confirm %s is private: it is not on GitHub, so gblog cannot check "
+                                     "its visibility; keeping it private is the operator's responsibility\n"
+                                     % _term(_safe_url(url)))
     if push:
         cur_branch = branch or _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
         if cur_branch == "HEAD":
@@ -4930,7 +5064,20 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             except subprocess.CalledProcessError as exc:
                 # redact first, then cut: a cut through `https://user:token@` would hide the secret from the rules.
                 # _safe_url also drops http(s) userinfo that has no known secret shape (a token used as user name).
-                result["error"] = _safe_url((exc.stderr or exc.stdout or "").strip())[-400:]
+                said = (exc.stderr or exc.stdout or "").strip()
+                if "[rejected]" in said or "non-fast-forward" in said or "fetch first" in said:
+                    # K8-04: never relay git's own "git pull" advice; SECURITY.md says the opposite.
+                    result["rejected"] = True
+                    result["error"] = (
+                        "push rejected: origin/%s holds commits this ledger does not have (non-fast-forward). This can "
+                        "mean a rollback, or another writer of the remote. Do not pull, merge, force-push or rewrite "
+                        "history; stop and report." % cur_branch)
+                else:
+                    red = _safe_url(said)
+                    cut = red[-400:]
+                    if len(red) > 400 and "\n" in cut:
+                        cut = cut.split("\n", 1)[1]  # cut on a line boundary
+                    result["error"] = cut
     stamp = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
     # Valid chain directories only: an invalid one (logs/my bot) must not get a state or lock file of its own.
     for b in ledger.valid_chains():
@@ -6279,6 +6426,55 @@ def _verify_text(name: str, res: Dict) -> str:
     return "".join(lines)
 
 
+def _fail_hints(bot: str, res: Dict, root: str = "<root>") -> List[str]:
+    """K8-09: one remedy line per class of ``verify`` problem or warning. Never part of the verify result itself."""
+    hints: List[str] = []
+
+    def add(text: str) -> None:
+        if text not in hints:
+            hints.append(text)
+
+    rebuild = "operator: `gblog state rebuild --bot %s`" % bot
+    relation = getattr(res, "state_relation", None)
+    for prob in res.get("problems") or []:
+        p = str(prob)
+        if "head does not match last record" in p:
+            if relation == "one_behind":
+                add("an append was interrupted (state is one record behind); the next append repairs it, or " + rebuild)
+            elif relation == "behind":
+                add("state names an earlier record of this chain; " + rebuild)
+            else:
+                add("state names a head that is not in the log: the end of the log was removed or rewritten; "
+                    "restore logs/%s/ from backup (state rebuild refuses)" % bot)
+        elif "no chain on disk for" in p:
+            add("the name selects nothing: `gblog alias list`")
+        elif "is no longer in the chain" in p:
+            add("treat as ROLLBACK: find the commit that still holds the head with "
+                "`git -C %s log --oneline -S<full head> -- logs/%s`" % (root, bot))
+        elif "archived file missing" in p or "content hash mismatch" in p or ": unreadable (" in p:
+            add("restore the file from the backup: `git -C %s log --oneline -- %s`" % (root, p.split(": ", 1)[0]))
+        elif "not a regular file" in p or "cannot be listed" in p:
+            add("remove or repair that entry (ls -l shows what it is); gblog never opens it")
+        elif "but logs/" in p and "is missing" in p:
+            add("restore logs/%s/ from backup, or retire the chain (README, Upgrading, item 4)" % bot)
+    for warn in res.get("warnings") or []:
+        w = str(warn)
+        if ("does not match the last record (seq" in w or "missing or unreadable: tail truncation" in w
+                or "was reset to genesis" in w):
+            add(rebuild)
+    return hints
+
+
+def _error_json(obj: Dict) -> None:
+    """K8-10 (opt-in): with GBLOG_ERRORS=json, one final machine-readable stderr line per failed run."""
+    if os.environ.get("GBLOG_ERRORS") != "json":
+        return
+    try:
+        sys.stderr.write("gblog-error: %s\n" % json.dumps(obj, sort_keys=True, default=str))
+    except Exception:
+        pass
+
+
 def _add_root_everywhere(parser: argparse.ArgumentParser) -> None:
     """Let --root follow the subcommand too (`gblog status --root X`). SUPPRESS keeps the global value when it is absent."""
     for action in list(parser._actions):
@@ -6351,6 +6547,9 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--bot", help="one chain (still not a whole-ledger skip)")
     s.add_argument("--skip-archives", action="store_true",
                    help="do not re-hash archived files while the chains are verified")
+    s.add_argument("--json", action="store_true",
+                   help="print the anchor rollup (chains with full heads, missing) as JSON; same exit codes. "
+                        "Entries named in parentheses are not chains and have no head")
 
     s = sub.add_parser("report", help="render a Markdown report")
     s.add_argument("--bot")
@@ -6475,10 +6674,13 @@ def _resolve_bot(ledger: Ledger, name: str) -> str:
     slug, known = ledger.resolve(name)
     if not known:
         data = ledger.aliases()
-        msg = "bot name '%s' is not registered in state/aliases.json (logging under '%s'); register it with: gblog alias add --slug <slug> --alias '%s'" % (name, slug, name)
         if data.get("strict"):
-            _die(msg)
-        sys.stderr.write("warning: " + msg + "\n")
+            # K8-06: nothing is logged in strict mode, and `alias add` is the operator's command.
+            _die("bot name '%s' is not registered in state/aliases.json; nothing was logged (alias strict is on). "
+                 "Use the registered slug (gblog alias list), or ask the operator to run: "
+                 "gblog alias add --slug <slug> --alias '%s'" % (name, name))
+        sys.stderr.write("warning: bot name '%s' is not registered in state/aliases.json (logging under '%s'); "
+                         "ask the operator to register it: gblog alias add --slug <slug> --alias '%s'\n" % (name, slug, name))
     return slug
 
 
@@ -6523,6 +6725,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     _ALIASES_WARNED.clear()  # one "aliases.json is unreadable" warning per run
+    _RUN["cmd"] = None
     _tolerant_streams()
     rc = 0
     try:
@@ -6534,10 +6737,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return rc
     except TailMismatchError as exc:
         sys.stderr.write("ALERT tail mismatch: %s\nspool: %s\nalert: %s\n" % (exc, exc.spool_path, exc.alert_path))
+        _error_json({"exit": 4, "kind": "tail_mismatch", "bot": getattr(exc, "bot", None),
+                     "cause": getattr(exc, "cause", None), "spool": exc.spool_path, "alert": exc.alert_path})
         return 4
     except (_UsageError, TimestampError, RecordError) as exc:
         sys.stderr.write("error: %s\n" % exc)
+        _error_json({"exit": 2, "kind": "usage", "message": str(exc)})
         return 2
+    except SystemExit as exc:
+        if exc.code == 2:
+            _error_json({"exit": 2, "kind": "usage"})
+        raise
     except BrokenPipeError:
         try:  # keep the interpreter from complaining again when it flushes stdout at exit
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
@@ -6552,14 +6762,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         detail = exc.strerror or str(exc) or exc.__class__.__name__
         if exc.filename:
             detail = "%s: %s" % (detail, exc.filename)
+        try:
+            planted = exc.errno == errno.ELOOP and isinstance(exc.filename, str) and os.path.islink(exc.filename)
+        except OSError:
+            planted = False
+        if planted:  # K8-13: say what it is, in the words verify uses
+            detail = ("%s is a symbolic link; gblog does not write through one (replace it with a regular file "
+                      "or remove it)" % exc.filename)
         sys.stderr.write("error: %s\n" % _term(detail))
+        tag = getattr(exc, "gblog_append", None)  # K8-05: set by Ledger.append
+        if tag and tag[0] == "written":
+            sys.stderr.write("notice: the record IS in the log (%s #%s %s); do not run the command again. "
+                             "state/%s.json is repaired by the next append\n" % (tag[1], tag[2], str(tag[3])[:12], tag[1]))
+        elif tag and tag[0] == "unknown":
+            sys.stderr.write("notice: the record may be in the log; check `gblog tail --bot %s -n 1` before you retry\n"
+                             % tag[1])
+        elif tag:
+            sys.stderr.write("notice: nothing was written to the log and nothing was spooled\n")
+        _error_json({"exit": 2, "kind": "environment", "message": detail, "written": tag[0] if tag else None})
         return 2
     except Exception as exc:  # last resort: malformed input must never end in a traceback
         if os.environ.get("GBLOG_DEBUG"):
             raise
         text = _term(" ".join(str(_clean_text(str(exc))).split())[:300])
-        sys.stderr.write("error: internal error (%s%s); set GBLOG_DEBUG=1 for a traceback\n"
-                         % (exc.__class__.__name__, (": " + text) if text else ""))
+        more = "; check `gblog tail -n 1` before rerunning a write command" if _RUN.get("cmd") in _LOGGING_CMDS else ""
+        sys.stderr.write("error: internal error (%s%s); set GBLOG_DEBUG=1 for a traceback%s\n"
+                         % (exc.__class__.__name__, (": " + text) if text else "", more))
+        _error_json({"exit": 1, "kind": "internal", "message": exc.__class__.__name__})
         return 1
 
 
@@ -6568,6 +6797,18 @@ def _main(argv: Optional[List[str]] = None) -> int:
     _validate_args(args)
     ledger = Ledger(args.root)
     ledger.cache_aliases = True  # one read of state/aliases.json per command (updates re-read it under aliases.lock)
+    _RUN["cmd"] = args.cmd
+    deciding = bool(getattr(args, "apply", None) or getattr(args, "reject", None))
+    reader = (args.cmd in ("verify", "status", "tail", "export", "coverage")
+              or (args.cmd == "spool" and getattr(args, "what", None) == "list")
+              or (args.cmd in ("report", "tune") and bool(getattr(args, "stdout", False)) and not deciding))
+    ledger.lenient_names = reader or args.cmd in ("anchor", "report", "tune")  # K8-16
+    if args.cmd != "init" and not os.path.isdir(ledger.logs_dir):  # K8-11: missing is not the same as empty
+        if _require_ledger():
+            _die("no ledger at %s; run `gblog init` there or fix --root / $GBLOG_ROOT" % ledger.root)
+        if reader:
+            sys.stderr.write("warning: no ledger at %s (logs/ does not exist); check --root / $GBLOG_ROOT\n"
+                             % _term(ledger.root))
     ledger.verify_strict = bool(getattr(args, "strict", False))
     ledger.verify_skip_archives = bool(getattr(args, "skip_archives", False))
     out = sys.stdout
@@ -6647,10 +6888,15 @@ def _main(argv: Optional[List[str]] = None) -> int:
         # One list of result entries: the text lines and the --json document are both rendered from it.
         results: List[Dict] = []
 
-        def emit(name: str, entry: Dict) -> None:
+        def emit(name: str, entry: Dict, kind: str = "chain") -> None:
+            entry["kind"] = kind  # K8-10: machine-readable, so nobody has to match the problem text
+            hints = _fail_hints(name, entry, ledger.root)
+            if hints:
+                entry["hints"] = hints
             results.append(entry)
             if not as_json:
                 out.write(_verify_text(name, entry))
+                sys.stderr.write("".join("hint: %s: %s\n" % (_term(name), _term(h)) for h in hints))
 
         def finish(code: int) -> int:
             if as_json:
@@ -6691,15 +6937,19 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 entry = _verify_missing(args.bot, "no chain on disk for '%s'" % args.bot)
                 for n in lost_by_name:
                     entry["problems"].extend(lost_by_name[n])
-                emit(args.bot, entry)
+                emit(args.bot, entry, "missing_chain" if lost_by_name else "unknown_name")
                 if unlistable:
-                    emit("(witness files)", dict(_verify_missing("(witness files)", unlistable[0]), problems=unlistable))
+                    emit("(witness files)", dict(_verify_missing("(witness files)", unlistable[0]), problems=unlistable),
+                         "witness_files")
                 return finish(1)
             missing.update(lost_by_name)
             if unlistable:
                 missing["(witness files)"] = unlistable
         not_found: List[str] = []
         present: set = set()  # hashes of the very snapshots verify() walked; --contains needs no second read
+        # K8-03: a miss is reported on the chain that was searched (the named one), else on the last chain.
+        exact = (args.bot or "").strip() if wanted else ""
+        decide_at = exact if exact in bots else (bots[-1] if bots else None)
         rc = 0
         for b in bots:
             res = _verify_guarded(ledger, b)
@@ -6711,11 +6961,19 @@ def _main(argv: Optional[List[str]] = None) -> int:
             if isinstance(res, _VerifyResult):
                 # --contains has used them: a long --all run must not keep two hash sets per chain in `results`
                 res.hashes = res.own_hashes = frozenset()
-            if wanted and b == bots[-1]:
+            if wanted and b == decide_at:
                 not_found = [h for h in wanted if h not in present]
-            if not_found and b == bots[-1]:
-                res["problems"].extend("expected hash %s not found in chain" % h[:12] for h in not_found)
-                res["ok"] = False
+                if not_found:
+                    searched = [exact] if exact in bots else list(bots)
+                    res["problems"].extend("expected hash %s not found in chain" % h[:12] for h in not_found)
+                    res["ok"] = False
+                    res["contains_missing"] = list(not_found)
+                    res["contains_searched"] = searched
+                    if not as_json:
+                        for h in not_found:
+                            sys.stderr.write("hint: %s was looked for in chain(s) %s; a miss means a rollback, a rewrite "
+                                             "or a wrong chain name (docs/routine-daily-audit.md, step 1)\n"
+                                             % (h, _term(", ".join(searched))))
             if not res["ok"]:
                 rc = 1
             emit(b, res)
@@ -6729,10 +6987,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
             rc = 1
             entry = _verify_missing(name, missing[name][0])
             entry["problems"] = missing[name]
-            emit(name, entry)
+            emit(name, entry, "witness_files" if name == "(witness files)" else "missing_chain")
         for name in invalid:
             rc = 1
-            emit(name, _verify_missing(name, "logs/%s: directory name is not a valid chain key; its records are not verified" % _clean_text(name)))
+            emit(name, _verify_missing(name, "logs/%s: directory name is not a valid chain key; its records are not verified" % _clean_text(name)),
+                 "invalid_dir")
         return finish(rc)
 
     if args.cmd == "seal":
@@ -6743,7 +7002,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         try:
             rec = ledger.seal_break(args.bot, KIM_BISEO_BREAK, args.jay_approval_id, copy_fixture=False)
         except SealError as exc:
-            sys.stderr.write("seal: %s\n" % exc)
+            sys.stderr.write("seal: %s\n" % _term(str(exc)))  # the approval id it may quote is ledger content
             return 2
         out.write("sealed %s #%d jay_approval_id=%s\n" % (rec["hash"][:12], rec["seq"], args.jay_approval_id))
         return 0
@@ -6753,11 +7012,24 @@ def _main(argv: Optional[List[str]] = None) -> int:
         if args.bot:
             bots = ledger.chains_on_disk(args.bot)
             if not bots:  # a typo must not create anchors/<typo>.json
+                if getattr(args, "json", False):
+                    _write_json(out, {"chains": [], "missing": [{"bot": args.bot, "ok": False, "problems": [
+                        "no chain on disk for '%s'" % args.bot]}]}, indent=2, default=str)
+                    return 1
+                # K8-08: a script that reads ANCHOR lines sees the failure too
+                out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (_term(args.bot), "-", ""))
                 out.write("FAIL  %-20s %6d records\n" % (_term(args.bot), 0))
                 out.write("      - no chain on disk for '%s'\n" % _term(args.bot))
                 return 1
         ledger.verify_want_hashes = []  # anchor looks no hash up: verify need not keep them
         rollup = ledger.anchor(bots)
+        if getattr(args, "json", False):
+            lost_json = list(rollup.get("missing") or [])
+            if args.bot:
+                named_json = ledger.lost_chains_of(args.bot, bots or [])
+                lost_json += [{"bot": n, "ok": False, "problems": named_json[n]} for n in named_json]
+            _write_json(out, dict(rollup, missing=lost_json), indent=2, default=str)
+            return 0 if all(c["ok"] for c in rollup["chains"]) and not lost_json else 1
         for c in rollup["chains"]:
             if c["ok"]:
                 extra = (" " + c["status"]) if c.get("approved_breaks") else ""
@@ -6769,9 +7041,14 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 heads = " ".join(str(h)[:12] for h in (c.get("segment_heads") or []))
                 where = "%s:%s seq %s->%s" % (br.get("file"), br.get("line_after"), br.get("seq_before"), br.get("seq_after")) if br else "-"
                 out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (c["bot"], _term(where), heads))
-                for prob in c.get("problems") or []:
-                    if str(prob).startswith("anchor aborted"):  # nothing else says why this chain has no anchor
-                        out.write("      - %s\n" % _term(prob))
+                # K8-08: say why (at most five lines; `verify` has the rest)
+                probs = [str(p) for p in c.get("problems") or []]
+                if c.get("aborted_detail"):
+                    probs.insert(1, str(c["aborted_detail"]))
+                for prob in probs[:5]:
+                    out.write("      - %s\n" % _term(prob))
+                if len(probs) > 5:
+                    out.write("      - ... %d more (gblog verify --bot %s)\n" % (len(probs) - 5, _term(c["bot"])))
         lost_chains = list(rollup.get("missing") or [])
         if args.bot:
             # K1-04: a chain of this Bot whose logs are gone while a witness survives is a FAIL here,
@@ -6857,12 +7134,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
             stamps = sorted(a_ts for a_ts, _n in alerts if a_ts)
             r["alert"] = stamps[0] if stamps else None
             r["spooled"] = sum(a_n for _ts, a_n in alerts)
+            causes = [(_read_json(os.path.join(ledger.state_dir, c + ".alert.json")) or {}).get("cause")
+                      for c in r["chains"]]
+            r["alert_cause"] = next((c for c in causes if isinstance(c, str)), None)  # K8-01
             # A future-dated tail pins every new record to that timestamp (and day file); taken from state.updated.
             ahead = [u for u in (state_views[c]["updated"] for c in r["chains"]) if _future_ts(u)]
             r["future_tail"] = max(ahead) if ahead else None
         orphans = _orphan_alerts(ledger, getattr(args, "bot", None))
         if args.json:
-            _write_json(out, {"root": ledger.root, "bots": rows, "orphan_alerts": orphans}, indent=2)
+            _write_json(out, {"root": ledger.root, "bots": rows, "orphan_alerts": orphans,
+                              "ledger_exists": os.path.isdir(ledger.logs_dir)}, indent=2)
             return 0
         out.write("root: %s\n" % ledger.root)
         orphan_alerts = ["ALERT %s: tail mismatch since %s (%d spooled)\n" % (_term(o["bot"]), _term(o["alert"]), o["spooled"])
@@ -6915,9 +7196,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
                        allow_unknown=bool(getattr(args, "allow_unknown_visibility", False)),
                        replace_remote=bool(getattr(args, "replace_remote", False)))
         except subprocess.CalledProcessError as exc:
-            sys.stderr.write("git failed: %s\n" % _safe_url((exc.stderr or exc.stdout or "").strip()))
+            sys.stderr.write("git failed (git %s, exit %s): %s\n" % (
+                _git_sub(exc.cmd), exc.returncode, _safe_url((exc.stderr or exc.stdout or "").strip())))
             return 2
-        out.write("commit %s%s%s\n" % (res["commit"], " pushed" if res["pushed"] else " (not pushed)", "" if not res["error"] else "\n  push error: " + res["error"]))
+        err_label = "error" if args.no_push else "push error"  # K8-17: no push was attempted with --no-push
+        out.write("commit %s%s%s\n" % (res["commit"], " pushed" if res["pushed"] else " (not pushed)", "" if not res["error"] else "\n  %s: %s" % (err_label, res["error"])))
         for text in res.get("stamp_errors") or []:  # G1-05: after the commit line; the exit code is unchanged
             sys.stderr.write("warning: %s\n" % _term(text))
         if res.get("refused") or (res["error"] and res["error"].startswith("refused:")):
@@ -7010,6 +7293,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 status = _install_shell_hook(args.bot, args.rc)
                 label = {"installed": "installed hook in", "updated": "updated hook in"}.get(status, "hook already present in")
                 out.write("%s %s\n" % (label, os.path.expanduser(args.rc)))
+                if status == "present":  # K8-14: "present" also covers a block that could not be replaced
+                    try:
+                        with _open_regular(os.path.expanduser(args.rc)) as fh:
+                            rc_body: Optional[bytes] = fh.read()
+                    except OSError:
+                        rc_body = None
+                    if rc_body is not None and shell_hook(args.bot).encode("utf-8").rstrip(b"\n") not in rc_body:
+                        sys.stderr.write(
+                            "warning: %s holds a gblog hook block that is not the current hook and could not be replaced "
+                            "(no end marker, or text before the start marker); remove the block by hand and run this "
+                            "command again\n" % _term(os.path.expanduser(args.rc)))
             else:
                 out.write(shell_hook(args.bot))
             return 0
@@ -7106,12 +7400,21 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 out.write("state/%s.json already matches the log tail; nothing to do\n" % chain)
                 return 0
             out.write("rebuilt %s seq %d head %s\n" % (chain, res["seq"], res["head"][:12]))
+            waiting = len(ledger.spool_files(chain))
+            if waiting:  # K8-12: name the next step
+                sys.stderr.write("note: %d spooled event(s) are pending for %s; next: gblog spool replay --bot %s\n"
+                                 % (waiting, chain, chain))
             return 0
 
     if args.cmd == "spool":
         if args.what == "list":
             # every chain of the Bot, as `status --bot` shows their alerts (K1-05)
             chains = ledger.spool_chains_for(args.bot) if args.bot else ledger.spool_bots()
+            if args.bot and not ledger.chains_on_disk(args.bot) and not any(
+                    os.path.isdir(os.path.join(ledger.spool_dir, c))
+                    or os.path.exists(os.path.join(ledger.state_dir, c + ".alert.json")) for c in chains if c):
+                sys.stderr.write("warning: no chain on disk for '%s'; nothing to show (see `gblog alias list`)\n"
+                                 % _term(args.bot))
             shown = 0
             for chain in chains:
                 for path in ledger.spool_files(chain):
@@ -7139,9 +7442,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
             for path in res.get("rejected") or []:
                 sys.stderr.write("spool replay: %s holds a break_ack, which only `gblog seal` may write; left in place\n"
                                  % os.path.relpath(path, ledger.root))
+            for path, why in res.get("invalid") or []:
+                sys.stderr.write("spool replay: %s: event refused (%s); left in place\n"
+                                 % (os.path.relpath(path, ledger.root), _term(why)))
+            if res["skipped"] or res.get("rejected") or res.get("invalid"):
+                sys.stderr.write('note: to dismiss a spool file without replaying it, see README "Upgrading", '
+                                 "item 3 (operator)\n")
             if res["refused"]:
-                sys.stderr.write("ALERT tail mismatch: %s still does not match state; %d spooled event(s) left in spool/%s\n"
-                                 % (chain, res["remaining"], chain))
+                sys.stderr.write("ALERT tail mismatch: %s still does not match state; %d spooled event(s) left in spool/%s"
+                                 "; operator: gblog verify --bot %s, then gblog state rebuild --bot %s "
+                                 "(docs/faq.md, question 8)\n" % (chain, res["remaining"], chain, chain, chain))
                 return 4
             out.write("replayed %d spooled event(s) for %s%s\n" % (
                 len(res["replayed"]), chain, "; alert resolved" if res["alert_resolved"] else ""))
@@ -7149,7 +7459,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             if siblings:  # replay stays per chain on purpose; say where the rest is
                 sys.stderr.write("note: spooled event(s) are pending in chain(s) %s; replay each with "
                                  "gblog spool replay --bot <chain>\n" % _term(", ".join(siblings)))
-            return 2 if (res["skipped"] or res.get("rejected")) else 0
+            return 2 if (res["skipped"] or res.get("rejected") or res.get("invalid")) else 0
 
     return 1
 
