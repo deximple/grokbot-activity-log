@@ -108,12 +108,21 @@ def stamp(n, day=DAY):
 
 
 def deep_nesting(default):
-    """Nesting depth for the "deeply nested JSON" tests.
+    """Nesting depth guaranteed to make ``json.loads`` raise ``RecursionError``.
 
     Before Python 3.14 the JSON scanner stops at a fixed recursion limit (at most 10 000 levels), so
-    20 000 levels always raise RecursionError and the tests need no more. From 3.14 the limit follows
-    the free C stack, so the original, larger depth (``default``) is kept there."""
-    return 20000 if sys.version_info < (3, 14) else default
+    20 000 levels always raise RecursionError. From 3.14 the scanner uses the C stack and can parse
+    50 000 nested objects without raising; probing once finds a depth past the current limit."""
+    if sys.version_info < (3, 14):
+        return 20000
+    depth = max(default, 50000)
+    while depth <= 8_000_000:
+        try:
+            json.loads('{"a":' * depth + "1" + "}" * depth)
+        except RecursionError:
+            return depth
+        depth *= 2
+    return depth
 
 
 # --------------------------------------------------------------------------- strict runner (review K6-01)

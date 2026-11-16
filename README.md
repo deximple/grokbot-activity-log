@@ -110,8 +110,9 @@ Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integr
 
     Full list and what to do after a leak: [`SECURITY.md`](SECURITY.md).
 - **Human-readable output.** `gblog report` renders a Markdown day report grouped by Bot and
-  task with FAIL/DENIED markers; `gblog status` shows record counts, open tasks, sync state and any
-  pending tail-mismatch alert (chain heads are shown only with `gblog status --json`).
+  task with FAIL/DENIED/PENDING markers; `gblog status` shows record counts, open tasks with each
+  task's last record and a `PENDING` flag when a step logged as `pending` has no result yet, sync
+  state, and any pending tail-mismatch alert (chain heads are shown only with `gblog status --json`).
 - **Backups you control — and private by policy.** `gblog sync` commits `logs/`, `reports/`, `state/`, `tuning/`, `archive/`, `anchors/`, and `spool/`
   into a git repo at the ledger root and pushes to the remote you configured. Nothing leaves the computer unless
   you set a remote, and `sync` **refuses to push to a public GitHub repository** (checked via `gh` or the public API;
@@ -302,6 +303,45 @@ not run `state rebuild` or `spool replay` on its own; the operator decides.
   `state/<bot>.alert.resolved-<stamp>.json`.
 - **`gblog status`** prints `ALERT <bot>: tail mismatch since <ts> (<n> spooled)` while an alert is
   pending. `status --json` adds `alert` and `spooled`.
+
+### Finding where a stuck run stopped
+
+When a Bot logs a step that can hang with `--outcome pending` before it starts and logs the outcome
+as a second record when it finishes, `gblog status` shows each open task's most recent record and
+flags an unfinished step. Demo run on a scratch `GBLOG_ROOT`:
+
+```text
+root: /tmp/gblog-demo-a
+bot                          chains    seq    today  open              updated  last sync
+ops                               1      4        4     1 2026-11-16T05:34:57Z  never
+open tasks: ops
+  af2d99e74d  Export and upload  (started 2026-11-16T05:34:57Z)
+    last: #4 action connector drive.upload [pending]
+    PENDING: started, no result recorded, nothing logged after it
+```
+
+If the task is waiting on an approval (`gblog approval … --decision pending`), `last:` shows
+`[pending]` without the `PENDING:` line — it is waiting for a person, not stuck mid-step:
+
+```text
+open tasks: ops
+  cf063854ed  Publish release notes  (started 2026-11-16T05:34:59Z)
+    last: #2 approval publish site [pending]
+```
+
+How to read it and what it cannot tell you:
+
+- **How to read `last:`.** The task stopped at its last record. If that record's outcome is `fail`
+  or `pending`, resume from that step; if it is `ok`, resume from the step after it.
+- **`PENDING` depends on a `pending` record.** `PENDING:` appears only if the Bot logged that step
+  with `--outcome pending` before starting it. A step that stopped without such a record is not in
+  the ledger at all, and `status` then shows the last finished step (`[ok]`).
+- **Self-reported, where not why.** The ledger is the Bot's own report. `status` shows where a task
+  stopped, not why it stopped, and `gblog` has no resume command.
+- **30-day window.** `status` inspects the last 30 days only: a task whose `task-start` is older is
+  in neither the `open` count nor `open tasks:`. To inspect older tasks, run
+  `gblog report --since YYYY-MM-DD --stdout` (open tasks render with `outcome **open**`, and any
+  unfinished step ends with `**PENDING**`), or scan raw records with `gblog export --bot <bot>`.
 
 | `verify` flag | Effect |
 |---|---|

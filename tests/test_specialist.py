@@ -956,5 +956,194 @@ class MiscFilesystemTest(Base):
             self.assertEqual(os.stat(real_rc).st_mode & 0o777, 0o640)
 
 
+# --------------------------------------------------------------------------- status open tasks and stuck-step flag
+class StatusOpenTaskBlockTest(Base):
+    PENDING_LINE = "    PENDING: started, no result recorded, nothing logged after it"
+
+    def _ago(self, days, seconds=0):
+        dt = gblog._utcnow() - gblog._dt.timedelta(days=days, seconds=-seconds)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_pending_action_block_appears_and_clears_after_next_record(self):
+        t0 = self._ago(0, 10)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "t1", "task": "Export and upload", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "t1", "action": "shell",
+                                       "target": "pg_dump", "outcome": "pending", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "t1", "action": "shell",
+                                       "target": "pg_dump", "outcome": "ok", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "t1", "action": "connector",
+                                       "target": "drive.upload", "outcome": "pending", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        lines = out.splitlines()
+        self.assertIn("open tasks: ops", lines)
+        idx = lines.index("open tasks: ops")
+        self.assertEqual(lines[idx + 1], "  t1  Export and upload  (started %s)" % t0)
+        self.assertEqual(lines[idx + 2], "    last: #4 action connector drive.upload [pending]")
+        self.assertEqual(lines[idx + 3], self.PENDING_LINE)
+
+        rc, jout, err = run(["status", "--json"], self.root)
+        self.assertEqual(rc, 0, jout + err)
+        row = json.loads(jout)["bots"][0]
+        self.assertEqual(row["open_tasks"], 1)
+        entry = row["open_task_list"][0]
+        self.assertEqual((entry["task_id"], entry["task"], entry["started"], entry["chain"]),
+                         ("t1", "Export and upload", t0, "ops"))
+        self.assertIs(entry["pending"], True)
+        self.assertEqual(entry["last"], {
+            "seq": 4, "type": "action", "action": "connector",
+            "target": "drive.upload", "outcome": "pending", "ts": t0,
+        })
+        self.assertEqual(row["pending_actions"], [entry])
+
+        # One more record on the same task clears PENDING; a record on another task does not.
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "note", "detail": "unrelated", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertIn(self.PENDING_LINE, out.splitlines())
+
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "action", "task_id": "t1", "action": "connector",
+                                       "target": "drive.upload", "outcome": "ok", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("PENDING:", out)
+        self.assertIn("    last: #6 action connector drive.upload [ok]", out.splitlines())
+        row = json.loads(run(["status", "--json"], self.root)[1])["bots"][0]
+        self.assertIs(row["open_task_list"][0]["pending"], False)
+        self.assertEqual(row["pending_actions"], [])
+
+    def test_pending_approval_shows_pending_without_stuck_flag(self):
+        t0 = self._ago(0, 5)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "ap1", "task": "Publish release", "ts": t0})
+            self.ledger.append("ops", {"type": "approval", "task_id": "ap1", "target": "publish site",
+                                       "decision": "pending", "outcome": "pending", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("    last: #2 approval publish site [pending]", out.splitlines())
+        self.assertNotIn("PENDING:", out)
+
+        row = json.loads(run(["status", "--json"], self.root)[1])["bots"][0]
+        entry = row["open_task_list"][0]
+        self.assertIs(entry["pending"], False)
+        self.assertIsNone(entry["last"]["action"])
+        self.assertEqual((entry["last"]["type"], entry["last"]["outcome"]), ("approval", "pending"))
+        self.assertEqual(row["pending_actions"], [])
+
+    def test_no_open_task_gives_byte_identical_text_and_preserves_alert_and_clock_order(self):
+        t0 = self._ago(0, 5)
+        future = "2099-01-01T00:00:00Z"
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "done", "task": "Closed", "ts": t0})
+            self.ledger.append("ops", {"type": "task_end", "task_id": "done", "outcome": "ok", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 3, out)
+        self.assertEqual(lines[0], "root: %s" % self.root)
+        self.assertEqual(lines[1], "%-28s %6s %6s %8s %5s %20s  %s"
+                         % ("bot", "chains", "seq", "today", "open", "updated", "last sync"))
+        self.assertEqual(lines[2], "%-28s %6d %6d %8d %5d %20s  %s"
+                         % ("ops", 1, 2, 0 if not t0.startswith(gblog.today()) else 2, 0, t0, "never"))
+        self.assertNotIn("open tasks:", out)
+
+        row = json.loads(run(["status", "--json"], self.root)[1])["bots"][0]
+        self.assertEqual((row["open_tasks"], row["open_task_list"], row["pending_actions"]), (0, [], []))
+
+        # With an open task plus ALERT and CLOCK, open tasks print after the table and before ALERT/CLOCK.
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "open1", "task": "Stuck", "ts": future})
+        self.write(self.path("state", "ops.alert.json"), json.dumps({"ts": t0}))
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        lines = out.splitlines()
+        i_table = 2
+        i_open = lines.index("open tasks: ops")
+        i_alert = next(i for i, l in enumerate(lines) if l.startswith("ALERT ops:"))
+        i_clock = next(i for i, l in enumerate(lines) if l.startswith("CLOCK ops:"))
+        self.assertLess(i_table, i_open)
+        self.assertLess(i_open, i_alert)
+        self.assertLess(i_alert, i_clock)
+
+    def test_control_characters_in_title_and_target_are_neutralised(self):
+        t0 = self._ago(0, 5)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "esc1",
+                                       "task": "Bad\ntitle\x1b[31m", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "esc1", "action": "shell",
+                                       "target": "echo hi\nALERT fake\x07", "outcome": "pending", "ts": t0})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)
+        self.assertEqual([l for l in out.splitlines() if l.startswith("ALERT")], [])
+        self.assertIn("Bad\\ntitle\\x1b[31m", out)
+        self.assertIn("echo hi\\nALERT fake\\x07 [pending]", out)
+
+    def test_task_older_than_window_is_excluded_even_with_recent_activity(self):
+        old_ts = self._ago(45)
+        now_ts = self._ago(0, 5)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "ancient", "task": "Old job", "ts": old_ts})
+            self.ledger.append("ops", {"type": "action", "task_id": "ancient", "action": "shell",
+                                       "target": "still_running", "outcome": "pending", "ts": now_ts})
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("open tasks:", out)
+        self.assertNotIn("PENDING:", out)
+        row = json.loads(run(["status", "--json"], self.root)[1])["bots"][0]
+        self.assertEqual((row["open_tasks"], row["open_task_list"], row["pending_actions"]), (0, [], []))
+
+    def test_bot_filter_and_chains_and_cross_chain_seq_disambiguation(self):
+        t1, t2 = self._ago(0, 10), self._ago(0, 20)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("cos", {"type": "task_start", "task_id": "c1", "task": "Draft memo", "ts": t1})
+            self.ledger.append("chief-of-staff", {"type": "action", "task_id": "c1", "action": "connector",
+                                                  "target": "docs.write", "outcome": "pending", "ts": t2})
+            self.ledger.append("ops", {"type": "task_start", "task_id": "o1", "task": "Other bot", "ts": t1})
+        self.ledger.add_alias("chief-of-staff", "Chief of Staff", ["cos"])
+
+        # Merged view: last record is in another chain than task_start, so #<seq> is qualified with its chain.
+        rc, out, err = run(["status", "--bot", "Chief of Staff"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("open tasks: Chief of Staff(chief-of-staff)", out.splitlines())
+        self.assertNotIn("open tasks: ops", out)
+        self.assertIn("    last: chief-of-staff#1 action connector docs.write [pending]", out.splitlines())
+        self.assertIn(self.PENDING_LINE, out.splitlines())
+
+        row = json.loads(run(["status", "--json", "--bot", "cos"], self.root)[1])["bots"][0]
+        self.assertEqual(row["open_task_list"][0]["chain"], "cos")
+        self.assertEqual(row["open_task_list"][0]["last"]["chain"], "chief-of-staff")
+
+        # --chains view: each chain sees only its own records.
+        rc, out_chains, err = run(["status", "--chains", "--bot", "Chief of Staff"], self.root)
+        self.assertEqual(rc, 0, out_chains + err)
+        self.assertIn("open tasks: cos", out_chains.splitlines())
+        self.assertNotIn("open tasks: chief-of-staff", out_chains)
+        self.assertIn("    last: #1 task_start", out_chains.splitlines())
+        self.assertNotIn("PENDING:", out_chains)
+
+    def test_status_reads_log_files_once_without_extra_io(self):
+        t0 = self._ago(0, 5)
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("ops", {"type": "task_start", "task_id": "io1", "task": "Single pass", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "io1", "action": "shell",
+                                       "target": "sleep 60", "outcome": "pending", "ts": t0})
+        opened = []
+        real_open = gblog._open_regular
+
+        def spy(path):
+            opened.append(os.path.relpath(path, self.root).replace(os.sep, "/"))
+            return real_open(path)
+
+        with mock.patch.object(gblog, "_open_regular", side_effect=spy):
+            rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        log_opens = [p for p in opened if p.startswith("logs/")]
+        self.assertEqual(len(log_opens), 1, log_opens)
+
+
 if __name__ == "__main__":
     unittest.main()

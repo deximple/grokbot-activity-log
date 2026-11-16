@@ -7424,16 +7424,43 @@ def _main(argv: Optional[List[str]] = None) -> int:
             # chain_records reads exactly one chain directory; records(c) would merge every alias chain once per chain.
             recent = [r for c in chains for r in ledger.chain_records(c, since=month)]
             open_tasks: Dict[str, Dict] = {}
-            for r in sorted(recent, key=lambda r: str(r.get("ts") or "")):
+            for r in sorted(recent, key=lambda r: (str(r.get("ts") or ""), str(r.get("bot") or ""), _seq_int(r.get("seq")))):
                 tid = r.get("task_id")
                 if not tid:
                     continue  # a task record without an id neither opens nor closes a task
                 if r.get("type") == "task_start":
                     open_tasks[tid] = {"task_id": tid, "task": r.get("task") or "", "started": r.get("ts"),
-                                       "chain": r.get("bot")}
+                                       "chain": r.get("bot"), "_last": r}
                 elif r.get("type") == "task_end":
                     open_tasks.pop(tid, None)
-            open_lists[key] = sorted(open_tasks.values(), key=lambda t: str(t.get("started") or ""))
+                elif tid in open_tasks:
+                    open_tasks[tid]["_last"] = r
+            task_entries: List[Dict] = []
+            for t in sorted(open_tasks.values(), key=lambda t: str(t.get("started") or "")):
+                lr = t["_last"]
+                rtype = lr.get("type")
+                is_action = rtype == "action"
+                outcome = lr.get("outcome")
+                last_info: Dict = {
+                    "seq": lr.get("seq"),
+                    "type": rtype,
+                    "action": lr.get("action") if is_action else None,
+                    "target": lr.get("target"),
+                    "outcome": outcome,
+                    "ts": lr.get("ts"),
+                }
+                if lr.get("bot") != t.get("chain"):
+                    last_info["chain"] = lr.get("bot")
+                is_pending = bool(is_action and outcome == "pending")
+                task_entries.append({
+                    "task_id": t["task_id"],
+                    "task": t["task"],
+                    "started": t["started"],
+                    "chain": t["chain"],
+                    "last": last_info,
+                    "pending": is_pending,
+                })
+            open_lists[key] = task_entries
             # A clamped record counts on the day its wall clock showed (clock_regressed), not on the pinned chain day.
             today_n = sum(1 for r in recent
                           if str((r.get("clock_regressed") if isinstance(r.get("clock_regressed"), str) else r.get("ts")) or "")
@@ -7444,6 +7471,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         chain_alerts: Dict[str, Tuple[Optional[str], int]] = {}  # one alert_info() per chain, reused for the ALERT lines
         for r in rows:
             r["open_task_list"] = open_lists.get(r["bot"], [])  # K1-01: the ids behind the `open_tasks` count
+            r["pending_actions"] = [t for t in r["open_task_list"] if t["pending"]]
             for c in r["chains"]:
                 chain_alerts[c] = ledger.alert_info(c)
             alerts = [chain_alerts[c] for c in r["chains"]]
@@ -7473,6 +7501,28 @@ def _main(argv: Optional[List[str]] = None) -> int:
             ls = r["last_sync"]
             ls_txt = "%s (%s%s)" % (ls["ts"], ls["commit"], "" if ls.get("pushed") else ", not pushed") if ls else "never"
             out.write("%-28s %6d %6d %8d %5d %20s  %s\n" % (_term(r["label"]), len(r["chains"]), r["seq"], r["today"], r["open_tasks"], _term(r["updated"] or "-"), _term(ls_txt)))
+        for r in rows:
+            if not r["open_task_list"]:
+                continue
+            out.write("open tasks: %s\n" % _term(r["label"]))
+            for t in r["open_task_list"]:
+                head_bits = ["  %s" % _term(str(t.get("task_id") or ""))]
+                if t.get("task"):
+                    head_bits.append(_term(str(t["task"])))
+                head_bits.append("(started %s)" % _term(str(t.get("started") or "-")))
+                out.write("  ".join(head_bits) + "\n")
+                lr = t["last"]
+                seq_ref = "%s#%s" % (_term(str(lr["chain"])), _term(str(lr.get("seq")))) if "chain" in lr else "#%s" % _term(str(lr.get("seq")))
+                last_bits = [seq_ref, _term(str(lr.get("type") or ""))]
+                if lr.get("type") == "action" and lr.get("action"):
+                    last_bits.append(_term(str(lr["action"])))
+                if lr.get("target"):
+                    last_bits.append(_term(str(lr["target"])))
+                if lr.get("outcome"):
+                    last_bits.append("[%s]" % _term(str(lr["outcome"])))
+                out.write("    last: %s\n" % " ".join(last_bits))
+                if t["pending"]:
+                    out.write("    PENDING: started, no result recorded, nothing logged after it\n")
         for r in rows:
             for c in r["chains"]:
                 a_ts, a_n = chain_alerts[c]

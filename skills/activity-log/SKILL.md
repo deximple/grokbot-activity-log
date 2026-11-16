@@ -35,7 +35,10 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
    `TID=$(gblog task-start --bot "$BOT" --source routine --task "<routine name>")`.
    Without it the weekly tune counts the runs as manual repeats and proposes the routine again.
 
-2. **Log each significant action immediately after it happens**, not in a batch at the end:
+2. **Log each significant action immediately after it happens**, not in a batch at the end. For a step
+   that can hang (a long shell command, an external call, a delegation), log it with `--outcome pending`
+   before it starts, then log the result (`ok`, `fail` or `denied`) as a second record when it ends; every
+   other step stays one record after the fact:
 
    | What happened | Command |
    |---|---|

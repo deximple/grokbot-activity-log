@@ -159,6 +159,10 @@ gblog log --bot "$BOT" --task-id "$TID" --action connector --target "quickbooks.
 - Write URLs as `scheme://host/path` without a query string.
 - Write shell commands verbatim, but never paste a password or a one-time code. Redaction is
   best-effort pattern matching (see [`SECURITY.md`](../SECURITY.md)).
+- For a step that can hang (a long shell command, an external call, a delegation), log it with
+  `--outcome pending` before it starts, then log the result as a second record when it ends; every
+  other step stays one record after the fact. `gblog status` flags an open task whose last record
+  is a `pending` action so an operator can see which step did not finish.
 
 ### 3.3 Approvals, notes, evidence
 
@@ -197,8 +201,12 @@ unset GBLOG_TASK
   - `gblog status --json --bot "$BOT"` has `seq` (the record count over all chains of the Bot) and
     `head`. `head` is `-` when the slug has no chain of its own and only variant chains exist.
   - The same row lists the tasks that are still open: `open_task_list` holds one object per task
-    opened in the last 30 days and not closed (`task_id`, `task`, `started`, `chain`), oldest
-    first. `open_tasks` is its length.
+    opened in the last 30 days and not closed (`task_id`, `task`, `started`, `chain`, `last`,
+    `pending`), oldest first. `last` holds the task's most recent record (`seq`, `type`, `action`,
+    `target`, `outcome`, `ts`, plus `chain` when that record is in another chain of the Bot than
+    the `task_start`; `action` is `null` unless `type` is `"action"`). `pending` is `true` only
+    when `last` is an `action` with `outcome == "pending"`, and `pending_actions` on the row holds
+    those entries. `open_tasks` is the length of `open_task_list`.
 
 ### 3.5 Tasks that span several turns or shells
 

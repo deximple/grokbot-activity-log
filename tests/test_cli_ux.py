@@ -318,7 +318,8 @@ class BotResolverTest(CliBase):
         for chain in VARIANTS:
             self.assertTrue(os.path.isfile(os.path.join(anchors, chain + ".json")), chain)
         self.assertFalse(os.path.exists(os.path.join(anchors, "ops.json")))
-        self.assertFalse(os.path.exists(os.path.join(anchors, "Chief-of-Staff.json")))
+        self.assertIn("chief-of-staff.json", os.listdir(anchors))
+        self.assertNotIn("Chief-of-Staff.json", os.listdir(anchors))
 
 
 # --------------------------------------------------------------------------- I-13

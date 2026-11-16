@@ -583,7 +583,11 @@ Read these before upgrading a routine or a script that branches on output or exi
     (`expired`) and `automatic` (`auto`). `--action` ignores letter case and reads `-` as `_`
     (`computer-use`) (K1-11).
   - `status --json` rows gain `open_task_list`: one object per open task (`task_id`, `task`,
-    `started`, `chain`), oldest first. `open_tasks` is its length (K1-01).
+    `started`, `chain`, `last`, `pending`), oldest first, plus `pending_actions` (the entries whose
+    `pending` is `true`). `open_tasks` is the length of `open_task_list`. When a row has open
+    tasks, text `gblog status` prints an `open tasks: <label>` block with each task's `last:`
+    record and a `PENDING:` line when that record is an `action` with `outcome == "pending"`
+    (K1-01).
   - The shell hook logs a command under the Bot it was installed for when gblog refuses the
     name in `GBLOG_BOT` (exit 2: unregistered under `alias strict on`, reserved). The record's
     detail is `GBLOG_BOT=<name> was refused`. The hook text changed; the marker is still

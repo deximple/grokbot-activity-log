@@ -174,11 +174,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     env:
       GIT_TERMINAL_PROMPT: "0"
-      GBLOG_ROOT: ${{ runner.temp }}/gblog-scripts
       # install.sh also writes the login shell's own startup file; pinned so every step sees the same files.
       SHELL: /bin/sh
     steps:
       - uses: actions/checkout@v4
+      - name: Default ledger root
+        run: echo "GBLOG_ROOT=$RUNNER_TEMP/gblog-scripts" >> "$GITHUB_ENV"
       - name: shellcheck install.sh, bin/gblog and the example scripts
         if: runner.os == 'Linux'
         run: |

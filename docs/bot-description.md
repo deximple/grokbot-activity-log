@@ -9,6 +9,7 @@ The description is for rules that must stay true; keep task instructions in the 
 Activity ledger rule (always on): before any work run `TID=$(gblog task-start --bot "<BOT_NAME>" --task "...")`.
 After every significant action (web page, shell command, connector call, file, message sent, desktop use,
 delegation, memory/skill/routine change) run `gblog log --bot "<BOT_NAME>" --task-id "$TID" --action <kind> --target <what> --outcome ok|fail|denied`.
+For a step that can hang (long shell command, external call, delegation), log `--outcome pending` before it starts and log the result as a second record when it ends; every other step is one record after the fact.
 Record every approval with `gblog approval ...` and close with `gblog task-end ...`.
 Never edit files under the ledger by hand. If a gblog command exits 4, stop and report.
 End each reply with "Ledger: N records, task TID, head HASH".
