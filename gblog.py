@@ -137,8 +137,8 @@ _SECRET_PATTERNS = [
     (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://[REDACTED]@"),  # userinfo in URLs
     # Audit I-08 (additive): JSON keys ending in a secret word, the same inside a JSON string (escaped quotes),
     # CLI flags, Basic auth, and more vendor key shapes.
-    (re.compile(r'(?i)("[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"'), r'\1"[REDACTED]"'),
-    (re.compile(r'(?i)(\\"[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key)\\"\s*:\s*)\\"[^"\n]*?\\"'), r'\1\\"[REDACTED]\\"'),
+    (re.compile(r'(?i)("[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|pwd|access[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"'), r'\1"[REDACTED]"'),
+    (re.compile(r'(?i)(\\"[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|pwd|access[_-]?key)\\"\s*:\s*)\\"[^"\n]*?\\"'), r'\1\\"[REDACTED]\\"'),
     (re.compile(r"(?i)(--(?:password|passwd|token|secret|api[_-]?key)[ =]+)(?:\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(authorization\s*[:=]\s*basic\s+)[A-Za-z0-9+/=]{8,}"), r"\1[REDACTED]"),
     (re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"), "[REDACTED]"),  # Stripe secret / restricted keys
@@ -469,6 +469,18 @@ def _touch_private(path: str) -> None:
             pass
 
 
+def _open_lock(path: str, mode: str = "a+"):
+    """Open a lock file for flock(). ``a+`` creates a missing file 0o600 (an existing file keeps its mode); ``r`` never creates."""
+    if mode == "r":
+        return open(path, "r")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        return os.fdopen(fd, "r+")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _is_within(path: str, parent: str) -> bool:
     """True when ``path`` is ``parent`` or below it (component-wise, not a string prefix)."""
     parent = os.path.abspath(parent)
@@ -626,12 +638,12 @@ class Ledger:
                     self._key = key
                 return self
             if not self.shared:
-                self.fh = open(self.path, "a+")
+                self.fh = _open_lock(self.path, "a+")
             else:
                 # A reader must work on a read-only tree and must not create a lock file for a chain that is not on disk.
                 for mode in (("a+", "r") if self.create else ("r",)):
                     try:
-                        self.fh = open(self.path, mode)
+                        self.fh = _open_lock(self.path, mode)
                         break
                     except OSError:
                         continue
@@ -665,12 +677,12 @@ class Ledger:
         """
         path = os.path.join(self.state_dir, bot + ".lock")
         if not shared:
-            os.makedirs(self.state_dir, exist_ok=True)
+            _makedirs(self.state_dir)
             return Ledger._Lock(path)
         on_disk = os.path.isdir(os.path.join(self.logs_dir, bot)) or os.path.exists(self._state_path(bot))
         if on_disk:
             try:
-                os.makedirs(self.state_dir, exist_ok=True)
+                _makedirs(self.state_dir)
             except OSError:
                 pass
         return Ledger._Lock(path, shared=True, create=on_disk)
@@ -926,7 +938,7 @@ class Ledger:
 
     def _atomic_json(self, path: str, obj: Dict) -> None:
         _makedirs(os.path.dirname(path))
-        tmp = path + ".tmp"
+        tmp = "%s.%d.tmp" % (path, os.getpid())  # per-process temp name: concurrent writers never share one temp file
         with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
             json.dump(obj, fh, indent=2, sort_keys=True, ensure_ascii=False)
             fh.write("\n")
@@ -1467,6 +1479,9 @@ class Ledger:
             exists = os.path.exists(self._state_path(bot))
             old = self._load_state(bot)
             old_seq, old_head = _state_head(old)
+            if old is not None and old_seq == tail["seq"] and old_head == tail["hash"]:
+                # State already names the tail: nothing to repair, so nothing is written (no state replace, no note).
+                return {"bot": bot, "seq": tail["seq"], "head": tail["hash"], "note": None, "noop": True}
             if old is None:
                 was = "seq - head %s" % ("unreadable" if exists else "missing")
             else:
@@ -1482,7 +1497,8 @@ class Ledger:
             self.write_state(bot, new)
         note = self.append(bot, {"type": "note", "source": "auto",
                                  "detail": "state rebuilt from log tail (was %s)" % was})
-        return {"bot": bot, "seq": tail["seq"], "head": tail["hash"], "note": note}
+        # seq/head are what state holds now, i.e. after the note that records the rebuild.
+        return {"bot": bot, "seq": note["seq"], "head": note["hash"], "note": note, "noop": False}
 
     def spool_bots(self) -> List[str]:
         if not os.path.isdir(self.spool_dir):
@@ -1535,7 +1551,7 @@ class Ledger:
                 rec["spooled_at"] = payload.get("ts")
                 rec["spool_id"] = spool_id
                 replayed.append(self.append(bot, rec))
-            os.makedirs(done_dir, exist_ok=True)
+            _makedirs(done_dir)
             os.replace(path, os.path.join(done_dir, os.path.basename(path)))
         remaining = self.spool_files(bot)
         resolved = None
@@ -1813,6 +1829,13 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     digest = hashlib.sha256(data).hexdigest()
     if ts:
         ts = parse_ts(ts)  # ValueError before anything is written; the day below becomes a directory name
+        # An explicit past timestamp is refused before the file is stored (append would refuse it afterwards).
+        _tail_path, _tail = ledger._tail_record(bot)
+        _tail_ts = _tail.get("ts") if _tail else None
+        if _is_norm_ts(_tail_ts) and ts < _tail_ts:
+            raise TimestampError(
+                "--ts %s is earlier than the last record of %s (%s); omit --ts and put the original time in --detail"
+                % (ts, bot, _tail_ts))
     day = today(ts)
     rel = os.path.join("archive", bot, day, digest + ".gz")
     full = os.path.join(ledger.root, rel)
@@ -1829,10 +1852,31 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
         os.replace(tmp, full)
     # the file and its directory entry must be durable before the hash is chained
     _fsync_dir(os.path.dirname(full))
-    rec = ledger.append(bot, {"type": "archive", "action": "file", "target": os.path.basename(name) or "stdin", "outcome": "ok",
-                              "task_id": task_id, "kind": kind if kind in ARCHIVE_KINDS else "other", "sha256": digest,
-                              "bytes": len(data), "path": rel.replace(os.sep, "/"), "redacted": redacted,
-                              "detail": detail, "ts": ts, "scanned": False if unscanned else None})
+    rel_posix = rel.replace(os.sep, "/")
+    try:
+        rec = ledger.append(bot, {"type": "archive", "action": "file", "target": os.path.basename(name) or "stdin", "outcome": "ok",
+                                  "task_id": task_id, "kind": kind if kind in ARCHIVE_KINDS else "other", "sha256": digest,
+                                  "bytes": len(data), "path": rel_posix, "redacted": redacted,
+                                  "detail": detail, "ts": ts,
+                                  # scanned: false = stored without secret scanning (binary content, or --no-redact)
+                                  "scanned": False if (unscanned or not do_redact) else None})
+    except TailMismatchError:
+        raise  # the spooled event references the stored file; a later `spool replay` chains it
+    except BaseException:
+        if not existed:
+            # Remove the file this call created, unless the log line became durable before the failure
+            # (for example ENOSPC while replacing state): then the chain references it and it must stay.
+            try:
+                _tp, tail_after = ledger._tail_record(bot)
+                chained = bool(tail_after) and tail_after.get("path") == rel_posix and tail_after.get("sha256") == digest
+            except Exception:
+                chained = True
+            if not chained:
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+        raise
     rec["_dedup"] = existed
     return rec
 
@@ -2017,7 +2061,7 @@ def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str], push: bool, message: Optional[str],
-         allow_public: bool = False, allow_unknown: Optional[bool] = None) -> Dict:
+         allow_public: bool = False, allow_unknown: bool = False) -> Dict:
     """Commit the ledger and, when ``push`` is set, push it to origin.
 
     Every push URL of origin is checked. A PUBLIC one refuses the push unless ``allow_public``.
@@ -2026,8 +2070,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     bot's own chain does not stop the commit or push; it is listed in ``result["tail_mismatch"]``.
     """
     root = ledger.root
-    if allow_unknown is None:  # the CLI sets this attribute from --allow-unknown-visibility
-        allow_unknown = bool(getattr(ledger, "allow_unknown_visibility", False))
+    allow_unknown = bool(allow_unknown)
     refused: List[str] = []
 
     def _bookkeep(record: Dict) -> None:
@@ -2054,7 +2097,11 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     # A pathspec that matches nothing makes `git add` fail, so README.md is listed only when present or tracked.
     if os.path.exists(os.path.join(root, "README.md")) or _git(root, "ls-files", "--", "README.md", check=False).stdout.strip():
         add_paths.append("README.md")
+    if os.path.exists(os.path.join(root, ".gitignore")):
+        add_paths.append(".gitignore")
     _git(root, "add", "-A", *add_paths)
+    # Lock files and file-capture snapshots are local scratch: untrack any that an older version committed.
+    _git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "state/*.lock", "state/capture-files-*.json", check=False)
     commit_msg = message or "gblog sync %s" % now_iso()
     env_ok = True
     try:
@@ -2564,9 +2611,15 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -
             status_ts = decision.get("ts")
             if status == "rejected":
                 # Hidden from the Markdown for 28 days, unless the evidence at least doubled since the rejection.
-                prior = sum(1 for r in evidence if _precedes(r, decision))
                 recent = _ts_epoch(now) - _ts_epoch(status_ts) < _REJECT_HIDE_DAYS * 86400
-                hidden = recent and len(evidence) < 2 * max(prior, 1)
+                snap = decision.get("proposal")
+                stored = snap.get("count") if isinstance(snap, dict) else None
+                if isinstance(stored, int) and not isinstance(stored, bool):
+                    # The count recorded with the decision does not decay when old evidence leaves the window.
+                    hidden = recent and len(evidence) < 2 * max(stored, 1)
+                else:
+                    prior = sum(1 for r in evidence if _precedes(r, decision))
+                    hidden = recent and len(evidence) < 2 * max(prior, 1)
         proposals.append({"id": pid, "bot": bot, "category": category, "key": key, "title": title, "suggestion": suggestion,
                           "evidence": [_ref(r) for r in evidence[:8]], "count": len(evidence),
                           "metric": metric, "baseline": baseline, "better": better, "window": {"since": since, "until": now},
@@ -2764,7 +2817,7 @@ def render_tune(analysis: Dict, title: str, labels: Optional[Dict[str, str]] = N
         lines.append("  - Evidence: %s" % _md(", ".join(p["evidence"])))
         lines.append("  - Apply: `gblog tune --apply %s --detail \"what you changed\"` · Reject: `gblog tune --reject %s --detail \"why\"`" % (p["id"], p["id"]))
     if applied:
-        lines += ["### already applied", ""]
+        lines += ["", "### already applied", ""]
         for p in applied:
             lines.append("- **[%s]** %s — %s (applied %s)" % (p["id"], labels.get(p["bot"], p["bot"]), _md(p["title"]),
                                                              str(p.get("status_ts") or "")[:10]))
@@ -2843,6 +2896,8 @@ def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool =
         raise ValueError("unknown proposal id %s (run `gblog tune` to list current ids)" % pid)
     p = match[0]
     keep = {k: p.get(k) for k in ("title", "category", "key", "metric", "baseline", "better", "window")}
+    if isinstance(p.get("count"), int) and not isinstance(p.get("count"), bool):
+        keep["count"] = p["count"]  # evidence count at decision time (used to decide when a rejection resurfaces)
     return ledger.append(p["bot"], {"type": "tune", "action": "other", "target": pid, "outcome": "skipped" if reject else "ok",
                                     "detail": detail or ("rejected" if reject else "applied"), "proposal": keep})
 
@@ -2886,9 +2941,58 @@ def _task_start_seen(ledger: "Ledger", bot: str, task_id: str, ts: Optional[str]
         base = now
     since = (base - _dt.timedelta(days=days)).strftime("%Y-%m-%d")
     try:
-        return any(r.get("type") == "task_start" and r.get("task_id") == task_id for r in ledger.records(bot, since=since))
+        # Day files newest first, stopping at the first hit: a task-end normally closes a task opened today.
+        files = []
+        for chain in ledger.chains_for(bot):
+            for path in ledger.log_files(chain):
+                day = os.path.basename(path)[:10]
+                if day >= since:
+                    files.append((day, chain, path))
+        for _day, chain, path in sorted(files, reverse=True):
+            for _path, _lineno, rec in ledger.iter_records(chain, [path]):
+                if rec.get("type") == "task_start" and rec.get("task_id") == task_id \
+                        and isinstance(rec.get("ts"), str) and rec["ts"] >= since:
+                    return True
+        return False
     except (OSError, ValueError, TypeError, AttributeError):
         return True  # unreadable history: stay quiet rather than warn wrongly
+
+
+def _orphan_alert_lines(ledger: "Ledger", only: Optional[str] = None) -> List[str]:
+    """`status` ALERT lines for chains known only from state/<bot>.alert.json or spool/<bot>/ (no logs/<bot> directory)."""
+    known = set(ledger.bots())
+    found = set()
+    suffix = ".alert.json"
+    try:
+        entries = os.listdir(ledger.state_dir)
+    except OSError:
+        entries = []
+    for name in entries:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            found.add(name[:-len(suffix)])
+    for chain in ledger.spool_bots():
+        if ledger.spool_files(chain):
+            found.add(chain)
+    found -= known
+    if not found:
+        return []
+    names = None
+    if only:
+        slug = ledger.canonical(only)
+        entry = ledger.aliases()["bots"].get(slug)
+        variants = entry.get("aliases") if isinstance(entry, dict) else None
+        names = {slug, only.strip()} | {a for a in (variants if isinstance(variants, list) else []) if isinstance(a, str)}
+    lines: List[str] = []
+    for chain in sorted(found):
+        if names is not None and chain not in names:
+            continue
+        a_ts, a_n = ledger.alert_info(chain)
+        if not a_ts and a_n:
+            first = _read_json(ledger.spool_files(chain)[0]) or {}
+            a_ts = first.get("ts") if isinstance(first.get("ts"), str) else "unknown"
+        if a_ts:
+            lines.append("ALERT %s: tail mismatch since %s (%d spooled)\n" % (chain, a_ts, a_n))
+    return lines
 
 
 def _record_verify(ledger: "Ledger", out, bot: str, res: Dict, record: Dict) -> int:
@@ -3381,8 +3485,10 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
             out.write(json.dumps({"root": ledger.root, "bots": rows}, indent=2, ensure_ascii=False) + "\n")
             return 0
         out.write("root: %s\n" % ledger.root)
+        orphan_alerts = _orphan_alert_lines(ledger, getattr(args, "bot", None))
         if not rows:
             out.write("(no records yet)\n")
+            out.write("".join(orphan_alerts))
             return 0
         out.write("%-28s %6s %6s %8s %5s %20s  %s\n" % ("bot", "chains", "seq", "today", "open", "updated", "last sync"))
         for r in rows:
@@ -3394,6 +3500,7 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
                 a_ts, a_n = ledger.alert_info(c)
                 if a_ts:
                     out.write("ALERT %s: tail mismatch since %s (%d spooled)\n" % (c, a_ts, a_n))
+        out.write("".join(orphan_alerts))
         return 0
 
     if args.cmd == "tail":
@@ -3414,12 +3521,12 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
         return 0
 
     if args.cmd == "sync":
-        ledger.allow_unknown_visibility = bool(getattr(args, "allow_unknown_visibility", False))
         # Same resolver as the write commands. The default housekeeping chain "system" resolves quietly,
         # so strict alias mode cannot block backups.
         args.bot = ledger.canonical(args.bot) if args.bot == "system" else _resolve_bot(ledger, args.bot)
         try:
-            res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message, args.allow_public)
+            res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message, args.allow_public,
+                       allow_unknown=bool(getattr(args, "allow_unknown_visibility", False)))
         except subprocess.CalledProcessError as exc:
             sys.stderr.write("git failed: %s\n" % redact((exc.stderr or exc.stdout or "").strip()))
             return 2
@@ -3569,6 +3676,9 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
             except StateRebuildError as exc:
                 sys.stderr.write("state rebuild: %s\n" % exc)
                 return 2
+            if res.get("noop"):
+                out.write("state/%s.json already matches the log tail; nothing to do\n" % chain)
+                return 0
             out.write("rebuilt %s seq %d head %s\n" % (chain, res["seq"], res["head"][:12]))
             return 0
 
