@@ -105,7 +105,8 @@ esac
 # only when it looks like a plain name. Anything else is logged as the word "command".
 name="${1##*/}"
 case "$name" in
-  ""|*[!A-Za-z0-9._+-]*) name="command" ;;
+  # listed one by one: a range such as A-Z depends on the locale in bash 3.2 (macOS)
+  ""|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-]*) name="command" ;;
 esac
 [ -n "$target" ] || target="$name"
 [ -n "$title" ] || title="Run $name"

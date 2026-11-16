@@ -26,6 +26,10 @@ CRON_TZ=UTC
 10 0 * * * GBLOG_ROOT=/workspace/activity-log GBLOG_AUDIT_REMOTE=git@github.com:you/private-ledger.git bash /workspace/grokbot-activity-log/examples/routine-daily-audit.sh >> "$HOME/gblog-audit.log" 2>&1
 ```
 
+`CRON_TZ` is a cronie feature. A cron that ignores it (macOS) runs the job at 00:10 local time: the
+report is still a complete UTC day, only later than intended. The portable alternative is a fixed
+local hour that falls after 00:00 UTC. `GBLOG_ROOT=~/…` is accepted: the script expands a leading `~`.
+
 Steps, in order:
 
 1. **Ledger check.** If `<root>/logs` does not exist, the script prints `ledger missing` and exits 2

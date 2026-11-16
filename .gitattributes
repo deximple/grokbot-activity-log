@@ -1,0 +1,7 @@
+# Scripts and fixtures must keep their bytes on every checkout (core.autocrlf on Windows
+# would otherwise break the bash scripts and the byte-compared fixture day files).
+*        text=auto eol=lf
+*.sh     text eol=lf
+bin/*    text eol=lf
+*.jsonl  -text
+*.gz     binary

@@ -4,7 +4,13 @@
 # chain is resolved with plain `readlink` (no `readlink -f`, which macOS lacks).
 set -euo pipefail
 src="${BASH_SOURCE[0]}"
+hops=0
 while [ -L "$src" ]; do
+  hops=$((hops + 1))
+  if [ "$hops" -gt 40 ]; then
+    echo "gblog: too many levels of symbolic links: ${BASH_SOURCE[0]}" >&2
+    exit 2
+  fi
   dir="$(CDPATH='' cd -P -- "$(dirname "$src")" && pwd)"
   src="$(readlink "$src")"
   case "$src" in
@@ -15,4 +21,21 @@ done
 # CDPATH is cleared for every `cd`: with an inherited CDPATH a relative path could resolve
 # to a same-named directory elsewhere, and `cd` would also print that directory.
 repo="$(CDPATH='' cd -P -- "$(dirname "$src")/.." && pwd)"
+# gblog.py does not compile on an interpreter older than 3.8: say so in one line instead of
+# letting the user read a SyntaxError traceback.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "gblog: python3 not found (Python 3.8 or newer is required)" >&2
+  exit 2
+fi
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+  found="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  if [ -n "$found" ]; then
+    echo "gblog needs Python 3.8 or newer (python3 is $found)" >&2
+  elif [ "$(uname -s 2>/dev/null || true)" = Darwin ]; then
+    echo "gblog: python3 did not start; install the Command Line Tools (xcode-select --install) or another Python 3" >&2
+  else
+    echo "gblog: python3 did not start" >&2
+  fi
+  exit 2
+fi
 exec python3 "$repo/gblog.py" "$@"

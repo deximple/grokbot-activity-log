@@ -48,7 +48,8 @@ class ScriptsTest(unittest.TestCase):
         env = dict(os.environ)
         for key in ("GBLOG_REPO", "GBLOG_REF", "GBLOG_SHA256", "GBLOG_BOT", "GBLOG_TASK", "ZDOTDIR", "ENV", "BASH_ENV"):
             env.pop(key, None)
-        env.update({"HOME": self.home, "GBLOG_PREFIX": self.prefix, "GBLOG_ROOT": self.root})
+        # SHELL is pinned: install.sh also writes the login shell's own startup file (zsh, bash on macOS)
+        env.update({"HOME": self.home, "GBLOG_PREFIX": self.prefix, "GBLOG_ROOT": self.root, "SHELL": "/bin/sh"})
         env.update(extra)
         return env
 

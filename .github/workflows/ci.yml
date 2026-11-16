@@ -40,6 +40,9 @@ jobs:
             pyflags: "-W error::DeprecationWarning"
           - os: macos-latest
             python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.13"
+            pyflags: "-W error::DeprecationWarning"
     env:
       GIT_TERMINAL_PROMPT: "0"
     steps:
@@ -51,6 +54,20 @@ jobs:
         run: python -m compileall -q gblog.py tests
       - name: Unit tests
         run: python ${{ matrix.pyflags }} -m unittest discover -s tests -v
+      - name: Unit tests with the system interpreter and /bin/bash (macOS)
+        if: runner.os == 'macOS' && matrix.python-version == '3.12'
+        # What users of a stock Mac run: /usr/bin/python3 and bash 3.2, not the setup-python build.
+        run: |
+          /usr/bin/python3 --version && /bin/bash --version | head -n 1
+          PATH="/usr/bin:/bin:/usr/sbin:/sbin" /usr/bin/python3 -m unittest discover -s tests
+      - name: Script tests under a temp directory with a space and a non-ASCII character
+        if: matrix.python-version == '3.12'
+        run: |
+          mkdir -p "$RUNNER_TEMP/gblog tmp é"
+          export TMPDIR="$RUNNER_TEMP/gblog tmp é"
+          for mod in test_portability.py test_scripts.py test_examples.py; do
+            python -m unittest discover -s tests -p "$mod"
+          done
       - name: Unit tests (non-UTC time zone, C locale, ASCII stdio)
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         env:
@@ -148,18 +165,27 @@ jobs:
           if ./bin/gblog verify --bot ci; then echo "tamper not detected"; exit 1; fi
 
   scripts:
-    runs-on: ubuntu-latest
+    name: scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     env:
       GIT_TERMINAL_PROMPT: "0"
       GBLOG_ROOT: ${{ runner.temp }}/gblog-scripts
+      # install.sh also writes the login shell's own startup file; pinned so every step sees the same files.
+      SHELL: /bin/sh
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck install.sh, bin/gblog and the example scripts
+        if: runner.os == 'Linux'
         run: |
           command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
           shellcheck install.sh bin/gblog examples/*.sh
       - name: Lint the embedded shell hook
+        if: runner.os == 'Linux'
         run: |
           # SC1007 is excluded on purpose: the hook's `HISTTIMEFORMAT= builtin history 1`
           # is an intentional empty per-command assignment. The hook text lives in gblog.py.
@@ -203,6 +229,25 @@ jobs:
           # a rerun must not change the rc file
           cp "$T/home/.profile" "$T/profile.before"
           HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash ./install.sh
+          cmp "$T/profile.before" "$T/home/.profile"
+          # ... also when the rerun happens in another locale
+          HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" LC_ALL=C bash ./install.sh
+          cmp "$T/profile.before" "$T/home/.profile"
+      - name: Startup lines are read back by sh (odd path, C locale)
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/home"
+          ROOT="$T/le dger's \$x"
+          HOME="$T/home" GBLOG_PREFIX="$T/b in" GBLOG_ROOT="$ROOT" LC_ALL=C bash ./install.sh
+          cat "$T/home/.profile"
+          got="$(HOME="$T/home" sh -c '. "$HOME/.profile" && printf %s "$GBLOG_ROOT"')"
+          if [ "$got" != "$ROOT" ]; then echo "sh read back '$got', expected '$ROOT'"; exit 1; fi
+          first="$(HOME="$T/home" sh -c '. "$HOME/.profile" && printf %s "${PATH%%:*}"')"
+          if [ "$first" != "$T/b in" ]; then echo "sh put '$first' first on PATH"; exit 1; fi
+          "$T/b in/gblog" --version
+          # a rerun in the job's own locale changes nothing
+          cp "$T/home/.profile" "$T/profile.before"
+          HOME="$T/home" GBLOG_PREFIX="$T/b in" GBLOG_ROOT="$ROOT" bash ./install.sh
           cmp "$T/profile.before" "$T/home/.profile"
       - name: Install handles a relative root, legacy rc lines and ~/.bash_profile
         run: |
@@ -248,7 +293,7 @@ jobs:
         run: |
           T="$(mktemp -d)"
           mkdir -p "$T/home"
-          GOOD="$(sha256sum gblog.py | cut -d' ' -f1)"
+          GOOD="$(shasum -a 256 gblog.py | cut -d' ' -f1)"
           BAD="$(printf '%064d' 0)"
           HOME="$T/home" GBLOG_PREFIX="$T/good" GBLOG_ROOT="$T/ledger" GBLOG_SHA256="$GOOD" bash ./install.sh
           "$T/good/gblog" --version
@@ -377,3 +422,21 @@ jobs:
           grep -q '^no shell startup file could be written' "$T/out.txt"
           if grep -q 'already configured' "$T/out.txt"; then echo "install.sh claimed the shell was already configured"; exit 1; fi
           if [ -n "$(ls -A "$RO_HOME")" ]; then echo "install.sh wrote into the read-only HOME"; ls -la "$RO_HOME"; exit 1; fi
+      - name: install.sh without a HOME
+        run: |
+          T="$(mktemp -d)"
+          mkdir "$T/cwd"
+          ( cd "$T/cwd" && env -u HOME GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash "$GITHUB_WORKSPACE/install.sh" ) > "$T/out.txt"
+          cat "$T/out.txt"
+          grep -q '^no shell startup file could be written' "$T/out.txt"
+          "$T/bin/gblog" --version
+          test -d "$T/ledger/logs"
+          if [ -n "$(ls -A "$T/cwd")" ]; then echo "install.sh wrote into the working directory"; exit 1; fi
+          # without HOME, a prefix and a root there is nowhere to install to: one line, exit 1
+          rc=0
+          env -u HOME -u GBLOG_PREFIX -u GBLOG_ROOT bash ./install.sh || rc=$?
+          if [ "$rc" -ne 1 ]; then echo "install.sh without HOME, prefix and root exited $rc, expected 1"; exit 1; fi
+          rc=0
+          HOME="" GBLOG_PREFIX="$T/bin2" bash ./install.sh || rc=$?
+          if [ "$rc" -ne 1 ]; then echo "install.sh with an empty HOME and no root exited $rc, expected 1"; exit 1; fi
+          if [ -e "$T/bin2" ]; then echo "something was installed without a root"; exit 1; fi

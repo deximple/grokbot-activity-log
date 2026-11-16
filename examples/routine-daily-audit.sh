@@ -67,6 +67,14 @@ if [ -z "$root" ]; then
     root="$home/activity-log"
   fi
 fi
+# A value set by cron or systemd is not expanded by a shell: "~/x" means $HOME/x here, as it does for gblog.
+tilde='~'
+if [ -n "$home" ]; then
+  case "$root" in
+    "$tilde") root="$home" ;;
+    "$tilde"/*) root="$home/${root#??}" ;;
+  esac
+fi
 export GBLOG_ROOT="$root"
 
 # gblog creates missing directories on first use. A deleted ledger must not turn into an
@@ -137,7 +145,8 @@ print_heads() {  # full heads of this anchor run; keep a copy of this block off 
   while read -r tag status chain rest; do
     [ "$tag" = "ANCHOR" ] || continue
     case "$chain" in
-      ""|*[!A-Za-z0-9._-]*) continue ;;
+      # listed one by one: a range such as A-Z depends on the locale in bash 3.2 (macOS)
+      ""|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) continue ;;
     esac
     found=0
     hist="$root/anchors/$chain.history.jsonl"
@@ -206,9 +215,12 @@ else
   say "== sync skipped: GBLOG_AUDIT_REMOTE is not set"
 fi
 
-if compgen -G "$root/state/*.alert.json" >/dev/null; then
-  saw_alert=1
-fi
+# A loop, not `compgen -G`: glob characters in $root itself must not be read as a pattern.
+for alert in "$root"/state/*.alert.json; do
+  if [ -e "$alert" ]; then
+    saw_alert=1
+  fi
+done
 
 if [ -n "$tid" ]; then
   outcome="ok"
