@@ -5,13 +5,38 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.10", "3.12"]
+        include:
+          # 3.8 is the supported floor. It is pinned to an older image because
+          # setup-python does not guarantee 3.8 builds for ubuntu-latest; do not
+          # raise the floor to work around a missing build.
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.12"
+    env:
+      GIT_TERMINAL_PROMPT: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,27 +49,89 @@ jobs:
       - name: Smoke test CLI
         env:
           GBLOG_ROOT: ${{ runner.temp }}/gblog-smoke
+          PYTHONWARNINGS: error::DeprecationWarning
         run: |
           ./bin/gblog init
           TID=$(./bin/gblog task-start --bot ci --task "smoke test")
           ./bin/gblog log --bot ci --task-id "$TID" --action shell --target "echo hi" --outcome ok
-          ./bin/gblog task-end --bot ci --task-id "$TID" --outcome ok
+          ./bin/gblog task-end --bot ci --task-id "$TID" --outcome ok --summary x
+          ./bin/gblog export --bot ci | grep '"detail": "x"' >/dev/null
           ./bin/gblog verify --all
           ./bin/gblog report --bot ci
           ./bin/gblog status
+          ./bin/gblog coverage
+          ./bin/gblog tune --stdout
+          ./bin/gblog anchor
+          rc=0
+          ./bin/gblog verify --bot nosuchbot || rc=$?
+          if [ "$rc" -ne 1 ]; then echo "verify --bot nosuchbot exited $rc, expected 1"; exit 1; fi
+          if [ -e "$GBLOG_ROOT/logs/nosuchbot" ]; then echo "verify created a chain for an unknown bot"; exit 1; fi
           python3 - <<'PY'
           import glob, os
           f = glob.glob(os.environ["GBLOG_ROOT"] + "/logs/ci/*.jsonl")[0]
-          s = open(f).read().replace("echo hi", "rm -rf /")
-          open(f, "w").write(s)
+          with open(f) as fh:
+              s = fh.read().replace("echo hi", "rm -rf /")
+          with open(f, "w") as fh:
+              fh.write(s)
           PY
           if ./bin/gblog verify --bot ci; then echo "tamper not detected"; exit 1; fi
 
-  shellcheck:
+  scripts:
     runs-on: ubuntu-latest
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+      GBLOG_ROOT: ${{ runner.temp }}/gblog-scripts
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck
+      - name: shellcheck install.sh and bin/gblog
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
           shellcheck install.sh bin/gblog
+      - name: Lint the embedded shell hook
+        run: |
+          # SC1007 is excluded on purpose: the hook's `HISTTIMEFORMAT= builtin history 1`
+          # is an intentional empty per-command assignment. The hook text lives in gblog.py.
+          ./bin/gblog capture shell-hook --bot ci > hook.sh && bash -n hook.sh && shellcheck -s bash -e SC1007 hook.sh
+      - name: Launcher works through a symlink
+        run: |
+          T="$(mktemp -d)"
+          ln -s "$PWD/bin/gblog" "$T/gblog-abs"
+          mkdir -p "$T/sub"
+          ln -s "../gblog-abs" "$T/sub/gblog-rel"
+          "$T/gblog-abs" --version
+          "$T/sub/gblog-rel" --version
+      - name: Install from the checkout into a temp HOME
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/home"
+          HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash ./install.sh
+          "$T/bin/gblog" --version
+          test -d "$T/ledger/logs"
+          grep -q '# gblog PATH' "$T/home/.profile"
+          grep -q '# gblog ROOT' "$T/home/.profile"
+          grep -q 'export GBLOG_ROOT=' "$T/home/.profile"
+          # a rerun must not change the rc file
+          cp "$T/home/.profile" "$T/profile.before"
+          HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash ./install.sh
+          cmp "$T/profile.before" "$T/home/.profile"
+      - name: Piped install ignores a gblog.py in the current directory
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/home" "$T/decoy"
+          echo 'raise SystemExit("decoy gblog.py was installed")' > "$T/decoy/gblog.py"
+          SRC="$PWD"
+          ( cd "$T/decoy" && HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" GBLOG_REPO="file://$SRC" bash < "$SRC/install.sh" )
+          "$T/bin/gblog" --version
+          cmp "$SRC/gblog.py" "$T/bin/gblog"
+      - name: GBLOG_SHA256 is enforced
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/home"
+          GOOD="$(sha256sum gblog.py | cut -d' ' -f1)"
+          BAD="$(printf '%064d' 0)"
+          HOME="$T/home" GBLOG_PREFIX="$T/good" GBLOG_ROOT="$T/ledger" GBLOG_SHA256="$GOOD" bash ./install.sh
+          "$T/good/gblog" --version
+          if HOME="$T/home" GBLOG_PREFIX="$T/bad" GBLOG_ROOT="$T/ledger" GBLOG_SHA256="$BAD" bash ./install.sh; then
+            echo "checksum mismatch was not detected"; exit 1
+          fi
+          if [ -e "$T/bad/gblog" ]; then echo "gblog was installed despite a checksum mismatch"; exit 1; fi

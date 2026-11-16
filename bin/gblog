@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
 # Thin launcher so the tool can be run from a checkout without installing.
+# Works through symlinks (e.g. ~/.local/bin/gblog -> <checkout>/bin/gblog): the link
+# chain is resolved with plain `readlink` (no `readlink -f`, which macOS lacks).
 set -euo pipefail
-exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gblog.py" "$@"
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in
+    /*) ;;
+    *) src="$dir/$src" ;;
+  esac
+done
+repo="$(cd -P "$(dirname "$src")/.." && pwd)"
+exec python3 "$repo/gblog.py" "$@"
