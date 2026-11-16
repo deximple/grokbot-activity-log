@@ -16,6 +16,7 @@ jobs:
   test:
     name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -29,10 +30,14 @@ jobs:
             python-version: "3.10"
           - os: ubuntu-latest
             python-version: "3.12"
+          # The newest interpreters run the unit tests with DeprecationWarning as an error,
+          # so a call that is about to be removed fails here first.
           - os: ubuntu-latest
             python-version: "3.13"
+            pyflags: "-W error::DeprecationWarning"
           - os: ubuntu-latest
             python-version: "3.14"
+            pyflags: "-W error::DeprecationWarning"
           - os: macos-latest
             python-version: "3.12"
     env:
@@ -45,7 +50,14 @@ jobs:
       - name: Byte-compile
         run: python -m compileall -q gblog.py tests
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        run: python ${{ matrix.pyflags }} -m unittest discover -s tests -v
+      - name: Unit tests (non-UTC time zone, C locale, ASCII stdio)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        env:
+          TZ: Asia/Seoul
+          LC_ALL: C
+          PYTHONIOENCODING: ascii
+        run: python -m unittest discover -s tests
       - name: Smoke test CLI
         env:
           GBLOG_ROOT: ${{ runner.temp }}/gblog-smoke
@@ -66,6 +78,20 @@ jobs:
           ./bin/gblog verify --bot nosuchbot || rc=$?
           if [ "$rc" -ne 1 ]; then echo "verify --bot nosuchbot exited $rc, expected 1"; exit 1; fi
           if [ -e "$GBLOG_ROOT/logs/nosuchbot" ]; then echo "verify created a chain for an unknown bot"; exit 1; fi
+          # a reserved bot name must be refused for a new chain (exit 2, nothing created)
+          rc=0
+          ./bin/gblog note --bot aliases --detail x || rc=$?
+          if [ "$rc" -ne 2 ]; then echo "note --bot aliases exited $rc, expected 2"; exit 1; fi
+          if [ -e "$GBLOG_ROOT/logs/aliases" ]; then echo "a reserved bot name created a chain"; exit 1; fi
+          ./bin/gblog verify --all --json | python -c 'import json,sys; json.load(sys.stdin)'
+          ./bin/gblog verify --all --strict
+          ./bin/gblog status --bot ci --root "$GBLOG_ROOT"
+          # state lost: rebuild it from the log tail, then the chain must verify again
+          rm "$GBLOG_ROOT/state/ci.json"
+          ./bin/gblog state rebuild --bot ci
+          test -f "$GBLOG_ROOT/state/ci.json"
+          ./bin/gblog verify --bot ci
+          ./bin/gblog spool list
           python3 - <<'PY'
           import glob, os
           f = glob.glob(os.environ["GBLOG_ROOT"] + "/logs/ci/*.jsonl")[0]
@@ -78,6 +104,7 @@ jobs:
 
   scripts:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GIT_TERMINAL_PROMPT: "0"
       GBLOG_ROOT: ${{ runner.temp }}/gblog-scripts
@@ -114,6 +141,37 @@ jobs:
           cp "$T/home/.profile" "$T/profile.before"
           HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/ledger" bash ./install.sh
           cmp "$T/profile.before" "$T/home/.profile"
+      - name: Install handles a relative root, legacy rc lines and ~/.bash_profile
+        run: |
+          SRC="$PWD"
+          T="$(mktemp -d)"
+          mkdir -p "$T/home" "$T/work"
+          # unmarked lines for the same prefix and root (as an older install or a user wrote them) are not duplicated
+          printf 'export PATH="%s:$PATH"\nexport GBLOG_ROOT=%s\n' "$T/bin" "$T/work/ledger" > "$T/home/.bashrc"
+          cp "$T/home/.bashrc" "$T/bashrc.before"
+          : > "$T/home/.bash_profile"
+          ( cd "$T/work" && HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT=ledger bash "$SRC/install.sh" )
+          # the relative root was resolved against the directory the installer ran in
+          test -d "$T/work/ledger/logs"
+          cmp "$T/bashrc.before" "$T/home/.bashrc"
+          # an existing ~/.bash_profile is handled and gets the absolute root
+          grep -q '# gblog PATH' "$T/home/.bash_profile"
+          grep -q '# gblog ROOT' "$T/home/.bash_profile"
+          grep -q '^export GBLOG_ROOT=/.*/work/ledger$' "$T/home/.bash_profile"
+          if [ -e "$T/home/.profile" ]; then echo "~/.profile was created although rc files exist"; exit 1; fi
+          # a rerun (again with the relative root) changes nothing
+          cp "$T/home/.bash_profile" "$T/bash_profile.before"
+          ( cd "$T/work" && HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT=ledger bash "$SRC/install.sh" )
+          cmp "$T/bashrc.before" "$T/home/.bashrc"
+          cmp "$T/bash_profile.before" "$T/home/.bash_profile"
+          # a different unmarked GBLOG_ROOT is reported with both values and gets no second block
+          printf 'export GBLOG_ROOT=/somewhere/else\n' > "$T/home/.zshrc"
+          HOME="$T/home" GBLOG_PREFIX="$T/bin" GBLOG_ROOT="$T/work/ledger" bash ./install.sh 2> "$T/err.txt"
+          cat "$T/err.txt" >&2
+          grep -q '^warning: .*/somewhere/else' "$T/err.txt"
+          grep -q '^warning: .*/work/ledger' "$T/err.txt"
+          if grep -q '# gblog ROOT' "$T/home/.zshrc"; then echo "a second GBLOG_ROOT block was added to .zshrc"; exit 1; fi
+          if [ "$(grep -c 'export GBLOG_ROOT=' "$T/home/.zshrc")" -ne 1 ]; then echo "GBLOG_ROOT was duplicated in .zshrc"; exit 1; fi
       - name: Piped install ignores a gblog.py in the current directory
         run: |
           T="$(mktemp -d)"

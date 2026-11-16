@@ -11,6 +11,7 @@
 # Env overrides:
 #   GBLOG_PREFIX   where to put the launcher      (default: ~/.local/bin)
 #   GBLOG_ROOT     where the ledger lives         (default: /workspace/activity-log if writable, else ~/activity-log)
+#                  a relative path is made absolute before it is used or persisted
 #   GBLOG_REPO     base URL to fetch gblog.py from (default: GitHub raw at $GBLOG_REF)
 #   GBLOG_REF      branch, tag or commit used to build the default URL (default: main; ignored when GBLOG_REPO is set)
 #   GBLOG_SHA256   expected sha256 of gblog.py; the install aborts on mismatch and installs nothing
@@ -84,6 +85,12 @@ echo "installed $PREFIX/gblog from $origin"
 if [ -z "${GBLOG_ROOT:-}" ]; then
   if [ -d /workspace ] && [ -w /workspace ]; then GBLOG_ROOT=/workspace/activity-log; else GBLOG_ROOT="$HOME/activity-log"; fi
 fi
+# A relative GBLOG_ROOT would later resolve against whatever directory a shell happens to
+# be in, so it is made absolute before it is used or persisted. Missing directories are
+# created private (0700), like the ones gblog creates itself. CDPATH is cleared so that
+# `cd` cannot land in a same-named directory somewhere else.
+(umask 077 && mkdir -p -- "$GBLOG_ROOT")
+GBLOG_ROOT="$(CDPATH='' cd -- "$GBLOG_ROOT" && pwd)"
 export GBLOG_ROOT
 "$PREFIX/gblog" init
 
@@ -97,10 +104,73 @@ path_line="export PATH=$(printf %q "$PREFIX"):\"\$PATH\""
 root_line="export GBLOG_ROOT=$(printf %q "$GBLOG_ROOT")"
 modified=0
 
+# Lines written without the "# gblog ..." markers (by an older install.sh, or by hand)
+# count too: an `export PATH=` line that already names $PREFIX and an `export GBLOG_ROOT=`
+# line are never duplicated. Each directory is recognised as written out, as `printf %q`
+# writes it, and (below $HOME) in its literal $HOME/... spelling.
+path_forms=("$PREFIX" "$(printf %q "$PREFIX")")
+root_forms=("$GBLOG_ROOT" "$(printf %q "$GBLOG_ROOT")")
+case "$PREFIX" in
+  "$HOME"/*) path_forms+=("\$HOME/${PREFIX#"$HOME"/}" "\${HOME}/${PREFIX#"$HOME"/}") ;;
+esac
+case "$GBLOG_ROOT" in
+  "$HOME"/*) root_forms+=("\$HOME/${GBLOG_ROOT#"$HOME"/}" "\${HOME}/${GBLOG_ROOT#"$HOME"/}") ;;
+esac
+
+rc_has_prefix_on_path() {  # rc_has_prefix_on_path FILE: does an `export PATH=` line in FILE already name $PREFIX?
+  local line form
+  [ -f "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      "export PATH="*)
+        for form in "${path_forms[@]}"; do
+          case "$line" in
+            *"$form"*) return 0 ;;
+          esac
+        done
+        ;;
+    esac
+  done < "$1"
+  return 1
+}
+
+legacy_root=""
+rc_root_value() {  # rc_root_value FILE: value of the last `export GBLOG_ROOT=` line of FILE -> $legacy_root; fails if none
+  local line found=1
+  legacy_root=""
+  [ -f "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      "export GBLOG_ROOT="*)
+        legacy_root="${line#"export GBLOG_ROOT="}"
+        legacy_root="${legacy_root%"${legacy_root##*[![:space:]]}"}"
+        found=0
+        ;;
+    esac
+  done < "$1"
+  return "$found"
+}
+
+is_this_root() {  # is_this_root VALUE: is VALUE (as written in an rc file) this install's ledger root?
+  local value="$1" form
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  for form in "${root_forms[@]}"; do
+    if [ "$value" = "$form" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 persist() {  # persist FILE: append the missing blocks to FILE and say what was done
   local rc="$1" what="" verb="modified"
   [ -e "$rc" ] || verb="created"
-  if [ "$need_path" = 1 ] && ! grep -qF '# gblog PATH' "$rc" 2>/dev/null; then
+  if [ "$need_path" = 1 ] && ! grep -qF '# gblog PATH' "$rc" 2>/dev/null && ! rc_has_prefix_on_path "$rc"; then
     if printf '\n# gblog PATH\n%s\n' "$path_line" >> "$rc"; then
       what="PATH"
     else
@@ -111,6 +181,11 @@ persist() {  # persist FILE: append the missing blocks to FILE and say what was 
   if grep -qF '# gblog ROOT' "$rc" 2>/dev/null; then
     if ! grep -qxF -- "$root_line" "$rc"; then
       echo "note: $rc already has a '# gblog ROOT' block with a different value; left unchanged" >&2
+    fi
+  elif rc_root_value "$rc"; then
+    # an unmarked line: the same root needs nothing, a different one is the user's to resolve
+    if ! is_this_root "$legacy_root"; then
+      echo "warning: $rc already has 'export GBLOG_ROOT=$legacy_root' but this install uses $GBLOG_ROOT; that line was left unchanged and no GBLOG_ROOT block was added" >&2
     fi
   elif printf '\n# gblog ROOT\n%s\n' "$root_line" >> "$rc"; then
     what="${what:+$what, }GBLOG_ROOT"
@@ -124,8 +199,9 @@ persist() {  # persist FILE: append the missing blocks to FILE and say what was 
   return 0
 }
 
+# ~/.bash_profile is included because bash login shells read it instead of ~/.profile.
 found=0
-for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.profile"; do
   if [ -f "$rc" ]; then
     found=1
     persist "$rc"
