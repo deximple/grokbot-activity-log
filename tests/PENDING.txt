@@ -1,2 +1,5 @@
 # Tests that carry @unittest.expectedFailure, one "Class.test_name" per line.
-# Nothing is pending. tests/test_meta.py fails when this list and the markers in tests/test*.py differ.
+# tests/test_meta.py fails when this list and the markers in tests/test*.py differ.
+# All entries below are in tests/test_mutation_gaps.py; each documents behaviour that the
+# documentation promises and gblog.py does not have (the comment above the test says which).
+ArchiveClaimGapTest.test_bare_archive_record_is_not_counted_as_intact

@@ -705,7 +705,8 @@ class SymlinkTest(Base):
     def test_state_tmp_symlink_is_not_followed(self):
         self.seed("ops", 1)
         victim = self.write(os.path.join(self.base, "victim.txt"), "precious\n")
-        self.symlink(victim, self.path("state", "ops.json.tmp"))
+        # the name the code really opens: state/ops.json.<pid>.tmp (a link at ops.json.tmp is never touched)
+        self.symlink(victim, gblog._tmp_name(self.path("state", "ops.json")))
         try:
             self.ledger.append("ops", {"type": "note", "detail": "after the plant", "ts": stamp(5)})
         except OSError:
@@ -1088,7 +1089,8 @@ class MiscHardeningTest(Base):
         self.write(path, "\n".join(lines) + "\n")
         res = self.ledger.verify("ops")
         self.assertTrue(res["ok"], res["problems"])
-        self.assertTrue(res["warnings"], "a duplicate key passed verify without any warning")
+        self.assertIn("logs/ops/%s.jsonl:1: duplicate keys in line (only the last value of a repeated key counts)" % DAY,
+                      res["warnings"])
 
     # fixed: A-L-5 (was: install.sh lets curl follow redirects to any scheme)
     def test_install_restricts_redirect_protocols(self):
