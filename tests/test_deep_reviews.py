@@ -517,7 +517,7 @@ class CliLayerTest(Base):
         hist = chrome_history(os.path.join(self.base, "chrome"), [("https://a.example/x", "A", 60)])
         rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", hist, "--hours=-5"], self.root)
         self.assertEqual(rc, 2, out + err)
-        self.assertIn("error: --hours must be 0 or more", err)
+        self.assertIn("error: --hours must be 1 or more (a window of 0 hours imports nothing)", err)
         self.assertFalse(os.path.exists(self.path("state", "ops.json")))
         rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", hist], self.root)
         self.assertEqual(rc, 0, out + err)

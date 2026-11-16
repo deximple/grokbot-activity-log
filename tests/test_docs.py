@@ -24,17 +24,9 @@ import gblog  # noqa: E402
 # Ids that the CHANGELOG still lists as open although gblog.py names them in a comment: id -> reason.
 PARTLY_FIXED = {
     "K1-03": "the stderr warning exists; a mistyped --bot on a read command is still exit 0",
-    "K1-09": "new writes use the directory's spelling; records of earlier builds keep their warning",
     "K2-06": "side files and the tail lookup are bounded; a log line is still read whole",
     "K2-09": "a FIFO at tuning/proposals.json is never opened; the file is still updated without a lock",
     "K2-10": "a refusal stays exit 4; an unwritable spool file still loses the event to the next alert",
-    "K3-01": "append bounds ts by the tail as written (_ts_floor); CHANGELOG entry not yet updated",
-    "K3-03": "a case variant of the chain directory counts as its own name; older records keep the warning",
-    "K3-04": "equivalent spellings of origin are accepted (_same_remote); CHANGELOG entry not yet updated",
-    "K4-02": "verify streams the chain after releasing the lock; CHANGELOG entry not yet updated",
-    "K4-04": "the two quadratic redaction rules are linear and run before the lock; entry not yet updated",
-    "K4-07": "spool replay reads the chain through one index; CHANGELOG entry not yet updated",
-    "K4-08": "the report twin lookup is indexed; export, status and tail (K4-09, K4-10, K4-13) are open",
 }
 
 _INLINE_RE = re.compile(r"(?:`|\$\()gblog(?=\s)")
@@ -71,10 +63,16 @@ def commands(text):
         if line.strip().startswith("```"):
             fenced = not fenced
             continue
-        for match in (_FENCED_RE if fenced else _INLINE_RE).finditer(line):
-            seg = line[match.end():].split("`", 1)[0]
-            seg = re.sub(r'"[^"]*"', '""', seg)
-            seg = re.sub(r"'[^']*'", "''", seg)
+        scan = line
+        if fenced:
+            scan = re.sub(r'"[^"]*"', '""', scan)
+            scan = re.sub(r"'[^']*'", "''", scan)
+            scan = re.sub(r"(?:^|\s)#.*$", "", scan)
+        for match in (_FENCED_RE if fenced else _INLINE_RE).finditer(scan):
+            seg = scan[match.end():].split("`", 1)[0]
+            if not fenced:
+                seg = re.sub(r'"[^"]*"', '""', seg)
+                seg = re.sub(r"'[^']*'", "''", seg)
             yield lineno, _CUT_RE.split(seg, 1)[0]
 
 
@@ -134,7 +132,6 @@ def _between(text, start, end):
 
 
 class DocsLintTest(unittest.TestCase):
-    @unittest.skip("follow-up: self-test expectation of the lint helper does not match its parser (generated 2026-11-16)")
     def test_lint_helpers(self):
         parser = gblog.build_parser()
         sample = ("Run `gblog log --bot ops --nope x --target=\"a --month 1\"` now, or `gblog capture files --limit 3`.\n"
@@ -142,7 +139,7 @@ class DocsLintTest(unittest.TestCase):
                   "Prose such as gblog log --prose is not code, and `gblog is missing` is not a command.\n")
         found = [(lineno, unknown_flags(seg, parser)) for lineno, seg in commands(sample)]
         self.assertEqual(found, [(1, (True, ["--nope"])), (1, (True, [])), (3, (True, ["--taks"])),
-                                 (5, (False, []))])
+                                 (3, (True, ["--bogus"])), (5, (False, []))])
         self.assertEqual(unknown_flags(" --root /x verify --all --strict", parser), (True, []))
         self.assertEqual(unknown_flags(" capture --bot ops", parser), (True, []))
         literals = literal_patterns()
@@ -172,6 +169,8 @@ class DocsLintTest(unittest.TestCase):
         self.assertEqual(sorted((listed & in_code) - set(PARTLY_FIXED)), [],
                          "listed as open in the CHANGELOG, yet named in a gblog.py comment: update the CHANGELOG, "
                          "or add the id to PARTLY_FIXED with a reason")
+        self.assertEqual(sorted(set(PARTLY_FIXED) - listed), [],
+                         "listed in PARTLY_FIXED, yet no longer under Known open findings in CHANGELOG.md")
         for ident, reason in PARTLY_FIXED.items():
             self.assertTrue(re.match(r"K\d-\d+\Z", ident) and reason.strip(), ident)
 

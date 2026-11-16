@@ -1144,6 +1144,47 @@ class StatusOpenTaskBlockTest(Base):
         log_opens = [p for p in opened if p.startswith("logs/")]
         self.assertEqual(len(log_opens), 1, log_opens)
 
+    def test_resolved_pending_pairs_do_not_distort_report_coverage_or_tune(self):
+        t0 = self._ago(0, 10)
+        with redirect_stderr(io.StringIO()):
+            for i in range(3):
+                tid = "p%d" % i
+                self.ledger.append("ops", {"type": "task_start", "task_id": tid, "task": "Run %d" % i, "ts": t0})
+                self.ledger.append("ops", {"type": "action", "task_id": tid, "action": "shell",
+                                           "target": "pg_dump billing", "outcome": "pending", "ts": t0})
+                self.ledger.append("ops", {"type": "action", "task_id": tid, "action": "shell",
+                                           "target": "pg_dump billing", "outcome": "ok", "ts": t0})
+                self.ledger.append("ops", {"type": "action", "task_id": tid, "action": "connector",
+                                           "target": "drive.upload", "outcome": "ok", "ts": t0})
+                self.ledger.append("ops", {"type": "action", "task_id": tid, "action": "message",
+                                           "target": "ops-chan", "outcome": "ok", "ts": t0})
+                self.ledger.append("ops", {"type": "task_end", "task_id": tid, "outcome": "ok", "ts": t0})
+            # One unresolved pending action in an open task must still render **PENDING**.
+            self.ledger.append("ops", {"type": "task_start", "task_id": "stuck", "task": "Stuck run", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "task_id": "stuck", "action": "connector",
+                                       "target": "warehouse.sync", "outcome": "pending", "ts": t0})
+            self.ledger.append("ops", {"type": "action", "source": "auto", "action": "shell",
+                                       "target": "pg_dump billing", "outcome": "ok", "ts": t0})
+
+        recs = self.ledger.records()
+        rep = gblog.render_report(recs, "Report")
+        # 3 tasks * 3 steps + 1 stuck step + 1 auto = 11 actions (not 14).
+        self.assertIn("| Actions | 11 |", rep)
+        self.assertIn("`shell` pg_dump billing (started)", rep)
+        self.assertEqual(rep.count("**PENDING**"), 1, rep)
+        self.assertIn("`connector` warehouse.sync **PENDING**", rep)
+
+        cov = gblog.coverage(recs)
+        self.assertEqual((cov["auto"], cov["matched"], cov["pct"]), (1, 1, 100.0))
+        # 10 self-reported steps - 1 matched = 9 self_only (not 12).
+        self.assertEqual(cov["self_only"], 9)
+
+        tune = gblog.analyze(recs, 28, cov)
+        self.assertEqual(tune["metrics"]["ops"]["actions"], 10)
+        seq_props = [p for p in tune["proposals"] if p["key"].startswith("seq:")]
+        self.assertEqual(len(seq_props), 1, seq_props)
+        self.assertEqual(seq_props[0]["key"], "seq:shell:pg_dump > connector:drive.upload > message:ops-chan")
+
 
 if __name__ == "__main__":
     unittest.main()

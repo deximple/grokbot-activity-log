@@ -10,7 +10,7 @@ any release listed here. A ledger written by any version still verifies with the
 Entries for 0.1 to 0.5 are retroactive. They were reconstructed from the code and the README, and
 their release dates were not recorded.
 
-## [0.6.1] - Unreleased
+## [0.6.1] - 2026-11-16
 
 Implements the round-2 audit of 2026-11-16. The item ids in parentheses (R-01 … R-25) refer to that
 audit. The record format and the hash rule are unchanged. A healthy ledger prints the same
@@ -333,32 +333,30 @@ specialist reviews of 2026-11-16. The High and Medium findings are fixed in the 
   write): …`. `verify --record` on a chain that is one record behind records `state one record
   behind (interrupted append); repaired by this record`.
 
-Open from these reviews: K9-05 (the other documents), K9-06 … K9-08, K10-07 c (needs a maintainer
-decision) and K10-08 … K10-12.
+Open from these reviews: K9-06 … K9-08, K10-07 c (needs a maintainer decision) and K10-08 … K10-12.
 
 ### Known open findings
 
 **Not** in the code yet: the items the deep reviews rated below Medium, and the specialist-review
 findings that are not listed as fixed under "Specialist reviews" above. The round-4 audit checked
-each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
+each line against `gblog.py`.
 
 - **verify / anchor.** A FIFO or device at
   `state/<bot>.json` is a `!` warning while a directory there, and any non-regular
   `anchors/<bot>.json`, is FAIL; a deleted `anchors/<bot>.json` is silent (Z-10; `docs/DESIGN.md`,
-  section 7). `problems`, `breaks` and `segments` have no cap (K4-12).
+  section 7). `problems`, `breaks` and `segments` have no cap in `verify` (K4-12).
   The `bytes` of an `archive` record is a hard read limit, and a `path` written with backslashes
   is opened as written (K3-06). A directory under `logs/` that is not a chain is FAIL even when it
   holds no log file (K3-07).
 - **seal.** An ack without its witness cannot be completed (D1-11).
 - **append / recovery.** Capture events refused during an alert are imported again after
-  recovery (D2-07, D4-17). `verify` reports FAIL, without a hint, while state is one record behind
-  (D2-10). Directory fsync (D2-11), `state rebuild` without its note (D2-12), a removed lock file
+  recovery (D2-07, D4-17). Directory fsync (D2-11), `state rebuild` without its note (D2-12), a removed lock file
   (D2-13). No reader bounds the size of a log line or a day file (K2-06, K4-03), and some readers
   still test the file type before they open the file, not on the opened descriptor (Z-14). A hard
   link at a day file or an anchor history is appended through. When a refusal cannot write its
   spool file, the event survives only in `state/<bot>.alert.json`, which the next refusal
   replaces (K2-10).
-- **sync.** `origin` can change before its record is written (D3-10). Multi-URL origins and
+- **sync.** Multi-URL origins and
   `pushurl` (D3-11). `NAME=value` redaction stops at `&` or a quote (D3-14). `sync` has no lock of its own. Every
   run hashes every evidence file: that is the price of having no cache (D3-05).
 - **capture / tune / archive.** A symlinked `--path` (D4-15), ports dropped from browser targets
@@ -377,8 +375,7 @@ each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
   Alias-registry changes (`alias add`, also with `--move`, `alias remove`, `alias strict`) are
   recorded in no chain (Z-16). Smaller format gaps between commands (K1-12). `export`, `status`,
   `report` and `tail` keep or parse more than they need (K4-09, K4-10, K4-13).
-- **Tests and routine.** No test uses a ledger shaped like the output of 0.2 to 0.5 (K3-08). The
-  daily routine prompt walks every chain three times (K4-06).
+- **Routine.** The daily routine prompt walks every chain three times (K4-06).
 
 Future work (design changes, not planned for 0.6.1):
 
@@ -587,7 +584,9 @@ Read these before upgrading a routine or a script that branches on output or exi
     `pending` is `true`). `open_tasks` is the length of `open_task_list`. When a row has open
     tasks, text `gblog status` prints an `open tasks: <label>` block with each task's `last:`
     record and a `PENDING:` line when that record is an `action` with `outcome == "pending"`
-    (K1-01).
+    (K1-01). When a `pending` action is later followed by its completion record, `report`,
+    `coverage` and `tune` count the pair as one step (`report` renders the first line with
+    `(started)` instead of `**PENDING**`).
   - The shell hook logs a command under the Bot it was installed for when gblog refuses the
     name in `GBLOG_BOT` (exit 2: unregistered under `alias strict on`, reserved). The record's
     detail is `GBLOG_BOT=<name> was refused`. The hook text changed; the marker is still

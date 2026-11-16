@@ -2412,7 +2412,12 @@ class Ledger:
         """Yield ``(rel, lineno, record, text)`` for the bytes a snapshot covers, one line at a time."""
         for path, size, dev, ino in extents:
             rel = os.path.relpath(path, self.root).replace(os.sep, "/")
-            with _open_regular(path) as fh:
+            try:
+                fh = _open_regular(path)
+            except OSError:
+                problems.append("%s: log file was replaced or shortened while it was being verified" % rel)
+                continue
+            with fh:
                 st = os.fstat(fh.fileno())
                 if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < size:
                     # never caused by gblog: the file was swapped or cut by something else after the snapshot
@@ -3956,6 +3961,29 @@ def _title_key(title: object) -> str:
     return " ".join(str(title).lower().split())
 
 
+def _resolved_pending_actions(records: Iterable[Dict]) -> set:
+    """``id(r)`` of each ``action`` record with ``outcome == 'pending'`` that is followed by a
+    non-``pending`` ``action`` record for the same ``(bot, task_id, action, norm_target)``."""
+    waiting: Dict[Tuple, List[int]] = {}
+    resolved: set = set()
+    for r in records:
+        if r.get("type") != "action" or r.get("source") == "auto":
+            continue
+        act = r.get("action")
+        try:
+            tgt = norm_target(act, r.get("target")) or str(r.get("target") or "")
+        except (AttributeError, TypeError):
+            tgt = str(r.get("target") or "")
+        key = (r.get("bot"), r.get("task_id") or None, act, tgt)
+        if r.get("outcome") == "pending":
+            waiting.setdefault(key, []).append(id(r))
+        else:
+            queue = waiting.get(key)
+            if queue:
+                resolved.add(queue.pop(0))
+    return resolved
+
+
 def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, str]] = None,
                   context: Optional[Dict] = None) -> str:
     labels = labels or {}
@@ -3966,7 +3994,8 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
     by_bot: Dict[str, List[Dict]] = {}
     for r in records:
         by_bot.setdefault(r.get("bot", "?"), []).append(r)
-    total_actions = sum(1 for r in records if r.get("type") == "action")
+    resolved = _resolved_pending_actions(records)
+    total_actions = sum(1 for r in records if r.get("type") == "action" and id(r) not in resolved)
     denied = [r for r in records if r.get("outcome") == "denied"]
     failed = [r for r in records if r.get("outcome") == "fail"]
     approvals = [r for r in records if r.get("type") == "approval"]
@@ -4071,13 +4100,16 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
             for r in t["actions"]:
                 # housekeeping records (verify, sync, tune, archive, break_ack) are named by their type, as `tail` does
                 kind = (r.get("action") if r.get("type") == "action" else None) or r.get("type") or r.get("action")
-                mark = {"fail": "FAIL", "denied": "DENIED", "pending": "PENDING"}.get(r.get("outcome", ""), "")
+                started_pair = id(r) in resolved
+                mark = "" if started_pair else {"fail": "FAIL", "denied": "DENIED", "pending": "PENDING"}.get(r.get("outcome", ""), "")
                 parts = ["%s" % _md(r.get("ts", "")[11:19]), "`%s`" % _md(kind)]
                 if isinstance(r.get("clock_regressed"), str):
                     # clamped record: the time above is the pinned chain timestamp, this is what the clock said
                     parts.append("(clock %s)" % _md(r["clock_regressed"], 40))
                 if r.get("target"):
                     parts.append(_md(r["target"]))
+                if started_pair:
+                    parts.append("(started)")
                 if mark:
                     parts.append("**%s**" % mark)
                 if r.get("detail"):
@@ -5875,7 +5907,10 @@ def coverage(records: List[Dict], window_minutes: int = 30, auto_since: Optional
             # are matched with may be older: an observed time can precede its import (a missed run, a first import).
             and (not auto_since or str(r.get("ts") or "") >= auto_since)]
     # An `archive` record (action "file", target = the file name) is the Bot reporting that file as well.
-    self_recs = [r for r in records if r.get("type") in ("action", "archive") and r.get("source") != "auto"]
+    # A `pending` start record that was followed by its completion record is one step, not two self-reports.
+    resolved = _resolved_pending_actions(records)
+    self_recs = [r for r in records if r.get("type") in ("action", "archive") and r.get("source") != "auto"
+                 and id(r) not in resolved]
     window = window_minutes * 60
     by_key: Dict[Tuple[str, str], Dict] = {}
     unmatched: List[Dict] = []
@@ -6041,7 +6076,9 @@ def _proposal_id(bot: str, category: str, key: str) -> str:
     return hashlib.sha1(("%s|%s|%s" % (bot, category, key)).encode("utf-8")).hexdigest()[:8]
 
 
-def _tasks_of(recs: List[Dict]) -> Dict[str, Dict]:
+def _tasks_of(recs: List[Dict], resolved: Optional[set] = None) -> Dict[str, Dict]:
+    if resolved is None:
+        resolved = _resolved_pending_actions(recs)
     tasks: Dict[str, Dict] = {}
     for r in recs:
         tid = r.get("task_id")
@@ -6054,7 +6091,7 @@ def _tasks_of(recs: List[Dict]) -> Dict[str, Dict]:
             t["start"] = r.get("ts")
         elif r.get("type") == "task_end":
             t["end"], t["outcome"] = r.get("ts"), r.get("outcome")
-        elif r.get("type") == "action":
+        elif r.get("type") == "action" and id(r) not in resolved:
             t["actions"].append(r)
         elif r.get("type") == "approval":
             t["approvals"].append(r)
@@ -6179,7 +6216,8 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None,
                           "status": status, "status_ts": status_ts, "hidden": hidden})
 
     for bot, recs in sorted(by_bot.items()):
-        tasks = _tasks_of(recs)
+        resolved = _resolved_pending_actions(recs)
+        tasks = _tasks_of(recs, resolved)
         durations = {tid: (_ts_epoch(t["end"]) - _ts_epoch(t["start"])) / 60 for tid, t in tasks.items() if t["start"] and t["end"]}
         # The Bot's own reports only: a failure that the shell hook captured as well is one failure, and
         # commands that exit non-zero by design (grep, diff, test) are not "repeated failures".
@@ -6190,7 +6228,7 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None,
              "closed": sum(1 for t in tasks.values() if t["start"] and t["end"]),
              "succeeded": sum(1 for t in tasks.values() if t["start"] and t["outcome"] == "ok"),
              "open": sum(1 for t in tasks.values() if t["start"] and not t["end"]),
-             "actions": sum(1 for r in recs if r.get("type") == "action" and r.get("source") != "auto"),
+             "actions": sum(1 for r in recs if r.get("type") == "action" and r.get("source") != "auto" and id(r) not in resolved),
              "auto_actions": sum(1 for r in recs if r.get("type") == "action" and r.get("source") == "auto"),
              "failed_actions": len(fails), "approvals": sum(1 for r in recs if r.get("type") == "approval"),
              "denied": len(denied), "median_minutes": round(_median(list(durations.values())), 1)}
@@ -6983,8 +7021,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.since = (_dt.datetime.strptime(today(), "%Y-%m-%d") - back).strftime("%Y-%m-%d")
     if args.cmd in ("report", "export") and args.since and not _is_date(args.since):
         raise _UsageError("--since must be YYYY-MM-DD")
-    if args.cmd == "capture" and args.what == "browser" and args.hours < 0:
-        raise _UsageError("--hours must be 0 or more")
     if args.cmd == "capture" and args.what == "browser" and args.hours < 1:
         raise _UsageError("--hours must be 1 or more (a window of 0 hours imports nothing)")
     if args.cmd == "coverage" and args.window < 0:

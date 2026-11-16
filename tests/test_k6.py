@@ -236,13 +236,12 @@ class SnapshotWindowTest(LedgerCase):
         self.assertEqual((res["records"], res["head"]), (3, self.recs[-1]["hash"]))
         self.assertEqual(self.ledger.verify("ops")["records"], 4)
 
-    # bug: K6-04. A day file removed between the snapshot and the parse raises FileNotFoundError out of
-    # Ledger.verify (seal and state rebuild then exit 2 without naming a chain) where a problem line belongs.
-    @unittest.expectedFailure
+    # fixed: K6-04. A day file removed between the snapshot and the parse is reported as a problem line
+    # instead of raising FileNotFoundError out of Ledger.verify.
     def test_day_file_deleted_after_snapshot_is_a_problem(self):
         res = self._verify_after(lambda: os.remove(self.log))
         self.assertFalse(res["ok"], res)
-        self.assertTrue(any("logs/ops/%s.jsonl" % DAY in p for p in res["problems"]), res["problems"])
+        self.assertIn(REPLACED, res["problems"])
 
 
 # --------------------------------------------------------------------------- K6-07
@@ -421,18 +420,25 @@ class CrashPointTest(LedgerCase):
     I4: no record carries ``state_adopted``."""
 
     def _check(self, root, bot, label):
+        def slurp(paths):
+            out = []
+            for p in paths:
+                with open(p, "rb") as fh:
+                    out.append(fh.read())
+            return out
+
         ledger = gblog.Ledger(root)
         _path, tail = ledger._tail_record(bot)
         torn = tail is not None and "_corrupt" in tail
         res = ledger.verify(bot)
         files = ledger.log_files(bot)
-        before = [open(p, "rb").read() for p in files]
+        before = slurp(files)
         if torn:
             self.assertEqual(len(res["problems"]), 1, label)
             self.assertIn("not valid JSON", res["problems"][0], label)
             with self.assertRaises(gblog.TailMismatchError), redirect_stderr(io.StringIO()):
                 ledger.append(bot, {"type": "note", "detail": "next", "ts": stamp(6)})
-            self.assertEqual([open(p, "rb").read() for p in files], before, label)
+            self.assertEqual(slurp(files), before, label)
             return
         self.assertIn(res["problems"], ([], [HEAD_MISMATCH % bot]), label)
         with redirect_stderr(io.StringIO()):

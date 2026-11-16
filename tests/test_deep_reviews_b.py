@@ -746,29 +746,26 @@ class BrowserWindowTest(Base):
         super().setUp()
         self.hist = chrome_history(os.path.join(self.base, "chrome"), [("https://a.example/one", "A", 60)])
 
-    def test_negative_hours_is_refused_with_the_exact_message(self):
-        # D4-03 (the larger negative-window test is test_deep_reviews.CliLayerTest, K6-14)
+    def test_non_positive_hours_is_refused_with_the_exact_message(self):
+        # D4-03 / K5-01 / K8-15: CLI refuses --hours below 1 with one message
         argv = ["capture", "browser", "--bot", "ops", "--history", self.hist]
-        rc, out, err = run(argv + ["--hours=-1"], self.root)
-        self.assertEqual((rc, out), (2, ""))
-        self.assertEqual(err, "error: --hours must be 0 or more\n")
-        self.assertFalse(os.path.exists(self.path("state", "ops.json")))
+        for bad in ("--hours=-1", "--hours=0"):
+            rc, out, err = run(argv + [bad], self.root)
+            self.assertEqual((rc, out), (2, ""))
+            self.assertEqual(err, "error: --hours must be 1 or more (a window of 0 hours imports nothing)\n")
+            self.assertFalse(os.path.exists(self.path("state", "ops.json")))
         rc, out, err = run(argv, self.root)
         self.assertEqual(rc, 0, out + err)
         self.assertIn("browser: 1 new visit(s)", out)
 
-    # bug: Z-12 (round-4 G2-01). README, FAQ 28 and the CHANGELOG say that only a negative --hours is
-    # refused and that `--hours 0` imports nothing on a first run; _validate_args still exits 2 for 0.
-    @unittest.expectedFailure
-    def test_hours_zero_imports_nothing_on_a_first_run(self):
-        argv = ["capture", "browser", "--bot", "ops", "--history", self.hist]
-        rc, out, err = run(argv + ["--hours=0"], self.root)
-        self.assertEqual(rc, 0, out + err)
-        self.assertIn("browser: 0 new visit(s) from 1 history file(s)", out)
+    # fixed: Z-12 / K5-01. The CLI refuses --hours below 1 (matching README, FAQ 28, DESIGN §11 and CHANGELOG);
+    # the library function clamps a non-positive window to 0 and records the marker without importing older visits.
+    def test_library_hours_zero_clamps_and_imports_nothing_on_a_first_run(self):
+        res, _err = self.quiet(gblog.capture_browser, self.ledger, "ops", [self.hist], hours=0)
+        self.assertEqual(res["added"], 0, res)
         # the first run left a marker: the default window does not reach back behind it
-        rc, out, err = run(argv, self.root)
-        self.assertEqual(rc, 0, out + err)
-        self.assertIn("browser: 0 new visit(s) from 1 history file(s)", out)
+        res2, _err2 = self.quiet(gblog.capture_browser, self.ledger, "ops", [self.hist], hours=24)
+        self.assertEqual(res2["added"], 0, res2)
         self.assertEqual(self.chain(), [])
 
     def test_future_marker_is_ignored_with_a_notice(self):
