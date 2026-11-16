@@ -98,6 +98,16 @@ class StateRebuildError(Exception):
 class _UsageError(Exception):
     """Bad CLI value. main() prints ``error: ...`` and returns 2."""
 
+
+class _VerifyResult(dict):
+    """Result of ``Ledger.verify``: a plain dict for callers and for JSON output.
+
+    ``hashes`` holds every record hash of the snapshot the result was computed from, so
+    ``verify --contains`` does not have to read the chain a second time. It is an attribute,
+    not a key: the result keys are unchanged."""
+
+    hashes: frozenset = frozenset()
+
 RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune", "archive")
 SOURCES = ("self", "auto", "routine")
 ACTION_KINDS = (
@@ -192,6 +202,16 @@ def _is_norm_ts(value: object) -> bool:
         return isinstance(value, str) and parse_ts(value) == value
     except ValueError:
         return False
+
+
+_FUTURE_TAIL_SECONDS = 300
+
+
+def _future_ts(ts: object, now: Optional[str] = None) -> bool:
+    """True when ``ts`` is a normalised timestamp more than 300 s after ``now`` (default: the wall clock)."""
+    if not _is_norm_ts(ts):
+        return False
+    return _ts_epoch(ts) - _ts_epoch(now or now_iso()) > _FUTURE_TAIL_SECONDS  # type: ignore[arg-type]
 
 
 def _die(message: str) -> None:
@@ -301,6 +321,11 @@ def safe_name(name: str) -> str:
     if not cleaned:
         _die("bot name must contain letters or digits")
     return cleaned
+
+
+def _chain_key(name: str) -> str:
+    """The sanitised form of a chain name, like safe_name() but without exiting ("" when nothing is left)."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(name).strip()).strip("-.")
 
 
 def _is_full_hash(value: object) -> bool:
@@ -582,6 +607,27 @@ class Ledger:
         if not os.path.isdir(self.logs_dir):
             return []
         return sorted(d for d in os.listdir(self.logs_dir) if os.path.isdir(os.path.join(self.logs_dir, d)))
+
+    def invalid_chain_dirs(self) -> List[str]:
+        """Directories under logs/ whose name is not its own sanitised form.
+
+        Such a directory can never be a chain key: safe_name() would map it to another chain (or exit),
+        so its records are never verified. ``verify --all`` reports each one as FAIL; readers skip them."""
+        return [d for d in self.bots() if _chain_key(d) != d]
+
+    def valid_chains(self) -> List[str]:
+        """bots() without the invalid chain directories. Each skipped directory is announced once on stderr."""
+        names = self.bots()
+        bad = [d for d in names if _chain_key(d) != d]
+        if not bad:
+            return names
+        warned = self.__dict__.setdefault("_warned_chain_dirs", set())
+        for d in bad:
+            if d not in warned:
+                warned.add(d)
+                sys.stderr.write("warning: ignoring logs/%s (invalid chain directory name); run gblog verify --all\n"
+                                 % _clean_text(d))
+        return [d for d in names if d not in bad]
 
     def log_files(self, bot: str) -> List[str]:
         d = os.path.join(self.logs_dir, bot)
@@ -871,7 +917,7 @@ class Ledger:
     def chains_for(self, bot: str) -> List[str]:
         slug = self.canonical(bot)
         names = {slug} | set(self.aliases()["bots"].get(slug, {}).get("aliases", []))
-        existing = [c for c in self.bots() if c in names or self.canonical(c) == slug]
+        existing = [c for c in self.valid_chains() if c in names or self.canonical(c) == slug]
         return existing or [slug]
 
     def chains_on_disk(self, name: str) -> List[str]:
@@ -890,7 +936,7 @@ class Ledger:
 
     def groups(self) -> Dict[str, List[str]]:
         out: Dict[str, List[str]] = {}
-        for chain in self.bots():
+        for chain in self.valid_chains():
             out.setdefault(self.canonical(chain), []).append(chain)
         return dict(sorted(out.items()))
 
@@ -1073,6 +1119,7 @@ class Ledger:
         moves the head backward, which this check also refuses).
         """
         bot = safe_name(bot)
+        self._check_reserved(bot)  # a new chain may not use a name that collides with gblog's own files under state/
         record = _clean_text(record)
         explicit_ts = None
         if record.get("ts"):
@@ -1103,6 +1150,10 @@ class Ledger:
                 ts = wall
                 if tail_ts and wall < tail_ts:
                     ts, regressed = tail_ts, True
+                    if _future_ts(tail_ts, wall):
+                        # A future-dated tail pins every later record to its timestamp and day file: say so.
+                        sys.stderr.write("warning: last record of %s is dated %s (future); this record is stamped with it\n"
+                                         % (bot, tail_ts))
             full = {"v": SCHEMA_VERSION, "seq": seq + 1, "ts": ts, "bot": bot}
             for key, value in record.items():
                 if key in ("v", "seq", "ts", "bot", "prev", "hash"):
@@ -1128,19 +1179,51 @@ class Ledger:
             items.append((rel, lineno, rec))
         return items
 
+    def _chain_snapshot(self, bot: str) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
+        """Every non-blank log line of one chain as ``(rel, lineno, record, text)``, plus the log file names.
+
+        ``text`` is the stripped line as written (None when it is not UTF-8). verify() calls this once,
+        under the shared lock, and derives the walk, the layout findings and the hash set from it."""
+        snap_lines: List[Tuple[str, int, Dict, Optional[str]]] = []
+        log_names: List[str] = []
+        for path in self.log_files(bot):
+            rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+            log_names.append(rel)
+            with open(path, "rb") as fh:
+                for lineno, raw in enumerate(fh, 1):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        text: Optional[str] = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = None
+                    snap_lines.append((rel, lineno, _parse_line(raw), text))
+        return snap_lines, log_names
+
     # -- verify
-    def verify(self, bot: str) -> Dict:
+    def verify(self, bot: str, strict: Optional[bool] = None, skip_archives: Optional[bool] = None) -> Dict:
         """Walk every segment. One break_ack may approve one exact link; any other break FAILs.
 
         A passing sealed chain is ok with approved_breaks >= 1. Callers print
         ``PASS (N approved break(s))`` and must not treat that as a chain with no gap.
+
+        ``strict`` and ``skip_archives`` default to the ledger presets (``verify_strict``,
+        ``verify_skip_archives``), which is what the CLI sets. With strict, the layout warnings
+        (bot field mismatch, stray file names) and non-canonical lines become problems.
         """
         bot = safe_name(bot)
+        strict = bool(self.verify_strict if strict is None else strict)
+        skip_archives = bool(self.verify_skip_archives if skip_archives is None else skip_archives)
         # Shared lock: a concurrent append is never seen half-written or with state ahead of the items.
+        # Log lines, state and both anchor files are read in this one snapshot, so an anchor written for a
+        # record appended later can never be compared with an older view of the chain.
         # It is released before the walk, the archive re-hash and the return (seal_break appends right after verify).
         with self.lock(bot, shared=True):
-            items = self._chain_items(bot)
+            snap_lines, log_names = self._chain_snapshot(bot)
             raw_state_snapshot = self._load_state(bot)
+            anchor_snapshot = self._anchor_snapshot(bot)
+        items = [(rel, lineno, rec) for rel, lineno, rec, _text in snap_lines]
         problems: List[str] = []
         warnings: List[str] = []
         acks = []
@@ -1268,19 +1351,24 @@ class Ledger:
 
         final_head = segments[-1]["head"] if segments else GENESIS
         raw_state = raw_state_snapshot
-        state = raw_state if raw_state is not None else {"seq": 0, "head": GENESIS}
+        # The state witness counts even when the walk found no record at all (emptied day file, deleted logs/<bot>).
+        state_head = raw_state.get("head", GENESIS) if raw_state is not None else None
+        state_readable = isinstance(state_head, str)  # a non-string head is as good as no state file
         state_problem = None
-        if not problems and count and state.get("head") not in (GENESIS, final_head):
+        if not problems and state_readable and state_head not in (GENESIS, final_head):
             state_problem = "state/%s.json: head does not match last record (state tampered or log truncated)" % bot
             problems.append(state_problem)
         if items:
-            if raw_state is None:
+            if not state_readable:
                 warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
-            elif state.get("head", GENESIS) == GENESIS:
+            elif state_head == GENESIS:
                 warnings.append("state/%s.json was reset to genesis" % bot)
+        if _future_ts(last_ts):
+            warnings.append("last record is dated %s, in the future: new records are stamped with that time "
+                            "(see clock_regressed)" % last_ts)
         # Every head that was ever anchored must still be a record of this chain.
         hashes = {rec.get("hash") for _rel, _lineno, rec in items if isinstance(rec.get("hash"), str)}
-        anchor_problems, anchor_warnings = self._anchor_checks(bot, hashes)
+        anchor_problems, anchor_warnings = self._anchor_checks(bot, hashes, anchor_snapshot)
         problems.extend(anchor_problems)
         warnings.extend(anchor_warnings)
         fixture_ack = bool(used and sole is not None and sole.get("fixture"))
@@ -1291,8 +1379,14 @@ class Ledger:
         if not problems:
             arch_recs = [rec for _rel, _lineno, rec in items if rec.get("type") == "archive"]
             archives = len(arch_recs)
-            problems.extend(verify_archives(self, arch_recs))
-        return {
+            problems.extend(verify_archives(self, arch_recs, check=not skip_archives))
+        # Layout findings come from the same snapshot as the walk (no second read, no second parser).
+        layout_warnings, noncanonical = _layout_findings(bot, snap_lines, log_names, strict)
+        if strict:
+            problems.extend(layout_warnings + noncanonical)
+        else:
+            warnings.extend(layout_warnings)
+        res = _VerifyResult({
             "bot": bot,
             "records": count,
             "head": final_head,
@@ -1307,13 +1401,34 @@ class Ledger:
             "warnings": warnings,
             "fixture_ack": fixture_ack,
             "state_problem": state_problem,
-        }
+            "archives_checked": not skip_archives,
+        })
+        res.hashes = hashes  # type: ignore[assignment]
+        return res
 
     def _anchor_history_file(self, bot: str) -> str:
         return os.path.join(self.anchors_dir, bot + ".history.jsonl")
 
-    def _anchor_checks(self, bot: str, hashes: set) -> Tuple[List[str], List[str]]:
-        """Containment of anchored heads: ``(problems, warnings)`` for anchors/<bot>.json and its history."""
+    def _anchor_snapshot(self, bot: str) -> Tuple[bool, Optional[Dict], Optional[List[Tuple[int, bytes]]]]:
+        """``(anchor file exists, anchors/<bot>.json or None, non-blank history lines or None)``.
+
+        verify() reads this under the shared bot lock together with the log lines and state."""
+        exists = os.path.exists(self._anchor_file(bot))
+        data = self.read_anchor(bot) if exists else None
+        history: Optional[List[Tuple[int, bytes]]] = None
+        hist = self._anchor_history_file(bot)
+        if os.path.exists(hist):
+            history = []
+            with open(hist, "rb") as fh:
+                for lineno, raw in enumerate(fh, 1):
+                    if raw.strip():
+                        history.append((lineno, raw))
+        return exists, data, history
+
+    def _anchor_checks(self, bot: str, hashes: set, snapshot: Optional[Tuple] = None) -> Tuple[List[str], List[str]]:
+        """Containment of anchored heads: ``(problems, warnings)`` for anchors/<bot>.json and its history.
+
+        Works on ``snapshot`` (from ``_anchor_snapshot``); without one the files are read now."""
         problems: List[str] = []
         warnings: List[str] = []
         reported = set()
@@ -1329,25 +1444,20 @@ class Ledger:
                 problems.append("%s: anchored head %s (%s) is no longer in the chain (history rewritten or tail truncated)"
                                 % (where, key[:12], ts))
 
-        if os.path.exists(self._anchor_file(bot)):
-            data = self.read_anchor(bot)
+        exists, data, history = snapshot if snapshot is not None else self._anchor_snapshot(bot)
+        if exists:
             if data is None:
                 warnings.append("anchors/%s.json is unreadable: anchored heads cannot be checked" % bot)
             else:
                 heads = [data.get("head")] if data.get("ok") else data.get("segment_heads")
                 check("anchors/%s.json" % bot, heads if isinstance(heads, list) else [], data.get("ts"))
-        hist = self._anchor_history_file(bot)
-        if os.path.exists(hist):
-            with open(hist, "rb") as fh:
-                for lineno, raw in enumerate(fh, 1):
-                    if not raw.strip():
-                        continue
-                    entry = _parse_line(raw)
-                    heads = entry.get("heads")
-                    if "_corrupt" in entry or not isinstance(heads, list) or not all(isinstance(h, str) for h in heads):
-                        problems.append("anchors/%s.history.jsonl:%d: corrupt anchor history line" % (bot, lineno))
-                        continue
-                    check("anchors/%s.history.jsonl:%d" % (bot, lineno), heads, entry.get("ts"))
+        for lineno, raw in history or []:
+            entry = _parse_line(raw)
+            heads = entry.get("heads")
+            if "_corrupt" in entry or not isinstance(heads, list) or not all(isinstance(h, str) for h in heads):
+                problems.append("anchors/%s.history.jsonl:%d: corrupt anchor history line" % (bot, lineno))
+                continue
+            check("anchors/%s.history.jsonl:%d" % (bot, lineno), heads, entry.get("ts"))
         return problems, warnings
 
     def _witness_present(self, brk: Dict, jay: str) -> Optional[bool]:
@@ -1386,6 +1496,56 @@ class Ledger:
             if isinstance(n, int) and not isinstance(n, bool) and n > 0 \
                     and not os.path.isdir(os.path.join(self.logs_dir, bot)):
                 found.append((bot, str(data.get("ts"))))
+        return found
+
+    def orphan_witnesses(self) -> List[Tuple[str, str]]:
+        """(bot, text) for every name that left a witness behind but has no logs/<name> directory.
+
+        Witnesses: ``state/<name>.json`` with a string non-genesis head, and ``anchors/<name>.history.jsonl``
+        with at least one non-empty ``heads`` list. ``verify --all`` reports each name as FAIL."""
+        found: List[Tuple[str, str]] = []
+
+        def gone(name: str) -> bool:
+            return not os.path.isdir(os.path.join(self.logs_dir, name))
+
+        if os.path.isdir(self.state_dir):
+            for fname in sorted(os.listdir(self.state_dir)):
+                if not fname.endswith(".json"):
+                    continue
+                name = fname[:-5]
+                if (not name or name == "aliases" or name.startswith("capture-files-") or name.endswith(".alert")
+                        or ".alert.resolved-" in name or not gone(name)):
+                    continue
+                data = _read_json(os.path.join(self.state_dir, fname))
+                if data is None or "kind" in data:
+                    continue
+                head = data.get("head")
+                if not isinstance(head, str) or head == GENESIS:
+                    continue
+                found.append((name, "state/%s.json records seq %s head %s but logs/%s is missing"
+                              % (name, data.get("seq"), head[:12], name)))
+        if os.path.isdir(self.anchors_dir):
+            suffix = ".history.jsonl"
+            for fname in sorted(os.listdir(self.anchors_dir)):
+                if not fname.endswith(suffix):
+                    continue
+                name = fname[:-len(suffix)]
+                if not name or not gone(name):
+                    continue
+                anchored, last_ts = False, None
+                try:
+                    with open(os.path.join(self.anchors_dir, fname), "rb") as fh:
+                        for raw in fh:
+                            if not raw.strip():
+                                continue
+                            entry = _parse_line(raw)
+                            heads = entry.get("heads")
+                            if isinstance(heads, list) and heads:
+                                anchored, last_ts = True, entry.get("ts")
+                except OSError:
+                    continue
+                if anchored:
+                    found.append((name, "chain was anchored (history, last %s) but logs/%s is missing" % (last_ts, name)))
         return found
 
     def seal_break(self, bot: str, descriptor: Dict, jay_approval_id: str, copy_fixture: bool = False) -> Dict:
@@ -1580,7 +1740,7 @@ class Ledger:
         There is no whole-ledger skip. One FAIL chain does not drop the others.
         """
         self.ensure()
-        names = [safe_name(b) for b in bots] if bots is not None else self.bots()
+        names = [safe_name(b) for b in bots] if bots is not None else self.valid_chains()
         chains = []
         for bot in names:
             if not self.log_files(bot) and not os.path.exists(self._state_path(bot)):
@@ -1654,8 +1814,12 @@ class Ledger:
         return rollup
 
     # -- query
-    def chain_records(self, chain: str, since: Optional[str] = None) -> List[Dict]:
-        """Records of exactly one chain directory (no alias merging), oldest first. ``since`` is YYYY-MM-DD."""
+    def chain_records(self, chain: str, since: Optional[str] = None, raw: bool = False) -> List[Dict]:
+        """Records of exactly one chain directory (no alias merging), oldest first. ``since`` is YYYY-MM-DD.
+
+        Records are attributed to the directory they were read from: when a record's ``bot`` field differs,
+        a copy is returned with ``bot`` set to the directory and the original kept in ``bot_field``.
+        ``raw=True`` returns the records exactly as stored."""
         files = self.log_files(chain)
         if since:
             files = [f for f in files if os.path.basename(f)[:10] >= since]
@@ -1667,6 +1831,8 @@ class Ledger:
                 continue
             if since and str(rec.get("ts") or "") < since:
                 continue
+            if not raw and rec.get("bot") != chain:
+                rec = dict(rec, bot=chain, bot_field=rec.get("bot"))
             out.append(rec)
 
         def _key(r: Dict) -> Tuple[str, int]:
@@ -1679,9 +1845,15 @@ class Ledger:
         out.sort(key=_key)
         return out
 
-    def records(self, bot: Optional[str] = None, date: Optional[str] = None, since: Optional[str] = None) -> List[Dict]:
+    def records(self, bot: Optional[str] = None, date: Optional[str] = None, since: Optional[str] = None,
+                raw: bool = False) -> List[Dict]:
+        """Records of one Bot (all its chains) or of every valid chain directory, oldest first.
+
+        Attribution is by directory: a record whose ``bot`` field differs from the chain it was read from is
+        returned as a copy with ``bot`` set to the directory and the original in ``bot_field``.
+        ``raw=True`` (export) returns the records exactly as stored."""
         out: List[Dict] = []
-        for b in (self.chains_for(bot) if bot else self.bots()):
+        for b in (self.chains_for(bot) if bot else self.valid_chains()):
             files = self.log_files(b)
             if date:
                 files = [f for f in files if os.path.basename(f).startswith(date)]
@@ -1692,6 +1864,8 @@ class Ledger:
                     continue  # corrupt or malformed lines are reported by verify, never by a traceback here
                 if since and rec.get("ts", "") < since:
                     continue
+                if not raw and rec.get("bot") != b:
+                    rec = dict(rec, bot=b, bot_field=rec.get("bot"))
                 out.append(rec)
         out.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("bot") or ""), _seq_int(r.get("seq"))))
         return out
@@ -1881,10 +2055,12 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     return rec
 
 
-def verify_archives(ledger: "Ledger", records: Iterable[Dict]) -> List[str]:
+def verify_archives(ledger: "Ledger", records: Iterable[Dict], check: Optional[bool] = None) -> List[str]:
     import gzip
     problems: List[str] = []
-    if getattr(ledger, "verify_skip_archives", False):
+    if check is None:  # direct callers follow the ledger preset; Ledger.verify passes its own decision
+        check = not getattr(ledger, "verify_skip_archives", False)
+    if not check:
         return problems  # verify --skip-archives: records are counted, files are not re-hashed
     seen = set()
     for r in records:
@@ -1923,95 +2099,41 @@ _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 _MAX_LAYOUT_FINDINGS = 20
 
 
-def _chain_layout_findings(ledger: "Ledger", bot: str, strict: bool) -> Tuple[List[str], List[str]]:
-    """Things the hash walk does not look at. Returns (warnings, strict_only_problems).
+def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[str], strict: bool) -> Tuple[List[str], List[str]]:
+    """Things the hash walk does not look at, computed from verify()'s own snapshot.
 
+    Returns (warnings, strict_only_problems).
     Warnings: a record whose ``bot`` field is not the chain directory (swapped chains) and
     ``*.jsonl`` files that are not day files (they still take part in ordering).
-    Strict only: a raw line that is not exactly what gblog writes (duplicate keys, reformatting)."""
+    Strict only: a raw line that is not exactly what gblog writes (duplicate keys, reformatting).
+    ``snap_lines`` are the ``(rel, lineno, record, text)`` tuples of ``Ledger._chain_snapshot``."""
     warnings: List[str] = []
     noncanonical: List[str] = []
-    chain_dir = os.path.join(ledger.logs_dir, bot)
-    try:
-        names = sorted(os.listdir(chain_dir))
-    except OSError:
-        return warnings, noncanonical
-    rel_dir = os.path.relpath(chain_dir, ledger.root).replace(os.sep, "/")
-    for name in names:
-        if name.endswith(".jsonl") and not _DAY_FILE_RE.match(name):
-            warnings.append("%s/%s: unexpected log file name (not YYYY-MM-DD.jsonl)" % (rel_dir, name))
+    for rel in log_names:
+        if not _DAY_FILE_RE.match(rel.rsplit("/", 1)[-1]):
+            warnings.append("%s: unexpected log file name (not YYYY-MM-DD.jsonl)" % rel)
     mismatched = reformatted = 0
-    for path in ledger.log_files(bot):
-        rel = os.path.relpath(path, ledger.root).replace(os.sep, "/")
-        try:
-            fh = open(path, "rb")
-        except OSError:
-            continue
-        with fh:
-            for lineno, raw in enumerate(fh, 1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    text = raw.decode("utf-8")
-                    rec = json.loads(text)
-                except ValueError:
-                    continue  # unreadable lines are reported by the chain walk
-                if not isinstance(rec, dict):
-                    continue
-                if rec.get("bot") != bot:
-                    mismatched += 1
-                    if mismatched <= _MAX_LAYOUT_FINDINGS:
-                        warnings.append("%s:%d: bot field '%s' does not match chain '%s'" % (rel, lineno, rec.get("bot"), bot))
-                if strict:
-                    try:
-                        canon = json.dumps(rec, ensure_ascii=False, sort_keys=True)
-                    except (TypeError, ValueError):
-                        canon = None
-                    if canon != text:
-                        reformatted += 1
-                        if reformatted <= _MAX_LAYOUT_FINDINGS:
-                            noncanonical.append("%s:%d: non-canonical line (duplicate keys or reformatted)" % (rel, lineno))
+    for rel, lineno, rec, text in snap_lines:
+        if "_corrupt" in rec:
+            continue  # unreadable lines are reported by the chain walk
+        if rec.get("bot") != bot:
+            mismatched += 1
+            if mismatched <= _MAX_LAYOUT_FINDINGS:
+                warnings.append("%s:%d: bot field '%s' does not match chain '%s'" % (rel, lineno, rec.get("bot"), bot))
+        if strict:
+            try:
+                canon = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError, RecursionError):
+                canon = None
+            if canon != text:
+                reformatted += 1
+                if reformatted <= _MAX_LAYOUT_FINDINGS:
+                    noncanonical.append("%s:%d: non-canonical line (duplicate keys or reformatted)" % (rel, lineno))
     if mismatched > _MAX_LAYOUT_FINDINGS:
         warnings.append("%d more record(s) whose bot field does not match chain '%s'" % (mismatched - _MAX_LAYOUT_FINDINGS, bot))
     if reformatted > _MAX_LAYOUT_FINDINGS:
         noncanonical.append("%d more non-canonical line(s)" % (reformatted - _MAX_LAYOUT_FINDINGS))
     return warnings, noncanonical
-
-
-def _with_verify_options(inner):
-    """Layer ``strict`` / ``skip_archives`` and the layout warnings over ``Ledger.verify``.
-
-    The options can be passed as keywords (``ledger.verify(bot, strict=True)``) or preset on the
-    ledger (``verify_strict``, ``verify_skip_archives``), which is what the CLI does. Any other
-    argument is handed to the chain walk unchanged. The result gains ``archives_checked`` and
-    always has a ``warnings`` list; with strict the layout warnings and non-canonical lines
-    become problems."""
-    def verify(self, bot, *args, **kwargs):
-        saved = (self.verify_strict, self.verify_skip_archives)
-        if "strict" in kwargs:
-            self.verify_strict = bool(kwargs.pop("strict"))
-        if "skip_archives" in kwargs:
-            self.verify_skip_archives = bool(kwargs.pop("skip_archives"))
-        try:
-            strict, skipped = bool(self.verify_strict), bool(self.verify_skip_archives)
-            res = inner(self, bot, *args, **kwargs)
-        finally:
-            self.verify_strict, self.verify_skip_archives = saved
-        warnings = res.setdefault("warnings", [])
-        res["archives_checked"] = not skipped
-        found, noncanonical = _chain_layout_findings(self, res.get("bot") or safe_name(bot), strict)
-        if strict:
-            res["problems"].extend(found + noncanonical)
-            res["ok"] = not res["problems"]
-        else:
-            warnings.extend(found)
-        return res
-    verify.__doc__ = inner.__doc__
-    return verify
-
-
-Ledger.verify = _with_verify_options(Ledger.verify)  # type: ignore
 
 
 # --------------------------------------------------------------------------- remote visibility (backups must be private)
@@ -3341,11 +3463,18 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
             raise _UsageError("verify --contains requires --bot")
         if any(not _is_full_hash(h) for h in wanted):
             raise _UsageError("verify --contains needs a full 64-hex record hash")
-        gone: List[Tuple[str, str]] = []
+        # Chains that left a witness (anchor, anchor history, state head) but have no logs/<name>: name -> problem lines.
+        missing: Dict[str, List[str]] = {}
+        invalid: List[str] = []
         if args.all or not args.bot:
-            bots = ledger.bots()
-            gone = ledger.anchored_missing()  # a chain that was anchored and then removed must not vanish silently
-            if not bots and not gone:
+            invalid = ledger.invalid_chain_dirs()  # never handed to Ledger.verify: safe_name() would check another chain
+            bots = [b for b in ledger.bots() if b not in invalid]
+            # a chain that was anchored and then removed must not vanish silently
+            for name, anchored_ts in ledger.anchored_missing():
+                missing.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
+            for name, text in ledger.orphan_witnesses():
+                missing.setdefault(name, []).append(text)
+            if not bots and not missing and not invalid:
                 out.write("no bots logged yet under %s\n" % ledger.root)
                 return 0
         else:
@@ -3355,14 +3484,13 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
                 out.write("      - no chain on disk for '%s'\n" % args.bot)
                 return 1
         not_found: List[str] = []
-        if wanted:
-            present = set()
-            for b in bots:
-                present |= ledger.chain_hashes(b)
-            not_found = [h for h in wanted if h not in present]
+        present: set = set()  # hashes of the very snapshots verify() walked; --contains needs no second read
         rc = 0
         for b in bots:
             res = ledger.verify(b)
+            present |= set(getattr(res, "hashes", ()))
+            if wanted and b == bots[-1]:
+                not_found = [h for h in wanted if h not in present]
             arch = ("  (archives not checked)" if res.get("archives_checked") is False else "  (%d archived file(s) intact)" % res["archives"]) if res.get("archives") else ""
             if not_found and b == bots[-1]:
                 res["problems"].extend("expected hash %s not found in chain" % h[:12] for h in not_found)
@@ -3385,10 +3513,16 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
                     detail = "%s; %s" % (pass_label(res["approved_breaks"]), detail)
                 rc |= _record_verify(ledger, out, b, res, {"type": "verify", "action": "other", "target": "chain", "outcome": "ok" if res["ok"] else "fail",
                                   "detail": detail})
-        for name, anchored_ts in gone:
+        for name in sorted(missing):
             rc = 1
-            out.write("FAIL  %-20s %6d records\n" % (name, 0))
-            out.write("      - chain was anchored on %s but logs/%s is missing\n" % (anchored_ts, name))
+            out.write("FAIL  %-20s %6d records\n" % (_clean_text(name), 0))
+            for text in missing[name]:
+                out.write("      - %s\n" % _clean_text(text))
+        for name in invalid:
+            rc = 1
+            shown = _clean_text(name)
+            out.write("FAIL  %-20s %6d records\n" % (shown, 0))
+            out.write("      - logs/%s: directory name is not a valid chain key; its records are not verified\n" % shown)
         return rc
 
     if args.cmd == "seal":
@@ -3454,7 +3588,7 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
 
     if args.cmd == "status":
         rows = []
-        groups = {c: [c] for c in ledger.bots()} if args.chains else ledger.groups()
+        groups = {c: [c] for c in ledger.valid_chains()} if args.chains else ledger.groups()
         if getattr(args, "bot", None):
             want = ledger.canonical(args.bot)
             groups = {k: v for k, v in groups.items() if (ledger.canonical(k) if args.chains else k) == want}
@@ -3481,6 +3615,9 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
             stamps = sorted(a_ts for a_ts, _n in alerts if a_ts)
             r["alert"] = stamps[0] if stamps else None
             r["spooled"] = sum(a_n for _ts, a_n in alerts)
+            # A future-dated tail pins every new record to that timestamp (and day file); taken from state.updated.
+            ahead = [u for u in (ledger.read_state(c).get("updated") for c in r["chains"]) if _future_ts(u)]
+            r["future_tail"] = max(ahead) if ahead else None
         if args.json:
             out.write(json.dumps({"root": ledger.root, "bots": rows}, indent=2, ensure_ascii=False) + "\n")
             return 0
@@ -3501,6 +3638,11 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
                 if a_ts:
                     out.write("ALERT %s: tail mismatch since %s (%d spooled)\n" % (c, a_ts, a_n))
         out.write("".join(orphan_alerts))
+        for r in rows:
+            for c in r["chains"]:
+                updated = ledger.read_state(c).get("updated")
+                if _future_ts(updated):
+                    out.write("CLOCK %s: last record dated %s (future)\n" % (c, updated))
         return 0
 
     if args.cmd == "tail":
@@ -3538,7 +3680,7 @@ def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] =
         return 0 if (res["pushed"] or args.no_push) else 1
 
     if args.cmd == "export":
-        for r in ledger.records(ledger.canonical(args.bot) if args.bot else None, since=args.since):
+        for r in ledger.records(ledger.canonical(args.bot) if args.bot else None, since=args.since, raw=True):
             out.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
         return 0
 

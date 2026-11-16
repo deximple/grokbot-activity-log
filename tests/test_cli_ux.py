@@ -12,10 +12,8 @@ Covers the cases named in the audit for:
   I-26  the exit-code table (0, 1, 2, 3, 4)
 
 Every test is written to the audit text. Where gblog.py does not do what the audit says, the
-test is marked ``@unittest.expectedFailure`` with a ``deviation:`` comment:
-
-  * ``test_reserved_bot_names_refused_on_append`` - ``Ledger.append`` does not apply the
-    reserved-name check; only ``alias add`` does.
+test is marked ``@unittest.expectedFailure`` with a ``deviation:`` comment. (The one
+deviation found in the first pass, reserved names on append, was fixed by round-2 R-02.)
 
 Everything runs in temporary directories. No network is used: the one ``sync`` call has
 ``remote_visibility`` mocked and is refused before any push.
@@ -868,7 +866,6 @@ class AliasRegistryTest(CliBase):
     # `gblog note --bot aliases` exits 0, creates logs/aliases/ and writes the chain head into
     # state/aliases.json (the alias registry file); `--bot capture-files-x` / `x.alert` / `x.lock` /
     # `x.tmp` are accepted the same way.
-    @unittest.expectedFailure
     def test_reserved_bot_names_refused_on_append(self):
         for name in ("capture-files-ops", "ops.alert", "ops.lock", "ops.tmp", "aliases"):
             rc, out, err = run(["note", "--bot", name, "--detail", "must be refused"], self.root)
