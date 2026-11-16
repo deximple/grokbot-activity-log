@@ -1,4 +1,4 @@
-<!-- Round-4 audit: claude-fable-5-2 effort=max (org gju21, 12:55 KST); appendix at effort=high (12:51 KST). -->
+<!-- Round-4 audit: claude-fable-5-2 effort=max (12:55 KST); appendix at effort=high (12:51 KST). -->
 # Round-4 audit — 2026-11-16
 
 Scope: the current tree (`gblog.py` 0.6.1 "Unreleased", tests, docs, `install.sh`, `bin/gblog`, `examples/`, CI). This is an audit only: no file was changed and nothing was executed. Every statement was derived by reading the sources and names the function or document it rests on.

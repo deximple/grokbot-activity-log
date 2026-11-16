@@ -1,4 +1,4 @@
-<!-- Round-2 audit: claude-fable-5-2, effort=max, batch, org gju20, 10:14 KST. R-16 (test_cli_ux.py) was already created before this audit landed. -->
+<!-- Round-2 audit: claude-fable-5-2, effort=max, batch, 10:14 KST. R-16 (test_cli_ux.py) was already created before this audit landed. -->
 # Round-2 audit — 2026-11-16
 
 Scope: `gblog.py` 0.6.0, `bin/gblog`, `install.sh`, `.github/workflows/ci.yml`, all `*.md`, `tests/*.py`, measured against work items I-01 … I-42 of the 2026-11-16 audit.

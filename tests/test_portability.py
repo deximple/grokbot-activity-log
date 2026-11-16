@@ -99,6 +99,11 @@ class Base(unittest.TestCase):
         data = _read(path)
         return data.count(b"# gblog PATH"), data.count(b"# gblog ROOT")
 
+    @staticmethod
+    def home_entries(path):
+        # On macOS /usr/bin/python3 is an Apple xcrun stub that creates ~/Library/Caches when started.
+        return sorted(n for n in os.listdir(path) if not (sys.platform == "darwin" and n == "Library"))
+
     def assert_version(self, binary):
         rc, out, err = self.sh([binary, "--version"])
         self.assertEqual((rc, out.strip()), (0, VERSION_LINE), err)
@@ -166,7 +171,7 @@ class InstallQuotingTest(Base):
                 self.assertEqual(_read(bashrc), text)
                 self.assertNotIn("different value", err)
                 self.assertNotIn("warning:", err)
-                self.assertEqual(os.listdir(home), [".bashrc"])
+                self.assertEqual(self.home_entries(home), [".bashrc"])
 
     def test_home_relative_spellings_and_trailing_text_are_recognised(self):
         # K7-13: ~/..., $HOME/..., ${HOME}/..., a trailing comment, `VAR=...; export VAR`
@@ -222,13 +227,13 @@ class InstallLoginShellTest(Base):
         rc, out, err = self.install(SHELL="/bin/zsh")
         self.assertEqual(rc, 0, out + err)
         zshrc = os.path.join(self.home, ".zshrc")
-        self.assertEqual(os.listdir(self.home), [".zshrc"])
+        self.assertEqual(self.home_entries(self.home), [".zshrc"])
         self.assertEqual(self.markers(zshrc), (1, 1))
         before = _read(zshrc)
         rc, out, err = self.install(SHELL="/bin/zsh")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(_read(zshrc), before)
-        self.assertEqual(os.listdir(self.home), [".zshrc"])
+        self.assertEqual(self.home_entries(self.home), [".zshrc"])
         if shutil.which("zsh"):
             proc = subprocess.run(["zsh", "-c", READ_BACK, "_", ".zshrc"], cwd=self.cwd, stdin=DEVNULL, stdout=PIPE,
                                   stderr=PIPE, timeout=60, env={"HOME": self.home, "PATH": os.environ.get("PATH", os.defpath)})
@@ -240,13 +245,13 @@ class InstallLoginShellTest(Base):
         rc, out, err = self.install(SHELL="/usr/bin/zsh", ZDOTDIR=zdot)
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.markers(os.path.join(zdot, ".zshrc")), (1, 1))
-        self.assertEqual(os.listdir(self.home), [])
+        self.assertEqual(self.home_entries(self.home), [])
 
     def test_zsh_with_only_a_profile_gets_both_files(self):
         _write(os.path.join(self.home, ".profile"), "# mine\n")
         rc, out, err = self.install(SHELL="/bin/zsh")
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(sorted(os.listdir(self.home)), [".profile", ".zshrc"])
+        self.assertEqual(self.home_entries(self.home), [".profile", ".zshrc"])
         for name in (".profile", ".zshrc"):
             self.assertEqual(self.markers(os.path.join(self.home, name)), (1, 1), name)
 
@@ -256,14 +261,14 @@ class InstallLoginShellTest(Base):
             rc, out, err = self.install(SHELL="/bin/zsh")
             self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.markers(zshrc), (1, 1))
-        self.assertEqual(os.listdir(self.home), [".zshrc"])
+        self.assertEqual(self.home_entries(self.home), [".zshrc"])
 
     def test_bash_login_shell_file(self):
         # Terminal on macOS starts login shells: bash reads ~/.bash_profile there. Elsewhere ~/.profile is created.
         rc, out, err = self.install(SHELL="/bin/bash")
         self.assertEqual(rc, 0, out + err)
         expected = ".bash_profile" if sys.platform == "darwin" else ".profile"
-        self.assertEqual(os.listdir(self.home), [expected])
+        self.assertEqual(self.home_entries(self.home), [expected])
         self.assertEqual(self.markers(os.path.join(self.home, expected)), (1, 1))
 
 
@@ -279,7 +284,7 @@ class InstallEnvironmentTest(Base):
         self.assert_version(os.path.join(self.prefix, "gblog"))
         self.assertTrue(os.path.isdir(os.path.join(self.root, "logs")))
         self.assertEqual(os.listdir(self.cwd), [])
-        self.assertEqual(os.listdir(self.home), [])
+        self.assertEqual(self.home_entries(self.home), [])
 
     def test_empty_home_needs_prefix_and_root(self):
         for missing in ("GBLOG_PREFIX", "GBLOG_ROOT"):

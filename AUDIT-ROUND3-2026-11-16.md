@@ -1,4 +1,4 @@
-<!-- Round-3 audit: claude-fable-5-2, effort=xhigh, batch, org gju20, 10:56 KST. Written before the round-4 commit that closed the 6 pending security gaps (T-01 items may already be fixed). -->
+<!-- Round-3 audit: claude-fable-5-2, effort=xhigh, batch, 10:56 KST. Written before the round-4 commit that closed the 6 pending security gaps (T-01 items may already be fixed). -->
 # Round-3 audit — 2026-11-16
 
 Scope: `gblog.py` (reports itself as 0.6.0), `bin/gblog`, `install.sh`, `.github/workflows/ci.yml`, all `*.md`, `tests/*.py`, as they stand after round 1 (I-01 … I-42), round 2 (R-01 … R-27) and the security round (A:…, B:…).
@@ -451,7 +451,7 @@ Rules for every item:
 - **Dismissing `state_adopted` warnings automatically.** The marker exists because an append erases the "state missing" evidence. Document that it is permanent.
 ---
 
-# Appendix — round-3 audit at effort=max (claude-fable-5-2, org gju21, 11:05 KST)
+# Appendix — round-3 audit at effort=max (claude-fable-5-2, 11:05 KST)
 
 
 Scope: `gblog.py` (reports itself as 0.6.0), `bin/gblog`, `install.sh`, `.github/workflows/ci.yml`, all `*.md`, `tests/*.py`, as they are in the tree after the round-2 and security-review work.
