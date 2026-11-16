@@ -211,10 +211,13 @@ class SideFileTypeTest(Base):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are not supported here")
         rc, out, err = run_cli(["verify", "--all"], self.root, timeout=60)
-        self.assertEqual(rc, 0, out + err)
-        self.assertRegex(out, r"(?m)^OK\s+ops\s")
+        # Never read (no hang on /dev/zero). Since specialist review K2 a symlinked side file is a problem
+        # for its chain, not just a warning; other chains are unaffected.
+        self.assertEqual(rc, 1, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertRegex(out, r"(?m)^FAIL\s+ops\s")
+        self.assertIn("anchors/ops.json: not a regular file", out)
         self.assertRegex(out, r"(?m)^OK\s+zzz\s")
-        self.assertIn("      ! anchors/ops.json is unreadable: anchored heads cannot be checked", out.splitlines())
 
     def test_fifo_archive_is_a_problem_not_a_hang(self):
         arch, _err = self.quiet(gblog.archive_file, self.ledger, "aaa", b"evidence\n", "e.txt", "artifact", ts=stamp(0))

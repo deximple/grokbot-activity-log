@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -320,17 +322,39 @@ def _parse_line_dups(raw: bytes) -> Tuple[Dict, bool]:
     return rec, bool(dup)
 
 
-def _read_json(path: str) -> Optional[Dict]:
+# Side files (state, anchors, rollups, spool events, the alias registry) are small. A larger one counts as unreadable.
+_MAX_JSON_BYTES = 16 << 20
+
+
+def _open_regular(path: str):
+    """Open ``path`` for binary reading, but only if it is a regular file (K2-06).
+
+    The type is tested on the opened descriptor, so an entry swapped for a FIFO between a check and the
+    open cannot block the reader; O_NONBLOCK makes the open of a FIFO return at once. Raises OSError."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _read_json(path: str, limit: Optional[int] = _MAX_JSON_BYTES) -> Optional[Dict]:
     """A JSON object from ``path``; None when missing, unparsable or not an object.
 
     Only a regular file is opened: a FIFO, directory or device at the path counts as unreadable
     (opening a FIFO would block the command, possibly while it holds a lock)."""
     try:
-        if not os.path.isfile(path):
-            return None
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError, RecursionError):
+        with _open_regular(path) as fh:
+            if limit is not None and os.fstat(fh.fileno()).st_size > limit:
+                return None  # far larger than any side file gblog writes: not read into memory
+            data = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError, RecursionError, MemoryError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -752,7 +776,7 @@ def _makedirs(path: str) -> None:
                 raise
 
 
-def _open_private(path: str, mode: str = "w", keep: Optional[str] = None, **kwargs):
+def _open_private(path: str, mode: str = "w", keep: Optional[str] = None, exclusive: bool = False, **kwargs):
     """open() for (over)writing where a file that does not exist yet is created 0o600.
 
     ``keep`` names the file a temp file is about to replace; its permission bits are carried
@@ -764,25 +788,51 @@ def _open_private(path: str, mode: str = "w", keep: Optional[str] = None, **kwar
         except OSError:
             pass
     # O_NOFOLLOW: gblog never writes through a symbolic link (a ledger cloned from elsewhere may contain one).
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0), perm)
+    # No O_TRUNC (K2-05): nothing is cut before the entry is known to be a regular file with one name. A hard
+    # link would send the new bytes into a file outside the ledger; a FIFO would block the open (O_NONBLOCK
+    # makes it fail instead). ``exclusive`` (O_EXCL) is used for temp files: an existing entry is never reused.
+    flags = (os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0) | (os.O_EXCL if exclusive else 0))
+    fd = os.open(path, flags, perm)
     try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        if st.st_nlink > 1:
+            raise OSError(errno.EMLINK, "file has more than one hard link; not overwritten in place", path)
+        os.ftruncate(fd, 0)
+        if exclusive and keep and hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, perm)  # the mode of the file about to be replaced, whatever the umask says
+            except OSError:
+                pass
         return os.fdopen(fd, mode, **kwargs)
-    except Exception:
-        os.close(fd)
+    except BaseException:
+        try:
+            os.close(fd)  # already closed when fdopen() failed after adopting it: not an error of its own
+        except OSError:
+            pass
         raise
 
 
 def _open_lock(path: str, mode: str = "a+"):
     """Open a lock file for flock(). ``a+`` creates a missing file 0o600 (an existing file keeps its mode); ``r`` never creates."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)  # a lock file is never a symbolic link
+    # A lock file is never a symbolic link, and opening it never blocks (K2-02): O_NONBLOCK makes the open
+    # of a FIFO return at once, and anything but a regular file is refused. flock() itself is not affected.
+    nofollow = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     if mode == "r":
         fd = os.open(path, os.O_RDONLY | nofollow)
     else:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "lock file is not a regular file", path)
         return os.fdopen(fd, "r" if mode == "r" else "r+")
-    except Exception:
-        os.close(fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         raise
 
 
@@ -797,19 +847,28 @@ def _is_within(path: str, parent: str) -> bool:
 
 def _last_line(path: str, block: int = 65536) -> bytes:
     """Last non-blank line of a file (stripped), read backwards in 64 KiB blocks. b"" if there is none."""
-    with open(path, "rb") as fh:
+    # Linear in the length of the last line (K2-06): every byte is read and searched once. The former
+    # version joined and re-searched the whole buffer per block, which stalled appends (under the bot
+    # lock) on a day file that ends in one very long line.
+    with _open_regular(path) as fh:
         fh.seek(0, os.SEEK_END)
         pos = fh.tell()
-        buf = b""
+        parts: List[bytes] = []  # pieces of the last line, newest first
         while pos > 0:
             step = min(block, pos)
             pos -= step
             fh.seek(pos)
-            buf = (fh.read(step) + buf).rstrip()
-            cut = buf.rfind(b"\n")
+            chunk = fh.read(step)
+            if not parts:
+                chunk = chunk.rstrip()  # trailing blank lines and white space
+                if not chunk:
+                    continue
+            cut = chunk.rfind(b"\n")
             if cut >= 0:
-                return buf[cut + 1:].strip()
-        return buf.strip()
+                parts.append(chunk[cut + 1:])
+                break
+            parts.append(chunk)
+        return b"".join(reversed(parts)).strip()
 
 
 # Line breaks and every other C0/C1 control character (ESC included): none of them may reach a report line.
@@ -859,8 +918,17 @@ def _atomic_write(path: str, write_fn, mode: str = "w", keep: bool = True, fsync
         kwargs["encoding"] = "utf-8"
         if errors:
             kwargs["errors"] = errors
+    keep_path = path if keep else None
     try:
-        with _open_private(tmp, mode, keep=path if keep else None, **kwargs) as fh:
+        try:
+            fh = _open_private(tmp, mode, keep=keep_path, exclusive=True, **kwargs)
+        except FileExistsError:
+            st = os.lstat(tmp)
+            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
+                raise  # a link, FIFO or directory planted at the temp name: refused (the name is removed below)
+            os.remove(tmp)  # a regular leftover of a killed process
+            fh = _open_private(tmp, mode, keep=keep_path, exclusive=True, **kwargs)
+        with fh:
             write_fn(fh)
             fh.flush()
             os.fsync(fh.fileno())
@@ -924,6 +992,7 @@ class Ledger:
         self.spool_dir = os.path.join(self.root, "spool")
         self.skipped_lines: Dict[str, int] = {}  # chain -> unreadable lines skipped by its last read (see _readable)
         self.warn_skipped = False                # set by the CLI readers: also say so on stderr
+        self._unlistable: List[str] = []         # witness directories the last missing_chains() could not list
 
     # -- filesystem helpers
     def init(self) -> None:
@@ -951,6 +1020,8 @@ class Ledger:
     # verify options: preset by the CLI (--strict, --skip-archives) or passed as keywords to verify()
     verify_strict = False
     verify_skip_archives = False
+    # (st_dev, st_ino) of state/.anchors.lock while anchor() holds it; see _Lock (K2-02).
+    _outer_lock: Optional[Tuple[int, int]] = None
 
     def _check_reserved(self, name: str) -> None:
         """Refuse a reserved name for a *new* chain; a chain that already exists keeps working."""
@@ -961,7 +1032,25 @@ class Ledger:
         """Sanitised chain name for a writer. A reserved name for a new chain is refused (exit 2) before anything is touched."""
         bot = safe_name(bot)
         self._check_reserved(bot)
-        return bot
+        return self._disk_name(bot)
+
+    def _disk_name(self, bot: str) -> str:
+        """The chain name as its directory under logs/ is spelled (K1-09).
+
+        Differs from ``bot`` only where the filesystem ignores letter case (macOS, Windows): there
+        logs/Ops *is* logs/ops, and records written as ``Ops`` would be foreign to their own chain.
+        On a case-sensitive filesystem the other-case spelling is not a directory and nothing is listed."""
+        other = bot.swapcase()
+        if other == bot or not os.path.isdir(os.path.join(self.logs_dir, other)):
+            return bot
+        try:
+            names = os.listdir(self.logs_dir)
+        except OSError:
+            return bot
+        if bot in names:
+            return bot
+        low = bot.lower()
+        return next((n for n in sorted(names) if n.lower() == low), bot)
 
     def bots(self) -> List[str]:
         if not os.path.isdir(self.logs_dir):
@@ -1039,10 +1128,11 @@ class Ledger:
 
         # No re-entrancy state is kept: every instance opens the lock file itself and holds it until __exit__.
 
-        def __init__(self, path: str, shared: bool = False, create: bool = True):
+        def __init__(self, path: str, shared: bool = False, create: bool = True, avoid=None):
             self.path = path
             self.shared = shared
             self.create = create
+            self.avoid = avoid  # (st_dev, st_ino) of a lock this process already holds, or None
             self.fh = None
 
         def __enter__(self):
@@ -1057,6 +1147,20 @@ class Ledger:
                     except OSError:
                         continue
                 if self.fh is None:
+                    return self
+            if self.avoid is not None:
+                # state/.anchors.lock is held by this process. flock() is per open file: a request on a
+                # hard link of that file would wait on ourselves forever (K2-02).
+                try:
+                    st = os.fstat(self.fh.fileno())
+                    same = (st.st_dev, st.st_ino) == self.avoid
+                except OSError:
+                    same = False
+                if same:
+                    self.fh.close()
+                    self.fh = None
+                    if not self.shared:
+                        raise OSError(errno.EDEADLK, "lock file is a hard link of state/.anchors.lock", self.path)
                     return self
             if fcntl is not None:
                 fcntl.flock(self.fh.fileno(), fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX)
@@ -1078,14 +1182,14 @@ class Ledger:
         path = os.path.join(self.state_dir, bot + ".lock")
         if not shared:
             _makedirs(self.state_dir)
-            return Ledger._Lock(path)
+            return Ledger._Lock(path, avoid=self._outer_lock)
         on_disk = os.path.isdir(os.path.join(self.logs_dir, bot)) or os.path.exists(self._state_path(bot))
         if on_disk:
             try:
                 _makedirs(self.state_dir)
             except OSError:
                 pass
-        return Ledger._Lock(path, shared=True, create=on_disk)
+        return Ledger._Lock(path, shared=True, create=on_disk, avoid=self._outer_lock)
 
     def update_state(self, bot: str, fields: Dict) -> bool:
         """Merge ``fields`` into state/<bot>.json under the bot lock. Returns True when state was written.
@@ -1150,7 +1254,7 @@ class Ledger:
         if not usable:
             return {"bots": {}, "strict": False, "unreadable": True}, True
         data["bots"] = bots
-        data.setdefault("strict", False)
+        data["strict"] = data.get("strict") is True  # a hand-edited "off" or "no" is not "on" (K1-13)
         for e in bots.values():
             e.setdefault("aliases", [])
         return data, False
@@ -1357,7 +1461,7 @@ class Ledger:
         # One rule, the same as resolve(): a chain belongs to the Bot its name resolves to.
         existing = [c for c in self.valid_chains() if self.canonical(c) == slug]
         # A hand-edited registry key is never used as a path component as it stands.
-        return existing or [c for c in (_chain_key(slug),) if c]
+        return existing or [self._disk_name(c) for c in (_chain_key(slug),) if c]
 
     def chains_on_disk(self, name: str) -> List[str]:
         """chains_for(name), limited to chains that have a logs/<chain> directory or a state file."""
@@ -1383,6 +1487,16 @@ class Ledger:
             return raw
         return self.canonical(raw)
 
+    def spool_chains_for(self, name: str) -> List[str]:
+        """Chains whose spool belongs to the Bot ``name`` (K1-05): the exact chain first (what ``spool replay``
+        addresses), then every other chain or spool directory that resolves to the same Bot. ``status --bot``
+        shows the alerts of all of them, so ``spool list --bot`` must not look at one only."""
+        first = self.chain_name(name)
+        slug = self.canonical(name)
+        rest = [c for c in sorted(set(self.chains_for(name)) | set(self.spool_bots()))
+                if c and c != first and _chain_key(c) == c and self.canonical(c) == slug]
+        return [first] + rest
+
     def groups(self) -> Dict[str, List[str]]:
         out: Dict[str, List[str]] = {}
         for chain in self.valid_chains():
@@ -1406,7 +1520,7 @@ class Ledger:
         # An explicit empty list means "no files", not "all files" (F-03).
         paths = self.log_files(bot) if files is None else list(files)
         for path in paths:
-            with open(path, "rb") as fh:
+            with _open_regular(path) as fh:
                 for lineno, raw in enumerate(fh, 1):
                     if not raw.strip():
                         continue
@@ -1534,8 +1648,13 @@ class Ledger:
         should treat that file as a page. Do not delete the spool or edit the log to retry.
         """
         spool_dir = os.path.join(self.spool_dir, bot)
-        _makedirs(self.state_dir)
-        _makedirs(spool_dir)
+        # A refusal is always exit 4 (K2-10): an entry planted at spool/<bot> must not turn it into an
+        # environment error that leaves neither a spool file nor an alert. Failures are named in the message.
+        for needed in (self.state_dir, spool_dir):
+            try:
+                _makedirs(needed)
+            except OSError:
+                pass
         # Refusals of one chain are serialised by its lock, so a per-second counter is their order:
         # file names sort in refusal order even when several events are refused within one second.
         stamp = now_iso().replace("-", "").replace(":", "")
@@ -1564,11 +1683,15 @@ class Ledger:
             "alert": os.path.relpath(alert_path, self.root).replace(os.sep, "/"),
         }
         payload = _clean_text(payload)
-        self._atomic_json(spool_path, payload)
-        self._atomic_json(alert_path, payload)
+        failed: List[str] = []
+        for what, target in (("alert", alert_path), ("spool", spool_path)):  # the alert first: `status` reads it
+            try:
+                self._atomic_json(target, payload)
+            except OSError as exc:
+                failed.append("%s not written (%s)" % (what, exc.__class__.__name__))
         raise TailMismatchError(
             # the observed values come from the last log line as written: no raw control characters in the message
-            _term("bot %s tail seq/hash %s/%s != state %s/%s" % (
+            _term(("bot %s tail seq/hash %s/%s != state %s/%s" + "".join("; " + text for text in failed)) % (
                 bot, observed.get("seq"), str(observed.get("hash") or "")[:12], expected_seq, str(expected_head)[:12],
             )),
             spool_path, alert_path,
@@ -1596,6 +1719,11 @@ class Ledger:
         raw = self._load_state(bot) if state_exists else None
         if seen is not None:
             seen.append(raw)  # handed to append(), which updates and writes it within the same lock hold
+        state_path = self._state_path(bot)
+        if state_exists and os.path.isdir(state_path) and not os.path.islink(state_path):
+            # A directory where the state file belongs cannot be replaced (K2-08). Without this refusal every
+            # append would write its line, fail on the state write and exit 2: the chain grows one "error" at a time.
+            return 0, GENESIS, tail, {"seq": None, "hash": None, "file": "state/%s.json" % bot, "corrupt": True}, ""
         # A state object whose head is not a string is treated like an unreadable file (verify does the same).
         state = raw if _usable_head(raw) else None
         seq, head = _state_head(state)
@@ -1711,6 +1839,12 @@ class Ledger:
             full["prev"] = head
             full["hash"] = compute_hash(full)
             path = os.path.join(self.logs_dir, bot, today(ts) + ".jsonl")
+            if os.path.lexists(path) and not os.path.islink(path) and not os.path.isfile(path):
+                # A FIFO, directory or device planted at the day file (K2-10): the tail check cannot see it.
+                # The event is spooled (exit 4), never lost with exit 2. A symlink keeps its plain refusal.
+                self._refuse_tail(bot, record, seq, head, {
+                    "seq": None, "hash": None, "corrupt": True,
+                    "file": os.path.relpath(path, self.root).replace(os.sep, "/")})
             self._append_line(path, json.dumps(full, ensure_ascii=False, sort_keys=True) + "\n")
             # The state read at the top of this lock hold is still current (state writers take this lock),
             # so the file is not read a second time.
@@ -1744,7 +1878,7 @@ class Ledger:
         for path in (self.log_files(bot) if paths is None else paths):
             rel = os.path.relpath(path, self.root).replace(os.sep, "/")
             log_names.append(rel)
-            with open(path, "rb") as fh:
+            with _open_regular(path) as fh:
                 for lineno, raw in enumerate(fh, 1):
                     raw = raw.strip()
                     if not raw:
@@ -1819,8 +1953,15 @@ class Ledger:
                 paths.append(path)
             elif len(problems) < _MAX_LAYOUT_FINDINGS:
                 problems.append("%s: not a regular file" % rel(path))
-        for path in (self._state_path(bot), self._anchor_file(bot), self._anchor_history_file(bot)):
+        lock_path = os.path.join(self.state_dir, bot + ".lock")
+        for path in (self._state_path(bot), self._anchor_file(bot), self._anchor_history_file(bot), lock_path):
             link(path)
+        if os.path.lexists(lock_path) and not os.path.islink(lock_path) and not os.path.isfile(lock_path):
+            # never opened by a reader (K2-02); writers of this chain cannot take their lock
+            problems.append("%s: not a regular file (appends to this chain exit 2)" % rel(lock_path))
+        state_path = self._state_path(bot)
+        if os.path.isdir(state_path) and not os.path.islink(state_path):
+            problems.append("%s: not a regular file (a directory; appends are refused)" % rel(state_path))
         arch = os.path.join(self.archive_dir, bot)
         link(arch)
         for name, is_link, _is_file in entries(arch):
@@ -2055,7 +2196,19 @@ class Ledger:
         if len(bare) > _MAX_LAYOUT_FINDINGS:
             bare_archives.append("%d more archive record(s) without path and sha256" % (len(bare) - _MAX_LAYOUT_FINDINGS))
         # Symbolic links among the chain's files are layout findings as well (problems with --strict).
-        layout_warnings = layout_warnings + link_files + bare_archives
+        # An archived file that is a symbolic link verifies through the link, but git would back up the link
+        # and not the evidence (K2-04). Same finding as for the other links: a warning, a problem with --strict.
+        linked_archives: List[str] = []
+        if not skip_archives:
+            for _rel, _lineno, rec in items:
+                apath = rec.get("path") if rec.get("type") == "archive" else None
+                if (isinstance(apath, str) and _ARCHIVE_PATH_RE.match(apath)
+                        and len(linked_archives) < _MAX_LAYOUT_FINDINGS
+                        and os.path.islink(os.path.join(self.root, *apath.split("/")))):
+                    text = "%s: symbolic link (gblog does not write through one)" % apath
+                    if text not in linked_archives:
+                        linked_archives.append(text)
+        layout_warnings = layout_warnings + link_files + linked_archives + bare_archives
         if strict:
             problems.extend(layout_warnings + noncanonical)
         else:
@@ -2112,7 +2265,12 @@ class Ledger:
         """``(anchor file exists, anchors/<bot>.json or None, non-blank history lines or None)``.
 
         verify() reads this under the shared bot lock together with the log lines and state."""
-        exists = os.path.exists(self._anchor_file(bot))
+        anchor_path = self._anchor_file(bot)
+        exists = os.path.exists(anchor_path)
+        anchor_problem: Optional[str] = None
+        if os.path.lexists(anchor_path) and not os.path.isfile(anchor_path):
+            # a FIFO, directory, device or dangling link where the latest anchor should be: never opened, never OK
+            anchor_problem, exists = "anchors/%s.json: not a regular file" % bot, False
         data = self.read_anchor(bot) if exists else None
         history: Optional[List[Tuple[int, bytes]]] = None
         hist_problem: Optional[str] = None
@@ -2130,7 +2288,7 @@ class Ledger:
             # a FIFO, directory, device or dangling link where the append-only history should be: the witness is gone
             hist_problem = "anchors/%s.history.jsonl: not a regular file" % bot
         # The day rollup is read in the same lock hold as the log lines (same argument as for the anchor files).
-        return exists, data, history, hist_problem, self._rollup_heads(bot)
+        return exists, data, history, [p for p in (anchor_problem, hist_problem) if p], self._rollup_heads(bot)
 
     def _anchor_checks(self, bot: str, hashes: set, snapshot: Optional[Tuple] = None) -> Tuple[List[str], List[str]]:
         """Containment of anchored heads: ``(problems, warnings)`` for anchors/<bot>.json and its history.
@@ -2152,8 +2310,7 @@ class Ledger:
                                 % (where, key[:12], ts))
 
         exists, data, history, hist_problem, rollup = snapshot if snapshot is not None else self._anchor_snapshot(bot)
-        if hist_problem:
-            problems.append(hist_problem)
+        problems.extend(hist_problem or [])  # non-regular or unreadable anchor / history files
         if exists:
             if data is None:
                 warnings.append("anchors/%s.json is unreadable: anchored heads cannot be checked" % bot)
@@ -2207,7 +2364,7 @@ class Ledger:
         found: List[Tuple[str, str]] = []
         if not os.path.isdir(self.anchors_dir):
             return found
-        for name in sorted(os.listdir(self.anchors_dir)):
+        for name in self._witness_listing(self.anchors_dir):
             if not name.endswith(".json") or not os.path.isfile(os.path.join(self.anchors_dir, name)):
                 continue
             bot = name[:-5]
@@ -2231,7 +2388,7 @@ class Ledger:
             return not os.path.isdir(os.path.join(self.logs_dir, name))
 
         if os.path.isdir(self.state_dir):
-            for fname in sorted(os.listdir(self.state_dir)):
+            for fname in self._witness_listing(self.state_dir):
                 if not fname.endswith(".json"):
                     continue
                 name = fname[:-5]
@@ -2248,7 +2405,7 @@ class Ledger:
                               % (name, data.get("seq"), head[:12], name)))
         if os.path.isdir(self.anchors_dir):
             suffix = ".history.jsonl"
-            for fname in sorted(os.listdir(self.anchors_dir)):
+            for fname in self._witness_listing(self.anchors_dir):
                 if not fname.endswith(suffix):
                     continue
                 name = fname[:-len(suffix)]
@@ -2275,7 +2432,7 @@ class Ledger:
         days = os.path.join(self.anchors_dir, "days")
         if os.path.isdir(days):
             rolled: Dict[str, str] = {}
-            for fname in sorted(os.listdir(days)):
+            for fname in self._witness_listing(days):
                 if not fname.endswith(".json") or not _DATE_RE.match(fname[:-5]):
                     continue
                 data = _read_json(os.path.join(days, fname))
@@ -2298,10 +2455,16 @@ class Ledger:
         ``verify --all``, ``verify --bot`` and ``anchor`` all report from this one list: each name once,
         the anchor line first, then the lines of ``orphan_witnesses``."""
         found: Dict[str, List[str]] = {}
+        self._unlistable = []
         for name, anchored_ts in self.anchored_missing():
             found.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
         for name, text in self.orphan_witnesses():
             found.setdefault(name, []).append(text)
+        if self._unlistable:
+            # K2-01: a witness directory that cannot be listed is a FAIL entry of its own. It never stops
+            # `verify --all` or `anchor` from reporting the chains, and it is never read as "nothing deleted".
+            found["(witness files)"] = ["%s: deleted chains cannot be reported" % text
+                                        for text in dict.fromkeys(self._unlistable)]
         return found
 
     def missing_witnesses(self, name: str) -> List[str]:
@@ -2311,6 +2474,30 @@ class Ledger:
         if not name or _chain_key(name) != name or os.path.isdir(os.path.join(self.logs_dir, name)):
             return []
         return self.missing_chains().get(name, [])
+
+    def _witness_listing(self, path: str) -> List[str]:
+        """Sorted entries of a witness directory; a directory that cannot be listed is remembered, not raised."""
+        try:
+            return sorted(os.listdir(path))
+        except OSError as exc:
+            self._unlistable.append("%s cannot be listed (%s)" % (
+                os.path.relpath(path, self.root).replace(os.sep, "/"), exc.__class__.__name__))
+            return []
+
+    def lost_chains_of(self, name: str, present: Iterable[str] = ()) -> Dict[str, List[str]]:
+        """``{chain: [problem lines]}`` for the chains ``name`` selects whose logs are gone while a witness
+        survives: the name as given, its slug and every registered variant (the rule `verify --bot` applies).
+        Chains in ``present`` are on disk and are left out. `anchor --bot` reports from this (K1-04)."""
+        exact = (name or "").strip()
+        have = set(present)
+        slug = self.canonical(exact)
+        registered = self.aliases()["bots"].get(slug)
+        variants = registered.get("aliases") if isinstance(registered, dict) else None
+        candidates = [exact, slug] + [a for a in (variants if isinstance(variants, list) else []) if isinstance(a, str)]
+        gone = [n for n in dict.fromkeys(candidates)
+                if n and n not in have and _chain_key(n) == n and not os.path.isdir(os.path.join(self.logs_dir, n))]
+        lost = self.missing_chains() if gone else {}
+        return {n: lost[n] for n in gone if lost.get(n)}
 
     def seal_break(self, bot: str, descriptor: Dict, jay_approval_id: str, copy_fixture: bool = False) -> Dict:
         """Append one break_ack for an exact on-disk gap. Does not rewrite, quarantine, or rehash.
@@ -2583,8 +2770,18 @@ class Ledger:
         and never while one is held, so it cannot be part of a lock cycle. Its name starts with a dot,
         which no chain name can, so it never collides with a bot lock."""
         self.ensure()
-        with Ledger._Lock(os.path.join(self.state_dir, ".anchors.lock")):
-            return self._anchor(bots)
+        lock = Ledger._Lock(os.path.join(self.state_dir, ".anchors.lock"))
+        with lock:
+            # Remember which file is held: a bot lock that is a hard link of it must not be requested (K2-02).
+            try:
+                st = os.fstat(lock.fh.fileno())
+                self._outer_lock = (st.st_dev, st.st_ino)
+            except (OSError, AttributeError, ValueError):
+                self._outer_lock = None
+            try:
+                return self._anchor(bots)
+            finally:
+                self._outer_lock = None
 
     def _anchor(self, bots: Optional[Iterable[str]] = None) -> Dict:
         """Anchor each chain. OK chains resume from their previous anchor. A FAIL chain records the break and both segment heads.
@@ -2688,7 +2885,14 @@ class Ledger:
             mine = {c["bot"] for c in chains}
             kept = [c for c in earlier if isinstance(c, dict) and isinstance(c.get("bot"), str) and c["bot"] not in mine]
             merged["chains"] = sorted(kept + chains, key=lambda c: str(c.get("bot")))
-        self._atomic_json(day, merged)
+        try:
+            self._atomic_json(day, merged)
+        except OSError as exc:
+            # K2-01: a rollup that cannot be written is reported after every chain line, never instead of them.
+            if os.environ.get("GBLOG_DEBUG"):
+                raise
+            rollup.setdefault("missing", []).append({"bot": "(day rollup)", "ok": False, "problems": [
+                "anchors/days/%s: not written (%s)" % (os.path.basename(day), exc.__class__.__name__)]})
         return rollup
 
     # -- query
@@ -2842,7 +3046,61 @@ class Ledger:
 
 
 # --------------------------------------------------------------------------- report
-def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, str]] = None) -> str:
+def _task_context(ledger: "Ledger", bot: Optional[str], recs: List[Dict], date: str) -> Dict:
+    """``{(slug, task_id): {"start", "title", "end", "outcome"}}`` for tasks of one UTC day that were opened
+    before it (up to 30 days back) or closed after it (K1-01).
+
+    A day report knows only that day's records, so a task that crosses UTC midnight used to be "open" on
+    day D for good and untitled on D+1. Other day files are scanned as raw lines; a line is parsed only
+    when it carries the marker."""
+    seen: Dict[Tuple, List[bool]] = {}
+    for r in recs:
+        tid = r.get("task_id")
+        if tid:
+            flags = seen.setdefault((r.get("bot"), tid), [False, False])
+            flags[0] = flags[0] or r.get("type") == "task_start"
+            flags[1] = flags[1] or r.get("type") == "task_end"
+    want_start = {k for k, f in seen.items() if not f[0]}
+    want_end = {k for k, f in seen.items() if not f[1]}
+    ctx: Dict[Tuple, Dict] = {}
+    if not (want_start or want_end) or not _is_date(date):
+        return ctx
+    floor = (_dt.datetime.strptime(date, "%Y-%m-%d") - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
+    for chain in (ledger.chains_for(bot) if bot else ledger.valid_chains()):
+        slug = ledger.canonical(chain)
+        for path in ledger.log_files(chain):
+            day = os.path.basename(path)[:10]
+            if day > date and want_end:
+                marker, kind, want = b'"task_end"', "task_end", want_end
+            elif floor <= day < date and want_start:
+                marker, kind, want = b'"task_start"', "task_start", want_start
+            else:
+                continue
+            try:
+                with _open_regular(path) as fh:
+                    for raw in fh:
+                        if marker not in raw:
+                            continue
+                        rec = _parse_line(raw)
+                        if rec.get("type") != kind or not isinstance(rec.get("ts"), str):
+                            continue
+                        rec = _text_fields(rec)
+                        key = (slug, rec.get("task_id"))
+                        if key not in want:
+                            continue
+                        slot = ctx.setdefault(key, {})
+                        if kind == "task_end":
+                            if "end" not in slot or rec["ts"] < slot["end"]:  # the first end after the day
+                                slot["end"], slot["outcome"] = rec["ts"], rec.get("outcome")
+                        elif "start" not in slot or rec["ts"] >= slot["start"]:  # the latest start before it
+                            slot["start"], slot["title"] = rec["ts"], rec.get("task") or ""
+            except OSError:
+                continue
+    return ctx
+
+
+def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, str]] = None,
+                  context: Optional[Dict] = None) -> str:
     labels = labels or {}
     lines = ["# %s" % title, ""]
     if not records:
@@ -2894,6 +3152,11 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
                 t["actions"].append(r)
         for tid in order:
             t = tasks[tid]
+            # What other days know about this task (see _task_context): its start and title, or its end.
+            extra = context.get((bot, tid), {}) if context else {}
+            if not t["start"] and extra.get("start"):
+                t["start"] = extra["start"]
+                t["title"] = t["title"] or extra.get("title") or ""
             head = "### %s" % _md(t["title"] or tid)
             if tid != "(no task)":
                 head += "  `%s`" % _md(tid)
@@ -2907,6 +3170,9 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
                 meta.append("outcome **%s**" % _md(t["outcome"]))
                 if t.get("end_chain") and t["chain"] and t["end_chain"] != t["chain"]:
                     meta.append("closed from chain `%s`" % _md(t["end_chain"], 100))
+            elif tid != "(no task)" and extra.get("end"):
+                meta.append("outcome **%s** (closed %s, after this day)" % (_md(extra.get("outcome") or "?"),
+                                                                           _md(extra["end"])))
             elif tid != "(no task)":
                 twin = None
                 if t["title"]:
@@ -3499,6 +3765,15 @@ def _git_env() -> Dict[str, str]:
 def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     # Hooks are never run for the ledger repository (a hook could rewrite or drop what sync commits), and
     # line-ending conversion is off so that the committed bytes are the bytes on disk.
+    # K2-07: git copies the 0o600 ledger files into .git/objects. A private umask keeps those copies private too.
+    old_umask = os.umask(0o077)
+    try:
+        return _git_call(root, args, check)
+    finally:
+        os.umask(old_umask)
+
+
+def _git_call(root: str, args: Tuple[str, ...], check: bool) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.autocrlf=false", "-C", root, *args],
                           check=check, encoding="utf-8", errors="replace", capture_output=True, env=_git_env())
 
@@ -3539,6 +3814,10 @@ def _sync_evidence(ledger: "Ledger") -> Tuple[List[str], Dict[str, Tuple[int, bo
         except OSError:
             return
         if not _stat.S_ISREG(st.st_mode):
+            if check:
+                # K2-04: a symlink (or FIFO, directory) where an evidence file belongs can never match a
+                # committed blob. It is reported as drift; git would commit a link and sync would say "pushed".
+                checked[rel] = (-1, append_only)
             return
         forced.append(rel)
         if check:
@@ -3653,11 +3932,14 @@ def _sync_drift(root: str, checked: Dict[str, Tuple[int, bool]], cache_path: Opt
     # ``cache_path`` (sync passes .git/gblog-sync-cache.json) maps path -> {blob, size, mtime_ns} for the
     # files the last run verified. A file whose HEAD blob id, size and mtime are all unchanged is not hashed
     # again. The size rules below are always applied. Without ``cache_path`` every file is hashed.
-    cache = (_read_json(cache_path) if cache_path else None) or {}
+    cache = (_read_json(cache_path, limit=None) if cache_path else None) or {}
     verified: Dict[str, Dict] = {}
     drift: List[str] = []
     for rel in sorted(checked):
         staged_size, append_only = checked[rel]
+        if staged_size < 0:  # not a regular file on disk (see _sync_evidence)
+            drift.append(rel)
+            continue
         full = os.path.join(root, *rel.split("/"))
         try:
             st = os.stat(full)  # taken before hashing: a change made afterwards has a newer mtime than the cached one
@@ -3741,6 +4023,10 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     ledger.ensure()
     if not os.path.isdir(os.path.join(root, ".git")):
         _git(root, "init", "-q")
+        try:
+            os.chmod(os.path.join(root, ".git"), 0o700)  # created by gblog: private, like the ledger directories
+        except OSError:
+            pass
     if remote:
         # Backups are never silently re-pointed: changing an existing origin needs ``replace_remote``
         # (--replace-remote), and every change of origin is recorded in the ledger.
@@ -3815,11 +4101,15 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     result = {"commit": sha, "committed": committed, "pushed": False, "error": None, "visibility": None, "tail_mismatch": refused}
     # The backup must hold what is on disk. An ignore rule, an index flag or a clean filter can keep new
     # records out of the commit while git reports success; then nothing is pushed and the caller is told.
-    drift = _sync_drift(root, checked, os.path.join(root, ".git", _SYNC_CACHE))
+    # Re-hashed on every run, without the cache: a cache file under .git/ is writable by whoever the check
+    # is meant to catch, and a matching entry would skip the hash.
+    drift = _sync_drift(root, checked)
     if drift:
         result["unverified"] = drift
         result["error"] = "committed content differs from disk for %s%s (git ignore rule, filter or index flag); not pushed" % (
             drift[0], " and %d more file(s)" % (len(drift) - 1) if len(drift) > 1 else "")
+        if os.path.islink(os.path.join(root, *drift[0].split("/"))):
+            result["error"] = "%s is a symbolic link: git stores the link, not the file; not pushed" % drift[0]
         linked = _linked_parent(root, drift[0])
         if linked:
             # git commits a symbolic link as a link: the files behind it are not in the backup, whatever the ignore rules say
@@ -3911,10 +4201,16 @@ __gblog_hook() {
     gblog|gblog\ *|__gblog*) return "$rc";;
   esac
   command -v gblog >/dev/null 2>&1 || return "$rc"
-  local outcome=ok
+  local outcome=ok st=0
   [ "$rc" -eq 0 ] || outcome=fail
-  gblog log --bot "${GBLOG_BOT:-%s}" --task-id "${GBLOG_TASK:-}" --action shell --target="$cmd" \
-    --outcome "$outcome" --source auto >/dev/null 2>&1 || true
+  gblog log --bot "${GBLOG_BOT:-%(bot)s}" --task-id "${GBLOG_TASK:-}" --action shell --target="$cmd" \
+    --outcome "$outcome" --source auto >/dev/null 2>&1 || st=$?
+  # A name in GBLOG_BOT that gblog refuses (exit 2: unregistered in strict alias mode, reserved) must not
+  # lose the event. It is logged under the Bot this hook was installed for, with the refused name in the detail.
+  if [ "$st" -eq 2 ] && [ -n "${GBLOG_BOT:-}" ] && [ "${GBLOG_BOT:-}" != "%(bot)s" ]; then
+    gblog log --bot "%(bot)s" --task-id "${GBLOG_TASK:-}" --action shell --target="$cmd" \
+      --outcome "$outcome" --source auto --detail "GBLOG_BOT=${GBLOG_BOT} was refused" >/dev/null 2>&1 || true
+  fi
   return "$rc"
 }
 case ";$PROMPT_COMMAND;" in *"__gblog_hook"*) ;; *) PROMPT_COMMAND="__gblog_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac
@@ -3948,7 +4244,7 @@ _WEBKIT_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
 
 
 def shell_hook(bot: str) -> str:
-    return SHELL_HOOK % safe_name(bot)
+    return SHELL_HOOK % {"bot": safe_name(bot)}
 
 
 _HOOK_BEGIN = b">>> gblog shell hook >>>"
@@ -3981,9 +4277,9 @@ def _install_shell_hook(bot: str, rc_path: str) -> str:
     stop = len(existing) if stop < 0 else stop + 1
     if existing[start:stop].rstrip(b"\r\n") == hook.rstrip(b"\n"):
         return "present"
-    with open(rc_path, "r+b") as fh:  # written in place: a symlinked rc file and its mode are kept
-        fh.write(existing[:start] + hook + existing[stop:])
-        fh.truncate()
+    # Replaced atomically (K2-12): a write that fails part-way must not leave half a startup file. The link
+    # target is what is replaced, so a symlinked rc file stays a link, and the mode bits are carried over.
+    _atomic_write(os.path.realpath(rc_path), lambda fh: fh.write(existing[:start] + hook + existing[stop:]), mode="wb")
     return "updated"
 
 
@@ -4108,7 +4404,7 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
             copy = os.path.join(tmp, "History")
             shutil.copyfile(path, copy)  # the browser keeps the live DB locked; read a copy
             for suffix in ("-wal", "-journal"):
-                if os.path.exists(path + suffix):
+                if os.path.isfile(path + suffix):  # never a device or directory planted beside the history
                     shutil.copyfile(path + suffix, copy + suffix)
             conn = sqlite3.connect(copy)
             try:
@@ -4185,7 +4481,7 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
     snap_path = os.path.join(ledger.state_dir, "capture-files-%s.json" % bot)
     legacy_snap = snap_path
     moved_from = None
-    held = _read_json(snap_path)
+    held = _read_json(snap_path, limit=None)
     if held is not None and isinstance(held.get("files"), dict) and held.get("path") not in (None, path):
         # The Bot's snapshot belongs to another directory. It is left alone (a run with another --path must not
         # destroy the baseline of the usual one); this directory gets a snapshot file of its own.
@@ -4231,7 +4527,7 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
     elif os.path.exists(snap_path):
         snap_rel = "state/" + os.path.basename(snap_path)
         # None when unreadable, unparsable or not an object
-        snap = held if snap_path == legacy_snap else _read_json(snap_path)
+        snap = held if snap_path == legacy_snap else _read_json(snap_path, limit=None)
         if snap is None or not isinstance(snap.get("files"), dict):
             baseline_reason = "snapshot unreadable"
             sys.stderr.write("notice: %s is unreadable; taking a new baseline (no changes logged this run)\n" % snap_rel)
@@ -4310,6 +4606,12 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
 def _ts_epoch(ts: Optional[str]) -> float:
     if not ts or not isinstance(ts, str):
         return 0.0
+    if not (len(ts) == 20 and ts.endswith("Z")):
+        # a pre-0.6 form (a UTC offset, a space instead of "T"): normalise it; anything else is sliced as before
+        try:
+            ts = parse_ts(ts)
+        except ValueError:
+            pass
     try:
         return _dt.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_dt.timezone.utc).timestamp()
     except ValueError:
@@ -4927,14 +5229,10 @@ def save_proposals(ledger: "Ledger", analysis: Dict) -> Dict:
     fresh = [dict(p, generated=generated) for p in analysis["proposals"]]
     ids = {p["id"] for p in fresh}
     old_list, old_generated = [], None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            old = json.load(fh)
-        if isinstance(old, dict) and isinstance(old.get("proposals"), list):
-            old_list, old_generated = old["proposals"], old.get("generated")
-    except OSError:
-        pass
-    except (ValueError, RecursionError):
+    old = _read_json(path, limit=None)  # K2-09: a FIFO or device planted at the path is never opened
+    if old is not None and isinstance(old.get("proposals"), list):
+        old_list, old_generated = old["proposals"], old.get("generated")
+    elif old is None and os.path.lexists(path):
         sys.stderr.write("notice: tuning/proposals.json was unreadable and has been replaced\n")
     cutoff = _ts_epoch(generated) - _PROPOSAL_KEEP_DAYS * 86400
     kept = []
@@ -4957,9 +5255,11 @@ def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool =
     path = os.path.join(ledger.tuning_dir, "proposals.json")
     if not os.path.exists(path):
         raise ValueError("no proposals yet; run `gblog tune` first")
+    doc = _read_json(path, limit=None)  # K2-09: never blocks on a FIFO planted at the path
     try:
-        with open(path, encoding="utf-8") as fh:
-            proposals = json.load(fh).get("proposals", [])
+        if doc is None:
+            raise ValueError("unreadable")
+        proposals = doc.get("proposals", [])
         match = [p for p in proposals if p["id"] == pid]
     except (ValueError, AttributeError, TypeError, KeyError, RecursionError):
         raise ProposalsCorruptError("%s is corrupt" % os.path.relpath(path, ledger.root).replace(os.sep, "/"))
@@ -4971,7 +5271,8 @@ def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool =
     keep = {k: p.get(k) for k in ("title", "category", "key", "metric", "baseline", "better", "window")}
     if _is_int(p.get("count")):
         keep["count"] = p["count"]  # evidence count at decision time (used to decide when a rejection resurfaces)
-    return ledger.append(p["bot"], {"type": "tune", "action": "other", "target": pid, "outcome": "skipped" if reject else "ok",
+    # canonical(): the decision follows the Bot when its name was registered as an alias after `gblog tune` ran
+    return ledger.append(ledger.canonical(p["bot"]), {"type": "tune", "action": "other", "target": pid, "outcome": "skipped" if reject else "ok",
                                     "detail": detail or ("rejected" if reject else "applied"), "proposal": keep})
 
 
@@ -4997,6 +5298,24 @@ def _norm_outcome(value: str) -> str:
     """argparse ``type=`` for --outcome. It runs before ``choices``, so common synonyms are accepted and stored canonically."""
     v = str(value).strip().lower()
     return _OUTCOME_SYNONYMS.get(v, v)
+
+
+_DECISION_SYNONYMS = {
+    "approved": "allowed", "approve": "allowed", "allow": "allowed", "granted": "allowed", "yes": "allowed",
+    "rejected": "denied", "declined": "denied", "deny": "denied", "refused": "denied", "no": "denied",
+    "timeout": "expired", "timed-out": "expired", "automatic": "auto",
+}
+
+
+def _norm_decision(value: str) -> str:
+    """argparse ``type=`` for --decision: common synonyms are stored canonically, like --outcome (K1-11)."""
+    v = str(value).strip().lower()
+    return _DECISION_SYNONYMS.get(v, v)
+
+
+def _norm_action(value: str) -> str:
+    """argparse ``type=`` for --action: ``computer-use`` is ``computer_use``."""
+    return str(value).strip().lower().replace("-", "_")
 
 
 def _source_field(args: argparse.Namespace) -> Optional[str]:
@@ -5029,6 +5348,53 @@ def _task_start_seen(ledger: "Ledger", bot: str, task_id: str, ts: Optional[str]
         return False
     except (OSError, ValueError, TypeError, AttributeError):
         return True  # unreadable history: stay quiet rather than warn wrongly
+
+
+def _task_status(ledger: "Ledger", bot: str, task_id: str, ts: Optional[str] = None, days: int = 30) -> str:
+    """``open``, ``closed`` or ``unknown`` for a task id in the Bot's chains (K1-06).
+
+    Day files of the last ``days`` days are scanned newest first as raw lines; a line is parsed only when
+    it contains the id as JSON text. The latest task_start / task_end of the newest file that has one decides."""
+    stored = redact(task_id) or task_id  # what append stored for this id
+    needle = json.dumps(stored, ensure_ascii=False).encode("utf-8", "backslashreplace")
+    now = _utcnow().replace(tzinfo=None)
+    try:
+        base = min(now, _dt.datetime.strptime(str(ts or "")[:10], "%Y-%m-%d"))
+    except ValueError:
+        base = now
+    since = (base - _dt.timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        files = sorted(((os.path.basename(p)[:10], p) for c in ledger.chains_for(bot) for p in ledger.log_files(c)
+                        if os.path.basename(p)[:10] >= since), reverse=True)
+        for _day, path in files:
+            last = None
+            with _open_regular(path) as fh:
+                for raw in fh:
+                    if needle not in raw:
+                        continue
+                    rec = _parse_line(raw)
+                    if rec.get("task_id") == stored and rec.get("type") in ("task_start", "task_end"):
+                        last = "open" if rec["type"] == "task_start" else "closed"
+            if last:
+                return last
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "open"  # unreadable history: stay quiet rather than warn wrongly
+    return "unknown"
+
+
+def _warn_task(ledger: "Ledger", args: argparse.Namespace, task_id: Optional[str]) -> None:
+    """After a logging command: say so on stderr when its task id names no open task (stdout and exit code unchanged).
+
+    Records captured without the Bot (``--source auto``, the shell hook) are not checked."""
+    if not task_id or getattr(args, "source", None) == "auto":
+        return
+    status = _task_status(ledger, args.bot, task_id, getattr(args, "ts", None))
+    if status == "unknown":
+        sys.stderr.write("warning: task '%s' has no task-start in the last 30 days of %s; recorded anyway "
+                         "(check --task-id / $GBLOG_TASK)\n" % (_term(task_id), args.bot))
+    elif status == "closed":
+        sys.stderr.write("warning: task '%s' is already closed; recorded anyway (unset GBLOG_TASK or open a new task)\n"
+                         % _term(task_id))
 
 
 def _orphan_alerts(ledger: "Ledger", only: Optional[str] = None) -> List[Dict]:
@@ -5170,14 +5536,15 @@ def _build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("log", help="append one action record")
     _add_common(s)
     s.add_argument("--type", default="action", choices=RECORD_TYPES)
-    s.add_argument("--action", default="other", choices=ACTION_KINDS, help="kind of action")
+    s.add_argument("--action", default="other", type=_norm_action, choices=ACTION_KINDS, help="kind of action")
     s.add_argument("--target", help="what was acted on: host/path, command, connector.tool, file, recipient")
     s.add_argument("--outcome", default="ok", type=_norm_outcome, choices=OUTCOMES)
 
     s = sub.add_parser("approval", help="record an approval request and its decision")
     _add_common(s)
     s.add_argument("--target", required=True, help="the proposed action")
-    s.add_argument("--decision", required=True, choices=("allowed", "denied", "pending", "expired", "auto"))
+    s.add_argument("--decision", required=True, type=_norm_decision,
+                   choices=("allowed", "denied", "pending", "expired", "auto"))
 
     s = sub.add_parser("task-end", help="close a task")
     _add_common(s)
@@ -5308,6 +5675,23 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _write_markdown(path: str, text: str) -> None:
+    """Write a report or tuning file by atomic replace (K2-05).
+
+    A symlink at the path is an error, as before. A hard link or FIFO planted there is replaced by a
+    regular file; nothing is truncated in place and nothing is written through either."""
+    if os.path.islink(path):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+    _atomic_write(path, lambda fh: fh.write(text), errors="backslashreplace")
+
+
+def _warn_unknown_bot(ledger: Ledger, name: Optional[str]) -> None:
+    """Readers (K1-03): say so when --bot selects nothing on disk. `verify --bot` reports the same name as FAIL;
+    an empty report for a mistyped name must not read as "no activity"."""
+    if name and not ledger.chains_on_disk(name):
+        sys.stderr.write("warning: no chain on disk for '%s'; nothing to show (see `gblog alias list`)\n" % _term(name))
+
+
 def _resolve_bot(ledger: Ledger, name: str) -> str:
     slug, known = ledger.resolve(name)
     if not known:
@@ -5336,6 +5720,9 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.date = (_dt.datetime.strptime(today(), "%Y-%m-%d") - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
         elif not _is_date(args.date):
             raise _UsageError("--date must be YYYY-MM-DD, today or yesterday")
+    if args.cmd in ("report", "export") and args.since in ("today", "yesterday"):  # the words --date accepts
+        back = _dt.timedelta(days=0 if args.since == "today" else 1)
+        args.since = (_dt.datetime.strptime(today(), "%Y-%m-%d") - back).strftime("%Y-%m-%d")
     if args.cmd in ("report", "export") and args.since and not _is_date(args.since):
         raise _UsageError("--since must be YYYY-MM-DD")
     if args.cmd == "capture" and args.what == "browser" and args.hours < 0:
@@ -5411,8 +5798,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
         args.task_id = os.environ.get("GBLOG_TASK") or None  # same fallback `log` and `archive` already had
     if args.cmd == "archive" and _source_field(args):
         sys.stderr.write("warning: --source is not stored on archive records\n")
+    if args.cmd == "archive" and args.task:
+        sys.stderr.write("warning: --task is not stored on archive records\n")
     # Readers skip unreadable log lines; these commands say so on stderr (stdout is unchanged).
     ledger.warn_skipped = args.cmd in ("report", "export", "tail", "status", "coverage", "tune")
+    if getattr(args, "bot", None) and (args.cmd in ("report", "export", "tail", "status", "coverage")
+                                        or (args.cmd == "tune" and not (args.apply or args.reject))):
+        _warn_unknown_bot(ledger, args.bot)
 
     if args.cmd == "init":
         ledger.init()
@@ -5421,6 +5813,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "task-start":
         tid = args.task_id or uuid.uuid4().hex[:10]
+        if args.task_id and _task_status(ledger, args.bot, args.task_id, args.ts) != "unknown":
+            sys.stderr.write("warning: task id '%s' was already used by %s in the last 30 days; reports will merge "
+                             "both runs\n" % (_term(args.task_id), args.bot))
+        if not args.task:
+            sys.stderr.write("warning: task-start without --task: the task has no title\n")
         ledger.append(args.bot, {"type": "task_start", "task_id": tid, "task": args.task, "detail": args.detail, "source": _source_field(args), "ts": args.ts})
         out.write(tid + "\n")
         return 0
@@ -5430,6 +5827,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
                                        "action": args.action, "target": args.target, "outcome": args.outcome, "detail": args.detail,
                                        "source": _source_field(args), "ts": args.ts})
         out.write("%s #%d %s\n" % (rec["hash"][:12], rec["seq"], rec["type"]))
+        if args.type not in ("task_start", "task_end"):
+            _warn_task(ledger, args, args.task_id or os.environ.get("GBLOG_TASK"))
         return 0
 
     if args.cmd == "approval":
@@ -5437,6 +5836,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         rec = ledger.append(args.bot, {"type": "approval", "task_id": args.task_id, "task": args.task, "target": args.target, "source": _source_field(args),
                                        "outcome": outcome, "decision": args.decision, "detail": args.detail, "ts": args.ts})
         out.write("%s #%d approval %s\n" % (rec["hash"][:12], rec["seq"], args.decision))
+        _warn_task(ledger, args, args.task_id)
         return 0
 
     if args.cmd == "task-end":
@@ -5453,6 +5853,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "note":
         rec = ledger.append(args.bot, {"type": "note", "task_id": args.task_id, "task": args.task, "detail": args.detail, "source": _source_field(args), "ts": args.ts})
         out.write("%s #%d note\n" % (rec["hash"][:12], rec["seq"]))
+        _warn_task(ledger, args, args.task_id)
         return 0
 
     if args.cmd == "verify":
@@ -5480,6 +5881,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         # Chains that left a witness (anchor, anchor history, state head) but have no logs/<name>: name -> problem lines.
         missing: Dict[str, List[str]] = {}
         invalid: List[str] = []
+        if args.all and args.bot:
+            sys.stderr.write("notice: --all given; --bot %s is ignored\n" % _term(args.bot))
         if args.all or not args.bot:
             invalid = ledger.invalid_chain_dirs()  # never handed to Ledger.verify: safe_name() would check another chain
             bots = [b for b in ledger.bots() if b not in invalid]
@@ -5581,7 +5984,15 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 heads = " ".join(str(h)[:12] for h in (c.get("segment_heads") or []))
                 where = "%s:%s seq %s->%s" % (br.get("file"), br.get("line_after"), br.get("seq_before"), br.get("seq_after")) if br else "-"
                 out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (c["bot"], _term(where), heads))
-        lost_chains = rollup.get("missing") or []
+                for prob in c.get("problems") or []:
+                    if str(prob).startswith("anchor aborted"):  # nothing else says why this chain has no anchor
+                        out.write("      - %s\n" % _term(prob))
+        lost_chains = list(rollup.get("missing") or [])
+        if args.bot:
+            # K1-04: a chain of this Bot whose logs are gone while a witness survives is a FAIL here,
+            # as it is in `verify --bot`. Its witness files are left exactly as they are.
+            named = ledger.lost_chains_of(args.bot, bots or [])
+            lost_chains += [{"bot": n, "ok": False, "problems": named[n]} for n in named]
         for m in lost_chains:  # logs/<bot> is gone while a witness survives: reported, never skipped
             # the name comes from a file name under anchors/ or state/, the text from an anchor file: no raw escapes
             out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (_term(m["bot"]), "-", ""))
@@ -5594,6 +6005,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             recs = ledger.records(bot, since=args.since)
             title = "Activity report since %s" % args.since
             fname = "since-%s" % args.since
+            date = None
         else:
             date = args.date or today()
             recs = ledger.records(bot, date=date)
@@ -5604,13 +6016,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
             fname += "-" + (_chain_key(bot) or "bot")  # never a path separator in the report file name
         recs = ledger.canonicalize(recs)
         labels = {b: ledger.label(b) for b in {r.get("bot", "?") for r in recs}}
-        text = render_report(recs, title, labels)
+        # A day report also asks the neighbouring days where its tasks began and ended (K1-01).
+        text = render_report(recs, title, labels, _task_context(ledger, bot, recs, date) if date else None)
         out.write(text)
         if not args.stdout:
             ledger.ensure()
             path = os.path.join(ledger.reports_dir, fname + ".md")
-            with _open_private(path, "w", encoding="utf-8", errors="backslashreplace") as fh:
-                fh.write(text)
+            _write_markdown(path, text)
             sys.stderr.write("wrote %s\n" % os.path.relpath(path, ledger.root))
         return 0
 
@@ -5622,6 +6034,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             want = ledger.canonical(args.bot)
             groups = {k: v for k, v in groups.items() if (ledger.canonical(k) if args.chains else k) == want}
         month = _days_ago(30)
+        open_lists: Dict[str, List[Dict]] = {}  # row key -> its open tasks, oldest first (`open_task_list`)
         today_day = today()  # evaluated once, not once per record
         for key, chains in groups.items():
             views = {c: ledger._state_view(c) for c in chains}  # one typed read of each chain's state
@@ -5632,15 +6045,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
             last_sync = max(syncs, key=lambda s: s["ts"]) if syncs else None
             # chain_records reads exactly one chain directory; records(c) would merge every alias chain once per chain.
             recent = [r for c in chains for r in ledger.chain_records(c, since=month)]
-            open_tasks = set()
+            open_tasks: Dict[str, Dict] = {}
             for r in sorted(recent, key=lambda r: str(r.get("ts") or "")):
                 tid = r.get("task_id")
                 if not tid:
                     continue  # a task record without an id neither opens nor closes a task
                 if r.get("type") == "task_start":
-                    open_tasks.add(tid)
+                    open_tasks[tid] = {"task_id": tid, "task": r.get("task") or "", "started": r.get("ts"),
+                                       "chain": r.get("bot")}
                 elif r.get("type") == "task_end":
-                    open_tasks.discard(tid)
+                    open_tasks.pop(tid, None)
+            open_lists[key] = sorted(open_tasks.values(), key=lambda t: str(t.get("started") or ""))
             # A clamped record counts on the day its wall clock showed (clock_regressed), not on the pinned chain day.
             today_n = sum(1 for r in recent
                           if str((r.get("clock_regressed") if isinstance(r.get("clock_regressed"), str) else r.get("ts")) or "")
@@ -5650,6 +6065,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
                          "updated": updated or None, "today": today_n, "open_tasks": len(open_tasks), "last_sync": last_sync})
         chain_alerts: Dict[str, Tuple[Optional[str], int]] = {}  # one alert_info() per chain, reused for the ALERT lines
         for r in rows:
+            r["open_task_list"] = open_lists.get(r["bot"], [])  # K1-01: the ids behind the `open_tasks` count
             for c in r["chains"]:
                 chain_alerts[c] = ledger.alert_info(c)
             alerts = [chain_alerts[c] for c in r["chains"]]
@@ -5746,6 +6162,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             return 2
         rec = archive_file(ledger, args.bot, data, name, args.kind, args.task_id or os.environ.get("GBLOG_TASK"), args.detail,
                            do_redact=not args.no_redact, ts=args.ts)
+        _warn_task(ledger, args, args.task_id or os.environ.get("GBLOG_TASK"))
         out.write("%s #%d archive %s sha256=%s %d bytes%s%s\n" % (rec["hash"][:12], rec["seq"], rec["path"], rec["sha256"][:12], rec["bytes"],
                                                                  " (redacted)" if rec.get("redacted") else "", " (already stored)" if rec.get("_dedup") else ""))
         return 0
@@ -5885,8 +6302,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             save_proposals(ledger, analysis)  # merged by id; a --bot run keeps the other Bots' ids valid
             # a --bot run gets a file of its own (like `report`), so it does not overwrite the all-Bots file
             path = os.path.join(ledger.tuning_dir, today() + (("-" + (_chain_key(bot) or "bot")) if bot else "") + ".md")
-            with _open_private(path, "w", encoding="utf-8", errors="backslashreplace") as fh:
-                fh.write(render_tune(analysis, "Tuning proposals %s" % today(), labels))
+            _write_markdown(path, render_tune(analysis, "Tuning proposals %s" % today(), labels))
             sys.stderr.write("wrote %s\n" % os.path.relpath(path, ledger.root))
         return 0
 
@@ -5906,7 +6322,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "spool":
         if args.what == "list":
-            chains = [ledger.chain_name(args.bot)] if args.bot else ledger.spool_bots()
+            # every chain of the Bot, as `status --bot` shows their alerts (K1-05)
+            chains = ledger.spool_chains_for(args.bot) if args.bot else ledger.spool_bots()
             shown = 0
             for chain in chains:
                 for path in ledger.spool_files(chain):
@@ -5940,6 +6357,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 return 4
             out.write("replayed %d spooled event(s) for %s%s\n" % (
                 len(res["replayed"]), chain, "; alert resolved" if res["alert_resolved"] else ""))
+            siblings = [c for c in ledger.spool_chains_for(args.bot)[1:] if ledger.spool_files(c)]
+            if siblings:  # replay stays per chain on purpose; say where the rest is
+                sys.stderr.write("note: spooled event(s) are pending in chain(s) %s; replay each with "
+                                 "gblog spool replay --bot <chain>\n" % _term(", ".join(siblings)))
             return 2 if (res["skipped"] or res.get("rejected")) else 0
 
     return 1
