@@ -825,6 +825,62 @@ def is_reserved(name: str) -> bool:
 
 
 # --------------------------------------------------------------------------- store
+class _ChainLines:
+    """The log lines of one chain for ``Ledger.verify``: bytes read under the bot lock, parsed on first use.
+
+    Iterating yields ``(rel, lineno, record, text)`` for every non-blank line, like ``Ledger._chain_snapshot``.
+    The bytes of a file are released as soon as that file is parsed. ``text`` (the stripped line as written)
+    is kept only with ``keep_text`` (verify --strict compares it with the canonical form); otherwise it is
+    None, so a default verify does not hold every line a second time."""
+
+    def __init__(self, raw_logs: List[Tuple[str, bytes]], dup_lines: Optional[set] = None, keep_text: bool = False):
+        self._raw: Optional[List[Tuple[str, bytes]]] = raw_logs
+        self._dup_lines = dup_lines
+        self._keep_text = keep_text
+        self._lines: Optional[List[Tuple[str, int, Dict, Optional[str]]]] = None
+
+    def __iter__(self):
+        if self._lines is None:
+            if self._raw is None:  # an earlier parse failed part-way: never hand out half a chain
+                raise RuntimeError("chain lines could not be parsed")
+            raw_logs, self._raw = self._raw, None
+            self._lines = self._parse(raw_logs)
+        return iter(self._lines)
+
+    def _parse(self, raw_logs: List[Tuple[str, bytes]]) -> List[Tuple[str, int, Dict, Optional[str]]]:
+        lines: List[Tuple[str, int, Dict, Optional[str]]] = []
+        repeated: List[bool] = []
+
+        def pairs(items):
+            obj = dict(items)
+            if len(obj) != len(items):
+                repeated.append(True)
+            return obj
+
+        for i in range(len(raw_logs)):
+            rel, data = raw_logs[i]
+            raw_logs[i] = (rel, b"")  # the bytes of a parsed file are not kept
+            # Split on LF only, exactly like iterating the file: line numbers and blank lines are the same.
+            for lineno, raw in enumerate(data.split(b"\n"), 1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                del repeated[:]
+                text: Optional[str] = None
+                try:
+                    text = raw.decode("utf-8")  # decoded once; a line that is not UTF-8 is a corrupt record
+                    rec = json.loads(text, object_pairs_hook=pairs)
+                except (ValueError, RecursionError):
+                    rec = None
+                if not isinstance(rec, dict):
+                    rec = {"_corrupt": True}
+                elif repeated and self._dup_lines is not None:
+                    self._dup_lines.add((rel, lineno))  # a JSON object in this line repeats a key
+                lines.append((rel, lineno, rec, text if self._keep_text else None))
+            del data
+        return lines
+
+
 class Ledger:
     def __init__(self, root: Optional[str] = None):
         self.root = os.path.abspath(root or default_root())
@@ -1078,8 +1134,19 @@ class Ledger:
             e.setdefault("aliases", [])
         return data, False
 
+    # Set by the CLI: state/aliases.json is read once per command instead of once per name lookup.
+    # Library callers keep reading it on every call (tests and operators rewrite the file between calls).
+    # Updates never use the cached copy: they read the file again under aliases.lock (_aliases_for_update).
+    cache_aliases = False
+    _aliases_cached: Optional[Tuple[Dict, bool]] = None
+
     def aliases(self) -> Dict:
-        data, unreadable = self._read_aliases()
+        if self.cache_aliases and self._aliases_cached is not None:
+            data, unreadable = self._aliases_cached
+        else:
+            data, unreadable = self._read_aliases()
+            if self.cache_aliases:
+                self._aliases_cached = (data, unreadable)
         if unreadable:
             key = self.aliases_path()
             if key not in _ALIASES_WARNED:
@@ -1090,6 +1157,7 @@ class Ledger:
 
     def _aliases_lock(self) -> "Ledger._Lock":
         """Exclusive lock for a read-modify-write of the alias registry. A leaf lock: nothing else is taken while it is held."""
+        self._aliases_cached = None  # a registry update starts here: what aliases() cached is stale from now on
         self.ensure()
         lock_path = os.path.join(self.state_dir, "aliases.lock")
         _touch_private(lock_path)
@@ -1356,7 +1424,7 @@ class Ledger:
         _atomic_write(path, emit)
 
     def _append_line(self, path: str, line: str) -> None:
-        """O_APPEND + fsync of the file and its directory. Never rewrites earlier bytes."""
+        """O_APPEND + fsync of the file, and of its directory when the file is new. Never rewrites earlier bytes."""
         _makedirs(os.path.dirname(path))
         data = line.encode("utf-8")
         # A new day file is private (0o600). O_RDWR only so the last byte can be inspected.
@@ -1400,7 +1468,10 @@ class Ledger:
             os.fsync(fd)
         finally:
             os.close(fd)
-        _fsync_dir(os.path.dirname(path))
+        if size == 0:
+            # Only a new (or still empty) file needs its directory entry made durable. An append to a file
+            # that already had data changes nothing in the directory.
+            _fsync_dir(os.path.dirname(path))
 
     def _refuse_tail(self, bot: str, record: Dict, expected_seq: int, expected_head: str, observed: Dict) -> None:
         """Keep the event, raise, and do not touch the chain. Alert is the spool plus state/<bot>.alert.json.
@@ -1456,7 +1527,7 @@ class Ledger:
         if corrupt or rec["seq"] != _state_head({"seq": seq})[0] or rec.get("hash") != head:
             self._refuse_tail(bot, record, seq, head, observed)
 
-    def _append_head(self, bot: str) -> Tuple[int, object, Optional[Dict], Optional[Dict], str]:
+    def _append_head(self, bot: str, seen: Optional[List] = None) -> Tuple[int, object, Optional[Dict], Optional[Dict], str]:
         """Decide what the next append links to. Reads only; never spools.
 
         Returns ``(seq, head, tail_record, observed, recovered)``. ``observed`` is None when the
@@ -1475,6 +1546,8 @@ class Ledger:
         path, tail = self._tail_record(bot)
         state_exists = os.path.exists(self._state_path(bot))
         state = self._load_state(bot) if state_exists else None
+        if seen is not None:
+            seen.append(state)  # handed to append(), which updates and writes it within the same lock hold
         seq, head = _state_head(state)
         if path is None or tail is None:
             if not state_exists or (head == GENESIS and (seq == 0 or not self.log_files(bot))):
@@ -1523,7 +1596,8 @@ class Ledger:
                 raise TimestampError("--ts must look like %s" % TS_HINT)
         self.ensure()
         with self.lock(bot):
-            seq, head, tail, observed, recovered = self._append_head(bot)
+            seen: List[Optional[Dict]] = []  # state/<bot>.json as _append_head read it; reused for the update below
+            seq, head, tail, observed, recovered = self._append_head(bot, seen)
             if observed is not None:
                 self._refuse_tail(bot, record, seq, head, observed)
             if _guard is not None:
@@ -1569,10 +1643,30 @@ class Ledger:
             full["hash"] = compute_hash(full)
             path = os.path.join(self.logs_dir, bot, today(ts) + ".jsonl")
             self._append_line(path, json.dumps(full, ensure_ascii=False, sort_keys=True) + "\n")
-            state = self.read_state(bot)
+            # The state read at the top of this lock hold is still current (state writers take this lock),
+            # so the file is not read a second time.
+            state = seen[0] if seen else self._load_state(bot)
+            if state is None:
+                state = {"seq": 0, "head": GENESIS}
             state.update({"seq": full["seq"], "head": full["hash"], "updated": ts})
             self.write_state(bot, state)
             return full
+
+    def _chain_lines(self, bot: str, dup_lines: Optional[set] = None,
+                     keep_text: bool = False) -> Tuple["_ChainLines", List[str]]:
+        """Read every log file of one chain as bytes: ``(lines, log file names)``.
+
+        verify() calls this under the shared bot lock, so the lock is held for the reads only. The lines
+        are parsed when ``lines`` is first iterated, which verify() does after it has released the lock.
+        ``dup_lines`` receives ``(file, line)`` of every line in which a JSON object repeats a key."""
+        raw_logs: List[Tuple[str, bytes]] = []
+        log_names: List[str] = []
+        for path in self.log_files(bot):
+            rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+            log_names.append(rel)
+            with open(path, "rb") as fh:
+                raw_logs.append((rel, fh.read()))
+        return _ChainLines(raw_logs, dup_lines, keep_text), log_names
 
     def _chain_items(self, bot: str) -> List[Tuple[str, int, Dict]]:
         items = []
@@ -1585,8 +1679,8 @@ class Ledger:
                         paths: Optional[Iterable[str]] = None) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
         """Every non-blank log line of one chain as ``(rel, lineno, record, text)``, plus the log file names.
 
-        ``text`` is the stripped line as written (None when it is not UTF-8). verify() calls this once,
-        under the shared lock, and derives the walk, the layout findings and the hash set from it."""
+        ``text`` is the stripped line as written (None when it is not UTF-8). The lines are parsed while
+        the files are read. verify() uses ``_chain_lines`` instead: it reads under the lock and parses later."""
         snap_lines: List[Tuple[str, int, Dict, Optional[str]]] = []
         log_names: List[str] = []
         # ``paths``: the regular log files verify() already found in its one directory scan
@@ -2456,6 +2550,56 @@ class Ledger:
         return rollup
 
     # -- query
+    def tail_records(self, bot: Optional[str] = None, n: int = 20) -> List[Dict]:
+        """The last ``n`` records of one Bot (all its chains) or of every valid chain directory, oldest first.
+
+        The result equals ``records(bot)[-n:]`` for every chain whose timestamps do not go backwards
+        (every chain that passes verify). Each chain's day files are read newest first and reading stops
+        once ``n`` readable records of that chain are collected, so the cost does not grow with the ledger.
+        ``skipped_lines`` (and the stderr warning) covers only the files that were read."""
+        if n <= 0:
+            return []
+
+        def _order(r: Dict) -> Tuple[str, str, int]:
+            return str(r.get("ts") or ""), str(r.get("bot") or ""), _seq_int(r.get("seq"))
+
+        out: List[Dict] = []
+        for chain in (self.chains_for(bot) if bot else self.valid_chains()):
+            per_file: List[List[Dict]] = []
+            have = skipped = 0
+            for path in reversed(self.log_files(chain)):
+                recs: List[Dict] = []
+                for _path, _lineno, rec in self.iter_records(chain, [path]):
+                    if "_corrupt" in rec or not isinstance(rec.get("ts", ""), str) or not isinstance(rec.get("bot", ""), str):
+                        skipped += 1
+                        continue
+                    rec = _text_fields(rec)
+                    if rec.get("bot") != chain:  # attributed to the directory it is stored in, like records()
+                        rec = dict(rec, bot=chain, bot_field=rec.get("bot"))
+                    recs.append(rec)
+                per_file.append(recs)
+                have += len(recs)
+                if have >= n:
+                    break
+            self._note_skipped(chain, skipped)
+            newest = [rec for recs in reversed(per_file) for rec in recs]  # back in file order
+            newest.sort(key=_order)
+            out.extend(newest[-n:])
+        out.sort(key=_order)
+        return out[-n:]
+
+    @staticmethod
+    def _clamped_candidates(paths: Iterable[str]) -> Iterator[Dict]:
+        """Parsed lines of ``paths`` that mention ``clock_regressed``.
+
+        ``records(date=...)`` looks for clamped records in every later day file. A line without that key
+        cannot be one, so it is skipped before it is parsed."""
+        for path in paths:
+            with open(path, "rb") as fh:
+                for raw in fh:
+                    if b'"clock_regressed"' in raw:
+                        yield _parse_line(raw)
+
     def chain_records(self, chain: str, since: Optional[str] = None, raw: bool = False) -> List[Dict]:
         """Records of exactly one chain directory (no alias merging), oldest first. ``since`` is YYYY-MM-DD.
 
@@ -2508,10 +2652,17 @@ class Ledger:
             for rec in self._readable(b, files, raw):
                 if since and rec.get("ts", "") < since:
                     continue
+                clock = rec.get("clock_regressed") if date else None
+                if (isinstance(clock, str) and clock[:10] < date
+                        and _DATE_RE.match(date) and _DATE_RE.match(clock[:10])):
+                    # Clamped across midnight: the record belongs to the day its wall clock showed. That
+                    # day's report finds it through the later-file scan below, so it is listed exactly once
+                    # (and `status` counts it on the same day).
+                    continue
                 if not raw and rec.get("bot") != b:
                     rec = dict(rec, bot=b, bot_field=rec.get("bot"))
                 out.append(rec)
-            for _path, _lineno, rec in (self.iter_records(b, later) if later else ()):
+            for rec in self._clamped_candidates(later):
                 clock = rec.get("clock_regressed")
                 if "_corrupt" in rec or not isinstance(clock, str) or clock[:10] != date:
                     continue  # only records whose wall clock showed the requested day
@@ -3133,7 +3284,24 @@ def _git_blob_id(path: str, size: int, hexlen: int) -> Optional[str]:
     return h.hexdigest()
 
 
-def _sync_drift(root: str, checked: Dict[str, Tuple[int, bool]]) -> List[str]:
+_SYNC_CACHE = "gblog-sync-cache.json"  # lives under .git/: never committed and not part of the ledger tree
+
+
+def _write_sync_cache(path: str, entries: Dict[str, Dict]) -> None:
+    """Replace the sync cache. Best effort: the cache only saves hashing, so failing to write it is not an error."""
+    tmp = _tmp_name(path)
+    try:
+        with _open_private(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _sync_drift(root: str, checked: Dict[str, Tuple[int, bool]], cache_path: Optional[str] = None) -> List[str]:
     """Evidence files whose bytes in ``HEAD`` are not the bytes on disk (or that are not in ``HEAD`` at all).
 
     Catches what ``git add`` can be talked out of: ignore rules, assume-unchanged / skip-worktree index
@@ -3157,22 +3325,34 @@ def _sync_drift(root: str, checked: Dict[str, Tuple[int, bool]]) -> List[str]:
             tree[raw.decode("utf-8")] = (fields[2].decode("ascii"), int(fields[3]))
         except (UnicodeDecodeError, ValueError):
             continue
+    # ``cache_path`` (sync passes .git/gblog-sync-cache.json) maps path -> {blob, size, mtime_ns} for the
+    # files the last run verified. A file whose HEAD blob id, size and mtime are all unchanged is not hashed
+    # again. The size rules below are always applied. Without ``cache_path`` every file is hashed.
+    cache = (_read_json(cache_path) if cache_path else None) or {}
+    verified: Dict[str, Dict] = {}
     drift: List[str] = []
     for rel in sorted(checked):
         staged_size, append_only = checked[rel]
         full = os.path.join(root, *rel.split("/"))
         try:
-            now_size = os.path.getsize(full)
+            st = os.stat(full)  # taken before hashing: a change made afterwards has a newer mtime than the cached one
         except OSError:
             continue  # gone since it was staged: nothing to compare
+        now_size = st.st_size
         blob = tree.get(rel)
         ok = False
         if blob is not None:
             sha, size = blob
             ok = (staged_size <= size <= now_size) if append_only else (size == now_size)
-            ok = ok and _git_blob_id(full, size, len(sha)) == sha
+            if ok:
+                entry = {"blob": sha, "size": now_size, "mtime_ns": st.st_mtime_ns}
+                ok = cache.get(rel) == entry or _git_blob_id(full, size, len(sha)) == sha
+                if ok:
+                    verified[rel] = entry
         if not ok:
             drift.append(rel)
+    if cache_path and verified != cache:
+        _write_sync_cache(cache_path, verified)
     return drift
 
 
@@ -3254,7 +3434,7 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None, "visibility": None, "tail_mismatch": refused}
     # The backup must hold what is on disk. An ignore rule, an index flag or a clean filter can keep new
     # records out of the commit while git reports success; then nothing is pushed and the caller is told.
-    drift = _sync_drift(root, checked)
+    drift = _sync_drift(root, checked, os.path.join(root, ".git", _SYNC_CACHE))
     if drift:
         result["unverified"] = drift
         result["error"] = "committed content differs from disk for %s%s (git ignore rule, filter or index flag); not pushed" % (
@@ -3660,6 +3840,23 @@ def coverage(records: List[Dict], window_minutes: int = 30) -> Dict:
     by_key: Dict[Tuple[str, str], Dict] = {}
     unmatched: List[Dict] = []
     used = set()
+    from bisect import bisect_left
+    # Self-reports are indexed once by (bot, action, normalised target), in record order, with their time.
+    # An observed action is then compared only with the reports that can match it, and no timestamp or
+    # target is parsed more than once. The matches are the same as with a scan over every self-report.
+    index: Dict[Tuple, Tuple[List[int], List[float]]] = {}
+    for i, s in enumerate(self_recs):
+        try:
+            s_target = norm_target(s.get("action"), s.get("target"))
+            if not s_target:
+                continue  # an empty target never matches
+            ids, times = index.setdefault((s.get("bot"), s.get("action"), s_target), ([], []))
+        except (AttributeError, TypeError):
+            continue  # a raw record with an unusable target, bot or action cannot be matched
+        ids.append(i)
+        times.append(_ts_epoch(s.get("ts")))
+    # Where a list is in time order (it is for records read from a ledger) the window is found by bisection.
+    in_order = {k: all(x <= y for x, y in zip(v[1], v[1][1:])) for k, v in index.items()}
     for a in auto:
         key = (a.get("bot", "?"), a.get("action") or "other")
         slot = by_key.setdefault(key, {"auto": 0, "matched": 0})
@@ -3667,13 +3864,16 @@ def coverage(records: List[Dict], window_minutes: int = 30) -> Dict:
         t_a = _ts_epoch(a.get("observed") or a.get("ts"))
         want = norm_target(a.get("action"), a.get("target"))
         hit = None
-        for i, s in enumerate(self_recs):
-            if i in used or s.get("bot") != a.get("bot") or s.get("action") != a.get("action"):
-                continue
-            if abs(_ts_epoch(s.get("ts")) - t_a) > window:
-                continue
-            if want and norm_target(s.get("action"), s.get("target")) == want:
-                hit = i
+        cand = (a.get("bot"), a.get("action"), want)
+        ids, times = index.get(cand, ((), ())) if want else ((), ())
+        ordered = bool(want) and in_order.get(cand, False)
+        # The one-second margin only keeps float rounding out of the bounds; the exact test is in the loop.
+        start = bisect_left(times, t_a - window - 1) if ordered else 0
+        for j in range(start, len(ids)):
+            if ordered and times[j] > t_a + window + 1:
+                break
+            if ids[j] not in used and abs(times[j] - t_a) <= window:
+                hit = ids[j]  # the first unused self-report in record order, as before
                 break
         if hit is None:
             unmatched.append(a)
@@ -3811,6 +4011,7 @@ def compute_metric(records: List[Dict], metric: Dict, since: Optional[str] = Non
 def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -> Dict:
     now = now_iso()
     since = (_utcnow() - _dt.timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_ago = (_utcnow() - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")  # a task open longer than this is stale
     by_bot: Dict[str, List[Dict]] = {}
     for r in records:
         if r.get("type") in ("sync", "verify") or r.get("ts", "") < since:
@@ -3958,11 +4159,12 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -
                 "Persist to Bot memory or description so it survives the conversation: \"%s\"" % (r.get("detail") or "")[:200], [r], None, "info")
 
         # H. tasks never closed -> logging discipline
-        stale = [t for t in tasks.values() if t["start"] and not t["end"] and t["start"] < (_utcnow() - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")]
+        stale_ids = {k for k, t in tasks.items() if t["start"] and not t["end"] and t["start"] < day_ago}
+        stale = [tasks[k] for k in stale_ids]
         if len(stale) >= 2:
             add(bot, "logging", "open", "%d tasks were never closed with task-end" % len(stale),
                 "Re-state in the description: every reply that finishes work ends with `gblog task-end`. Close the stale ones with "
-                "`--outcome skipped --detail \"closed late\"`.", [r for r in recs if r.get("type") == "task_start" and r.get("task_id") in {k for k, t in tasks.items() if t in stale}],
+                "`--outcome skipped --detail \"closed late\"`.", [r for r in recs if r.get("type") == "task_start" and r.get("task_id") in stale_ids],
                 {"kind": "open_tasks", "bot": bot}, "lower")
 
     # I. coverage gaps -> logging rules
@@ -4543,6 +4745,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     _validate_args(args)
     ledger = Ledger(args.root)
+    ledger.cache_aliases = True  # one read of state/aliases.json per command (updates re-read it under aliases.lock)
     ledger.verify_strict = bool(getattr(args, "strict", False))
     ledger.verify_skip_archives = bool(getattr(args, "skip_archives", False))
     out = sys.stdout
@@ -4657,6 +4860,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
             # another name, reached through an alias, cannot satisfy the rollback check.
             if wanted and (args.bot.strip() not in bots or b == args.bot.strip()):
                 present |= set(getattr(res, "own_hashes", getattr(res, "hashes", ())))
+            if isinstance(res, _VerifyResult):
+                # --contains has used them: a long --all run must not keep two hash sets per chain in `results`
+                res.hashes = res.own_hashes = frozenset()
             if wanted and b == bots[-1]:
                 not_found = [h for h in wanted if h not in present]
             if not_found and b == bots[-1]:
@@ -4749,6 +4955,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "status":
         rows = []
+        state_views: Dict[str, Dict] = {}  # chain -> _state_view(chain): each state file is read once
         groups = {c: [c] for c in ledger.valid_chains()} if args.chains else ledger.groups()
         if getattr(args, "bot", None):
             want = ledger.canonical(args.bot)
@@ -4756,6 +4963,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         month = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
         for key, chains in groups.items():
             views = {c: ledger._state_view(c) for c in chains}  # one typed read of each chain's state
+            state_views.update(views)
             seq = sum(v["seq"] for v in views.values())
             updated = max((v["updated"] or "" for v in views.values()), default="")
             syncs = [v["last_sync"] for v in views.values() if v["last_sync"]]
@@ -4775,13 +4983,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
             head = views[key]["head"][:12] if key in views else "-"
             rows.append({"bot": key, "label": ledger.label(key) if not args.chains else key, "chains": chains, "seq": seq, "head": head,
                          "updated": updated or None, "today": today_n, "open_tasks": len(open_tasks), "last_sync": last_sync})
+        chain_alerts: Dict[str, Tuple[Optional[str], int]] = {}  # one alert_info() per chain, reused for the ALERT lines
         for r in rows:
-            alerts = [ledger.alert_info(c) for c in r["chains"]]
+            for c in r["chains"]:
+                chain_alerts[c] = ledger.alert_info(c)
+            alerts = [chain_alerts[c] for c in r["chains"]]
             stamps = sorted(a_ts for a_ts, _n in alerts if a_ts)
             r["alert"] = stamps[0] if stamps else None
             r["spooled"] = sum(a_n for _ts, a_n in alerts)
             # A future-dated tail pins every new record to that timestamp (and day file); taken from state.updated.
-            ahead = [u for u in (ledger.read_state(c).get("updated") for c in r["chains"]) if _future_ts(u)]
+            ahead = [u for u in (state_views[c]["updated"] for c in r["chains"]) if _future_ts(u)]
             r["future_tail"] = max(ahead) if ahead else None
         if args.json:
             out.write(json.dumps({"root": ledger.root, "bots": rows}, indent=2, ensure_ascii=False) + "\n")
@@ -4799,13 +5010,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
             out.write("%-28s %6d %6d %8d %5d %20s  %s\n" % (_term(r["label"]), len(r["chains"]), r["seq"], r["today"], r["open_tasks"], _term(r["updated"] or "-"), _term(ls_txt)))
         for r in rows:
             for c in r["chains"]:
-                a_ts, a_n = ledger.alert_info(c)
+                a_ts, a_n = chain_alerts[c]
                 if a_ts:
                     out.write("ALERT %s: tail mismatch since %s (%d spooled)\n" % (c, _term(a_ts), a_n))
         out.write("".join(orphan_alerts))
         for r in rows:
             for c in r["chains"]:
-                updated = ledger.read_state(c).get("updated")
+                updated = state_views[c]["updated"]
                 if _future_ts(updated):
                     out.write("CLOCK %s: last record dated %s (future)\n" % (c, updated))
         return 0
@@ -4813,7 +5024,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "tail":
         if args.n <= 0:
             return 0
-        recs = ledger.records(ledger.canonical(args.bot) if args.bot else None)[-args.n:]
+        recs = ledger.tail_records(ledger.canonical(args.bot) if args.bot else None, args.n)
         for r in recs:
             bits = [r.get("ts", ""), ledger.label(r.get("bot", "")), "#%s" % r.get("seq"), r.get("type", "")]
             if r.get("action") and r.get("type") == "action":
