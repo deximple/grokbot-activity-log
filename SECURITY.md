@@ -48,8 +48,7 @@ output. Run the newest 0.6.x: 0.6.0 still reports an emptied chain as `OK … 0 
 state file survives, and does not refuse reserved bot names on append. It also pushes to a GitHub
 remote written with a port, as `ssh.github.com` or through an ssh host alias after only a warning,
 and lets `gblog sync --remote` re-point an existing backup remote. All of these are fixed in 0.6.1 (see
-[`CHANGELOG.md`](CHANGELOG.md)). 0.6.1 is not released yet: a checkout that contains these fixes
-prints `gblog 0.6.1`, and the CHANGELOG lists what is still open under "Known open findings".
+[`CHANGELOG.md`](CHANGELOG.md), which also lists what remains open under "Known open findings").
 
 ## Threat model (summary)
 
@@ -341,9 +340,15 @@ Notes:
   files behind it. `sync` says so, pushes nothing and exits 1.
 - A `--remote` URL with a user name and password is stored by git in `.git/config` as written.
   gblog warns about it; use a credential helper instead.
+- `sync` refuses (exit 2, nothing changed) a git repository at the ledger root that it cannot
+  recognise as a ledger, and marks a repository it recognises with `gblog.ledger = true` in
+  `.git/config`. If `origin` is also defined in the system or global git configuration (`url` or
+  `pushurl`), `sync` commits locally and refuses to push (exit 1).
 - `--no-push` never contacts the network.
 - The local commit is made even when the push is refused, so anchors, spool and alert files are
-  still captured.
+  still captured (except when `--replace-remote` could not be recorded because of a tail mismatch
+  on the sync Bot's chain: then nothing is changed, nothing is committed, and the refused event
+  says `NOT applied`, exit 4).
 - Visibility is checked at push time only. gblog cannot notice a repository being made public later.
 - Refusal and error text passes through redaction before it is printed or logged, so userinfo in a
   remote URL is not echoed. Text is redacted before it is shortened.

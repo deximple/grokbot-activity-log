@@ -285,7 +285,8 @@ Policy refusal. Every push URL of `origin` is checked:
 - The wiki of a repository is checked as that repository.
 - A push needs an `origin` in the ledger repository itself (question 26).
 - The local commit is made even when the push is refused, and a `sync` record with outcome
-  `denied` is written.
+  `denied` is written (when `--replace-remote` itself is refused with exit 4 because of a tail
+  mismatch, nothing is changed and nothing is committed).
 - The override flags are per-invocation operator decisions. Never put them in a routine prompt.
 
 ### 24. How do I set or change the backup remote?

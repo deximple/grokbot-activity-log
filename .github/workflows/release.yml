@@ -1,0 +1,91 @@
+# Cut a GitHub Release from a version tag (vX.Y.Z must match gblog --version).
+#
+#   git tag v0.6.1 && git push origin refs/tags/v0.6.1
+#
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag matches gblog --version and CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          ver="$(./bin/gblog --version | cut -d' ' -f2)"
+          if [ "v${ver}" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ./bin/gblog --version (${ver})"
+            exit 1
+          fi
+          if ! awk -v want="## [${ver}] - 20" 'index($0, want) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated '## [${ver}] - YYYY-MM-DD' section"
+            exit 1
+          fi
+
+      - name: Unit tests and shellcheck
+        run: |
+          python -W error::DeprecationWarning -m unittest discover -s tests
+          command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck install.sh bin/gblog examples/*.sh
+
+      - name: Extract release notes
+        run: |
+          ver="$(./bin/gblog --version | cut -d' ' -f2)"
+          python - "$ver" <<'PY' > "$RUNNER_TEMP/release-notes.md"
+          import re, sys
+          ver = sys.argv[1]
+          with open("CHANGELOG.md", encoding="utf-8") as fh:
+              text = fh.read()
+          pat = re.compile(r"^## \[" + re.escape(ver) + r"\][^\n]*\n", re.M)
+          m = pat.search(text)
+          if not m:
+              raise SystemExit(f"CHANGELOG.md has no section for {ver}")
+          rest = text[m.end():]
+          nxt = re.search(r"^## \[", rest, re.M)
+          body = (rest[:nxt.start()] if nxt else rest).strip()
+          upgrade = (
+              "\n\n## Upgrade on a Grok Bot computer\n"
+              "```bash\n"
+              "git -C /workspace/grokbot-activity-log pull && bash /workspace/grokbot-activity-log/install.sh && gblog --version\n"
+              "gblog verify --all\n"
+              "```\n"
+          )
+          sys.stdout.write(body + upgrade)
+          PY
+          test -s "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="$(./bin/gblog --version | cut -d' ' -f2)"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; nothing to overwrite."
+            exit 0
+          fi
+          flags=(--verify-tag --title "gblog ${ver}" --notes-file "$RUNNER_TEMP/release-notes.md")
+          case "$ver" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}"

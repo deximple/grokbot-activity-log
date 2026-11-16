@@ -35,7 +35,7 @@ OK    ops                       4 records  head 3c4241c25eb5
 | Weekly tune routine | `docs/routine-weekly-tune.md` | capture → coverage → tune → ask → apply → record, every week |
 | Marketplace kit | `docs/marketplace.md` | Ready-to-paste listing, operating instructions, skills/routines/memories for a shareable "Ledger" Bot |
 | Bot template | `docs/bot-template.md` | A shareable "Ledger" Bot for x.ai/bot, and a comparison with existing note-taking Bots |
-| Tests + CI | `tests/`, `.github/workflows/ci.yml` | Unit tests incl. tamper detection, forged-ack and rollback detection, crash recovery, coverage matching and the tune loop; Python 3.8 to 3.14 on Linux, 3.12 on macOS; shellcheck |
+| Tests + CI | `tests/`, `.github/workflows/ci.yml` | Unit tests incl. tamper detection, forged-ack and rollback detection, crash recovery, coverage matching and the tune loop; Python 3.8 to 3.14 on Linux, 3.12 and 3.13 on macOS; shellcheck |
 | Design + policy | `docs/DESIGN.md`, `SECURITY.md`, `CHANGELOG.md` | Threat model, append state machine, record field reference, exit codes; reporting and private-remote policy; per-version behaviour changes |
 
 Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integration.md`](docs/agent-integration.md). Common questions are answered in [`docs/faq.md`](docs/faq.md).
@@ -388,7 +388,7 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 | 1 | Integrity FAIL (`verify`, `anchor`, unknown `--bot` on those, `--contains` miss, a `verify --record` record that was refused); `capture browser` found no readable history; `sync` committed but did not push (also: no `origin` in the ledger repository, a symlinked ledger directory), or found committed content that differs from the files on disk (nothing is pushed then); or an unexpected internal error (`error: internal error …`). |
 | 2 | Usage or environment error. A **usage error** wrote nothing: an argparse message, or `error: --…` and similar lines for a bad flag or value, an invalid `--ts` or date, an unregistered name in strict mode, a reserved name, a `seal` or `state rebuild` refusal. An **environment error** (`error: <system message>`, for example `error: No space left on device: <path>`, or `git failed: …` from `sync`) may already have written the record, so check `gblog tail --bot <bot> -n 1` before you retry. `spool replay` exits 2 when it had to skip an unreadable spool file; it lists the events it did replay. |
 | 3 | Policy refusal: `sync` will not push to a public or unconfirmed-visibility GitHub remote. |
-| 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. Also returned when a directory sits at `state/<bot>.json`, or a FIFO, directory or device at the target day file: the append is refused in the same way. |
+| 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. For `sync --replace-remote`, when the origin-change record itself is refused, `origin` is unchanged, no commit is made, and the spooled event says `NOT applied`. Also returned when a directory sits at `state/<bot>.json`, or a FIFO, directory or device at the target day file: the append is refused in the same way. |
 
 Ctrl-C exits 130. A closed output pipe does not change the exit code of a command that had finished
 (a `verify` FAIL stays 1). Details and the append state machine are in [`docs/DESIGN.md`](docs/DESIGN.md).
@@ -521,7 +521,8 @@ listed in [`docs/agent-integration.md`](docs/agent-integration.md), section 6.
 | a new chain under a reserved name (`aliases`, `…​.alert`, `…​.lock`, `…​.tmp`, `capture-files-…`) | accepted | 2, nothing written |
 | `sync` to a GitHub remote whose visibility cannot be confirmed | warned and pushed | 3 |
 | `sync --remote <url>` while `origin` points somewhere else | `origin` replaced | 2 without `--replace-remote` |
-| `sync` when the committed bytes differ from the files on disk, or without an `origin` in the ledger repository | pushed, or left to git | 1, nothing pushed |
+| `sync` in a git repository that tracks non-ledger files | committed | 2, nothing changed (item 8 below) |
+| `sync` when the committed bytes differ from the files on disk, without an `origin` in the ledger repository, or when `origin` is also defined in the system/global git config | pushed, or left to git | 1, nothing pushed |
 | `capture files` with a `--path` that does not exist | logged every known file as deleted | 2 |
 | `tune --apply X --reject Y` | recorded X as rejected | 2 |
 | an unexpected internal error | traceback | 1, one `error:` line |
@@ -577,7 +578,7 @@ under "Known open findings").
 
 ### After upgrading from 0.5 or earlier
 
-Check these things once. The operator does items 3 to 6; a Bot must not.
+Check these things once. The operator does items 3 to 6 and 8; a Bot must not.
 
 **1. Abbreviated flags.** New flags made some prefix abbreviations ambiguous, and argparse then exits 2.
 Spell the flag out in routines and scripts.
@@ -661,11 +662,14 @@ from the stored one when it names the same repository: for GitHub, the same owne
 over https or ssh, with or without `.git`; for another host, the same text apart from a trailing
 `/` or `.git`; for a local path, the same directory. `origin` keeps the spelling it has, and
 nothing is recorded. With `--replace-remote` the new spelling is stored and recorded as a change.
-Any other URL exits 2, before the local commit. To move the backup, the operator runs
-`gblog sync --remote <new url> --replace-remote` once; the change is recorded in the ledger. If the
+Any other URL exits 2, before the local commit (and a legacy `.git/remotes/origin` or `.git/branches/origin`
+file also blocks setting a first `origin` with exit 2). To move the backup, the operator runs
+`gblog sync --remote <new url> --replace-remote` once; the change is recorded in the ledger before `origin`
+is updated (if that record is refused with exit 4, `origin` is left unchanged and no commit is made). If the
 remote is a GitHub repository written with a port, as `ssh.github.com` or through an ssh host alias,
 0.6.1 checks its visibility: a public or unconfirmed repository that 0.6.0 pushed to with a warning
-is now refused with exit 3.
+is now refused with exit 3. A `remote.origin.url` or `pushurl` in the system or global git configuration
+beside a local `origin` stops the push with exit 1.
 
 **6. Auto-review rule and shell hook.** Replace a blanket *Allow automatically* rule for `gblog`
 with the allow-list in setup step 6. An upgrade does not update the shell hook in `~/.bashrc`:
@@ -673,14 +677,21 @@ run `gblog capture shell-hook --bot <slug> --install` again; it replaces an olde
 lines between `# >>> gblog shell hook >>>` and `# <<< gblog shell hook <<<`) in place and prints
 `updated hook in <rc file>`. If the block still has no `# gblog hook v2` line afterwards, remove it
 by hand and run the command again. Run the command also when the block already says
-`# gblog hook v2`: the hook text changed once more before the release (when gblog refuses the name
-in `GBLOG_BOT`, the hook logs the command under the Bot it was installed for), and the command
-replaces any block that differs from the current text.
+`# gblog hook v2` without `# gblog hook text 3`: the hook text changed once more before the release
+(when gblog refuses the name in `GBLOG_BOT`, the hook logs the command under the Bot it was installed for),
+and the command replaces any block that differs from the current text.
 
 **7. Symlinked ledger directories.** If `logs/`, `archive/` or another ledger directory is a symbolic
 link (for example `archive/` on another disk), git stores the link, not the files behind it. 0.6.0
 pushed such a ledger without those files and said nothing. 0.6.1 `sync` names the link, pushes nothing
 and exits 1. Use a mount instead of a link.
+
+**8. Backup repository marker.** `gblog sync` refuses (exit 2, nothing changed) a git repository at the
+ledger root that it cannot recognise as a ledger, and marks one it recognises with `gblog.ledger = true`
+in `.git/config`. A backup repository that gblog synced before is recognised automatically. In an empty
+`git init` directory, run `gblog init` before `gblog sync`. If `sync` prints `… is a git repository that
+is not a gblog ledger (it tracks <path>)` for your ledger, the operator runs
+`git -C "$GBLOG_ROOT" config gblog.ledger true` once.
 
 ## Development
 

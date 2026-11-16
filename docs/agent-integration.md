@@ -272,7 +272,8 @@ Exit 2 in detail:
 Notes:
 
 - When several codes apply to `sync`, a refusal (3) is reported before a tail mismatch (4). With
-  exit 4, `sync` still made its commit.
+  exit 4, `sync` still made its commit — except when `--replace-remote` could not be recorded:
+  then `origin` is unchanged, nothing is committed, and the refused event says `NOT applied`.
 - An output pipe that closes while gblog is still writing (`gblog export | head`) exits 0. A
   command that had finished keeps its exit code: a `verify` FAIL whose reader went away is still 1.
 - Set `GBLOG_DEBUG=1` only when the operator asks for a traceback of an internal error.
