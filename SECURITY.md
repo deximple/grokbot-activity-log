@@ -31,6 +31,8 @@ These count as vulnerabilities:
 - a secret shape listed as covered below that is stored unredacted.
 
 The items under "Not guaranteed" and "Redaction limits" are known limits, not vulnerabilities.
+The known limits under "Filesystem assumptions" are open findings that are already recorded; they
+need no new report.
 Improvements to them are welcome as ordinary issues.
 
 ## Supported versions
@@ -89,9 +91,10 @@ transcript where the daily routine posts chain heads, and a git remote that reje
 - a deleted chain whose state file, anchor, anchor-history file or day-rollup entry
   (`anchors/days/*.json`) survives (`verify --all`, and `verify --bot <name>` for that exact name);
 - a `*.jsonl` entry in a chain directory that is not a regular file (a FIFO, a directory, a
-  device). It is reported and never opened. The same holds for `state/<bot>.json`, the anchor
-  files and an archived file, also behind a symlink. A non-regular day rollup, alert file or alias
-  registry is treated as unreadable and never opened;
+  device). It is reported and never opened. The same holds for `anchors/<bot>.history.jsonl` and
+  an archived file, also behind a symlink. A non-regular `state/<bot>.json`, `anchors/<bot>.json`,
+  day rollup, alert file or alias registry is never opened either; it is treated as unreadable
+  (for state and the anchor file that is a `!` warning, not a FAIL);
 - a chain directory that cannot be listed. It is not taken for an empty chain;
 - a directory under `logs/` whose name is not a valid chain key (`verify --all`). Its records are
   never treated as verified and are left out of reports.
@@ -99,7 +102,8 @@ transcript where the daily routine posts chain heads, and a git remote that reje
 Two properties of the check itself are guaranteed too:
 
 - *Every chain is reported.* An unexpected error while one chain is verified or anchored is a FAIL
-  for that chain. `verify --all` and `anchor` still verify and anchor the others.
+  for that chain. `verify --all` and `anchor` still verify and anchor the others. The known
+  exceptions are listed under "Filesystem assumptions".
 - *`--contains` is chain-exact.* `verify --bot <chain> --contains <hash>` passes only when the hash
   belongs to a record that is stored in that chain and carries its name. A copy of the chain under
   another name, reached through an alias, does not satisfy it.
@@ -123,6 +127,8 @@ once with its cause.
   dated in the future makes every later record carry that time. `verify` and `status` warn about
   it; it is not a FAIL.
 - *Confidentiality at rest.* New files are `0o600`, which does not protect against the same user.
+  The copies that `sync` commits under `.git/objects` get the mode the process umask gives them
+  (see "Filesystem assumptions").
 - *Confidentiality against shell access.* The private-remote policy below guards `gblog sync`.
   Someone who can run `git` or edit `.git/config` can push the ledger anywhere without gblog.
 - *An unchecked remote.* `sync` makes sure the commit it pushes holds gblog's files as they are on
@@ -140,6 +146,69 @@ once with its cause.
 
 There is deliberately no HMAC or signature with a key stored on the same computer, because the
 adversary would hold that key too. Use off-box anchors instead (see "Keep the remote append-only").
+
+## Filesystem assumptions
+
+gblog keeps the ledger in ordinary files under one root. This section says what it assumes about
+that file system, what the code does when an entry is not what it expects, and where that defence
+ends today. The limits come from code reviews of 2026-11-16 (ids `K1-…` to `K4-…`). They were
+derived by reading the code, not by running it, and they are recorded in the CHANGELOG under
+"Known open findings".
+
+**Assumed.**
+
+- *A local POSIX file system for the whole root.* `flock`, `fsync`, `O_APPEND` and an atomic
+  `rename` must work on it. Where `fcntl` is missing gblog runs without locks, and only one writer
+  may run at a time.
+- *One user.* gblog creates new files `0o600` and new directories `0o700` and leaves existing
+  modes alone. It does not defend against another local user who can write to the root.
+- *Regular files with one name.* Every file under the root is a regular file with a single hard
+  link, and every ledger directory is a real directory. The checks below cover a symlink at the
+  final path component and a non-regular entry at a path gblog reads. Hard links are not detected.
+- *Case-sensitive names.* On a file system that ignores letter case (the macOS and Windows
+  defaults) `logs/Ops` and `logs/ops` are one directory. Records written under the other spelling
+  get the `bot field … does not match chain` warning, and `verify --contains` does not count their
+  hashes (K1-09, K3-03).
+- *Only chains under `logs/`.* Every directory there must be a chain. A `lost+found` (when `logs/`
+  is a mount point), `.stfolder` or similar directory is FAIL in `verify --all` (K3-07).
+- *git stores the files byte for byte.* A clean filter or Git LFS on `logs/`, `anchors/` or
+  `archive/` makes the committed-content check of `sync` fail on every run (exit 1, nothing
+  pushed). There is no override.
+
+**What the code does.**
+
+- It does not write through a symlink at the final path component. Day files, anchor histories,
+  lock files, reports and tuning files are opened with `O_NOFOLLOW` (exit 2). State, anchor,
+  rollup, snapshot and archive files are written to `<path>.<pid>.tmp` and renamed over the link.
+- It does not open a non-regular entry at a path it reads. A `*.jsonl` entry, an anchor history or
+  an archived file of that kind is a `verify` problem. A state file, `anchors/<bot>.json`, day
+  rollup, alert file or alias registry of that kind counts as unreadable.
+- It reads an archived file only up to one byte past the `bytes` its record declares.
+- A write of a log line that fails part-way is rolled back to the size the file had before.
+- A chain directory that cannot be listed is FAIL, and a failure while one chain is anchored is a
+  FAIL entry for that chain (`anchor aborted: <class>`).
+
+**Known limits (open; fixes are future work).**
+
+| Entry on disk | What happens today | Id |
+|---|---|---|
+| a FIFO at `state/<bot>.lock` | `verify`, `verify --all` and `anchor` wait forever; appends to that chain exit 2 | K2-02 |
+| `state/<bot>.lock` hard-linked to `state/.anchors.lock` | `anchor` waits on its own lock | K2-02 |
+| `anchors/` or `anchors/days/` that cannot be listed | `verify --all` and `anchor` exit 2 before the first chain is reported | K2-01 |
+| a day rollup that cannot be written | `anchor` exits 2 after it wrote the per-chain anchors, and prints no `ANCHOR` line | K2-01 |
+| a hard link at a path gblog overwrites (`<path>.<pid>.tmp`, `reports/<date>.md`, a tuning file) | the content is written into the linked file, which can lie outside the root. `O_NOFOLLOW` stops symlinks only | K2-05 |
+| a FIFO at a report, a tuning file, `tuning/proposals.json` or a temporary name | the command blocks | K2-05, K2-09 |
+| an entry that is swapped for a FIFO between the type test and the open | the reader blocks; the two are separate steps | K2-06 |
+| a very long line, or a very large side file | it is read whole into memory; a long last line also makes the tail lookup of `append` slow (see `docs/DESIGN.md`, section 13) | K2-06, K4-03 |
+| a symlink in place of a day file, an anchor history or an archived file | `verify` follows it (a `!` line for the day file and the history, no line for an archived file). `sync` commits the link, leaves it out of the committed-content check and can print `pushed` | K2-04 |
+| a directory at `state/<bot>.json` | `verify` warns; every append writes its line (with `state_adopted`) and then exits 2 | K2-08 |
+| a regular file at `spool/<bot>` | a refused append exits 2 instead of 4, with no spool file and no alert | K2-10 |
+| a non-regular entry at the name of today's day file | the append exits 2 and the event is not spooled; `verify` reports the entry | K2-10 |
+| `.git/objects` | git writes objects with the process umask. With umask 022 the committed copies of `0o600` files are readable by other local users unless the root itself is private | K2-07 |
+| `.git/gblog-sync-cache.json` | the committed-content check does not hash a file again when this cache says it is unchanged | D3-05 |
+| `~/.bashrc` during `capture shell-hook --install` | an older hook block is replaced by rewriting the file in place; a write that fails part-way can leave it damaged | K2-12 |
+| two overlapping `capture` or `tune` runs for one Bot | the snapshot, the browser markers and `tuning/proposals.json` are read, changed and written without a lock: duplicate `auto` records, lost proposal ids | K2-09, K2-14 |
+| a failing `archive` that overlaps another append | the cleanup looks at the tail record only and can remove a file that a chained record names | K2-13 |
 
 ## Redaction limits
 
@@ -237,8 +306,9 @@ Notes:
   added even when an ignore rule (a nested `.gitignore`, `.git/info/exclude`, `core.excludesFile`)
   would hide them (also a rule that names a whole directory such as `logs/`), git hooks do not
   run, commits and pushes are not signed, and after the commit the log files, the anchor-history
-  files and the archived files are re-hashed (on every run, without a cache) and compared with
-  the committed content. A difference (a clean filter, an index flag) is an error: nothing is
+  files and the archived files are compared with the committed content. A file is hashed again
+  unless its committed blob id, size, times and inode equal what the last run stored in
+  `.git/gblog-sync-cache.json`. A difference (a clean filter, an index flag) is an error: nothing is
   pushed and the exit code is 1. `<root>/.gitignore` is created when it is missing, so a ledger
   made before 0.6 stops committing lock files and capture snapshots.
 - A ledger directory that is a symbolic link cannot be backed up: git stores the link, not the
@@ -321,3 +391,8 @@ input.
   alias registry), also behind a committed symlink such as `state/x.json -> /dev/zero`.
 - Output of `tail`, `status` and `report --stdout` is safe to display: control characters are
   neutralised. What the text says is still chosen by the Bot.
+- Run `gblog --root <clone> verify --all --strict --skip-archives` first. gblog reads a log line
+  or a side file whole, whatever its size, and decompresses an archived file up to the `bytes` its
+  record declares (to the end when the record declares none). A clone can hold a few megabytes
+  that expand to gigabytes, so run the audit under a memory limit (`ulimit -v`) and decide on the
+  full archive check afterwards.

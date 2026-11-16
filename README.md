@@ -54,9 +54,11 @@ Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integr
     reported by `gblog verify --all`, and so is a directory under `logs/` whose name is not a valid
     chain key. A day-rollup entry under `anchors/days/` counts as such a witness too, for a deleted
     chain and for a truncated or rewritten one. A `*.jsonl` entry that is not a regular file (a
-    FIFO, a directory) is FAIL and is never opened; the same holds for a state, anchor or archive
-    file, also behind a symlink. A chain directory that cannot be listed is FAIL. One damaged
-    chain never stops `verify --all` or `anchor` from reporting the others.
+    FIFO, a directory) is FAIL and is never opened; the same holds for an anchor-history or
+    archive file, also behind a symlink. A state file or `anchors/<bot>.json` of that kind is
+    never opened either and counts as unreadable (a `!` warning). A chain directory that cannot
+    be listed is FAIL. One damaged chain never stops `verify --all` or `anchor` from reporting
+    the others (known exceptions: [`SECURITY.md`](SECURITY.md), "Filesystem assumptions").
   - **Warned (`!` lines, exit code unchanged):** `state/<bot>.json` is missing, unreadable or reset to
     genesis. Truncation can then no longer be detected from state. Report these lines verbatim.
     Also warned: a last record dated in the future. Every later record is then stamped with that
@@ -153,7 +155,7 @@ What capture does **not** see:
   nothing: what history shows then was typed in an earlier session.
 - Browser capture stores **scheme://host/path and the page title** (first 120 characters, in `detail`).
   It stores no query string or fragment. After a missed run it resumes from its per-history marker.
-  The first import of a history file is bounded by `--hours` (default 24; below 1 exits 2). A marker
+  The first import of a history file is bounded by `--hours` (default 24; a negative value exits 2). A marker
   dated in the future is ignored with a notice.
   History files it could not read are reported as `, N unreadable`.
 - File capture compares size and modification time against a snapshot in `state/capture-files-<bot>.json`.
@@ -227,8 +229,9 @@ gblog alias strict on       # refuse unknown names instead of warning
 
 - The canonical key is a single ASCII slug; `report`, `status`, `tail`, `coverage` and `tune` merge all
   variant chains under it and print `Chief of Staff(chief-of-staff)`.
-- New records written under any variant or the display name go to the slug's chain; old chains stay
-  byte-for-byte as they were (and still verify).
+- New records written under any variant or the display name go to the slug's chain. The logging
+  commands never write to a variant chain, and old chains still verify. `verify --record`,
+  `state rebuild` and `spool replay` address a chain directory and do append to it.
 - `alias add` refuses a variant or display name that is already another Bot's slug or display name, and a slug
   that is already another Bot's alias or equals another Bot's display name. `alias list` prints any such conflicts left by older versions, with the fix.
 - `alias add` also refuses a variant that is currently another Bot's alias (`'<variant>' is an alias of <other>; use --move`).
@@ -300,7 +303,7 @@ not run `state rebuild` or `spool replay` on its own; the operator decides.
 | `verify` flag | Effect |
 |---|---|
 | `--contains HASH` | Repeatable, needs `--bot`, full 64-hex. Exit 1 with `expected hash … not found in chain`. Pass yesterday's head to detect a rollback. Chain-exact: only a record stored in the named chain and carrying its name counts, so a copy of the chain under another name does not satisfy the check. |
-| `--strict` | Also FAIL on a record whose `bot` differs from its chain, on a stray `*.jsonl` file name, on a symlink among the chain's files, on a non-string text field, on a `ts` that is not in the normalised form, and on any line that is not the canonical serialisation (duplicate keys, reformatted; surrounding white space is ignored). |
+| `--strict` | Also FAIL on a record whose `bot` differs from its chain, on a stray `*.jsonl` file name, on a record stored in a day file of another date, on a symlink among the chain's files, on a non-string text field, on a `ts` that is not in the normalised form, and on any line that is not the canonical serialisation (duplicate keys, reformatted; surrounding white space is ignored). |
 | `--skip-archives` | Do not re-hash archived files; prints `(archives not checked)`. |
 | `--json` | Print the result objects (with `warnings`) as a JSON list. Exit codes are unchanged. |
 
@@ -403,6 +406,117 @@ gblog verify --all                  # chains are format-compatible; nothing to m
 gblog alias add --slug <slug> --display <name> --alias <old-variant> ...   # once per Bot that has name variants
 ```
 
+### Upgrading from 0.5
+
+**There is nothing to migrate.** The record format, the canonical JSON and the hash rule have not
+changed since 0.1, and no gblog command rewrites, moves or rehashes a log line. Install the new
+version and run `gblog verify --all`; that is the whole upgrade. The side files of 0.2 to 0.5 are
+read as they are:
+
+- `state/<bot>.json`, including the single browser-capture marker that 0.2 kept (the next
+  `capture browser` run turns it into one marker per history file);
+- `anchors/<bot>.json` and the day rollups of 0.4 and 0.5 (the first `gblog anchor` starts
+  `anchors/<bot>.history.jsonl`);
+- `state/aliases.json` (also an entry without `aliases`, and a registry without `strict`);
+- spool files under their old names, and `tuning/proposals.json` and `tune` records without the
+  newer keys;
+- a chain whose name is reserved today (`ops.tmp`, `capture-files-x`): it keeps working.
+
+Existing files keep their permissions. Only files and directories created from now on are private
+(`0o600`, `0o700`).
+
+This compatibility was checked by reading the code. The test suite does not yet contain a ledger
+written by 0.2 to 0.5 (CHANGELOG, "Known open findings", K3-08). Run `gblog verify --all` after
+installing and, for information, `gblog verify --all --strict`. The strict run also reports
+records written with a free-form `--ts` before 0.6 (`ts is not in normalised form`); that line is
+expected for such records.
+
+**What `verify` now says about an existing ledger.** A ledger that printed `OK` with 0.5 can print
+`FAIL` now. In each case the files were already in that state; 0.5 did not look.
+
+| On disk | 0.5 | Now |
+|---|---|---|
+| a chain whose day files are empty while `state/<bot>.json` names a head | `OK … 0 records` | FAIL |
+| `logs/<bot>` removed while a state head, an anchor, an anchor history or a day-rollup entry remains | not reported | FAIL in `verify --all` (item 4 below) |
+| a `break_ack` other than the pinned kim-biseo one | honoured | FAIL |
+| a head recorded by `gblog anchor` that is no longer in the chain | not checked | FAIL |
+| a directory under `logs/` whose name is not a chain key (`logs/my bot`, but also `lost+found` or `.stfolder`) | read by reports, not verified | FAIL in `verify --all`, even when it holds no log file; readers skip it with a warning. Move such a directory out of `logs/` |
+| a `*.jsonl` entry that is not a regular file (a FIFO, a directory) | could hang `verify` and `append` | FAIL, never opened |
+| an `archive` record whose path is outside `archive/` or is not named `<sha256>.gz`, or that has only one of `path` and `sha256` | accepted | FAIL |
+| an archived file whose content is longer than the `bytes` of its record | `OK` when the hash matched | FAIL (`content hash mismatch`): `bytes` is now a read limit |
+
+**New `!` lines (the exit code stays 0).** `verify` prints them under a chain. Report them
+verbatim. On a ledger from 0.5 expect these, where they apply:
+
+1. `state/<bot>.json missing or unreadable …` and `state/<bot>.json was reset to genesis`;
+2. `last record is dated <ts>, in the future …`;
+3. `bot field '<x>' does not match chain '<y>'`, `unexpected log file name …` and
+   `record dated <date> is stored in day file <date>` (a copied, renamed or merged day file);
+4. `field '<name>' is not a string`, `non-finite number …` and `duplicate keys in line …`;
+5. `… symbolic link (gblog does not write through one)`;
+6. `archive record without path and sha256 …` (as `gblog log --type archive` writes it);
+7. `anchors/<bot>.json is unreadable …`.
+
+`--strict` turns the lines of items 3 to 6 into problems. The full list is in
+[`docs/DESIGN.md`](docs/DESIGN.md), section 7. The new `notice:` and `warning:` lines on stderr are
+listed in [`docs/agent-integration.md`](docs/agent-integration.md), section 6.
+
+**Exit codes.** Scripts and routines that branch on exit codes need these changes:
+
+| Situation | Before 0.6 | Now |
+|---|---|---|
+| `verify --bot` or `anchor --bot` for a name with no chain on disk | 0 (`OK … 0 records`) | 1 |
+| any `error: …` message (bad value, unregistered name in strict mode, alias conflict, unreadable `--file`) | 1 | 2 |
+| `--ts` that is not a timestamp, is earlier than the Bot's last record, or is more than 300 s in the future | accepted | 2, nothing written |
+| a new chain under a reserved name (`aliases`, `…​.alert`, `…​.lock`, `…​.tmp`, `capture-files-…`) | accepted | 2, nothing written |
+| `sync` to a GitHub remote whose visibility cannot be confirmed | warned and pushed | 3 |
+| `sync --remote <url>` while `origin` points somewhere else | `origin` replaced | 2 without `--replace-remote` |
+| `sync` when the committed bytes differ from the files on disk, or without an `origin` in the ledger repository | pushed, or left to git | 1, nothing pushed |
+| `capture files` with a `--path` that does not exist | logged every known file as deleted | 2 |
+| `tune --apply X --reject Y` | recorded X as rejected | 2 |
+| an unexpected internal error | traceback | 1, one `error:` line |
+| a closed output pipe | traceback | 0 while the command was still writing; otherwise the command's own code |
+| tail mismatch (append refused, event spooled) | 4 | 4 (unchanged) |
+
+The abbreviated flags that became ambiguous (exit 2) are in item 1 below.
+
+**Other things an existing setup will notice.**
+
+- `note`, `approval` and `task-end` now fall back to `$GBLOG_TASK`. A stale
+  `export GBLOG_TASK=…` attaches new records to an old task: `unset GBLOG_TASK` after `task-end`.
+- `verify --bot X --contains <head>` is chain-exact. Pass the chain name exactly as the daily
+  routine posted it. When the name is itself a chain directory, only that chain is searched, so a
+  head that lives in a variant chain is reported as missing.
+- `verify --record` (the daily routine) appends its record to every chain directory it verifies,
+  variant chains included. The logging commands never write to a variant chain.
+- The shell hook and the Auto-review rule need a manual step (item 6 below).
+
+**Known limits of this upgrade.** These are open (CHANGELOG, "Known open findings"); fixes are
+future work.
+
+- *A last record with a local-time `--ts`.* Before 0.6 `--ts` was stored as written. If the last
+  record of a chain carries a `ts` that is not of the form `YYYY-MM-DDTHH:MM:SSZ` (for example
+  `2026-11-17T08:00:00+09:00`), the first append after the upgrade is not checked against it.
+  While the UTC clock still reads earlier than the time written there, the new record can fail
+  `verify` for good (`timestamp goes backwards`), or land in an earlier day file, after which
+  every append to that chain exits 4. Check each chain with `gblog tail --bot <chain> -n 1` right
+  after installing. If the timestamp shown is not in that form, do not write to the chain until
+  the UTC time has passed the time written in it (at most the UTC offset, 9 hours for `+09:00`).
+  (D1-09, K3-01)
+- *File systems that ignore letter case (macOS and Windows defaults).* `alias add` lower-cases
+  the slug. If the chain directory on disk is `logs/Ops` and you register the slug `ops`, new
+  records carry `bot: "ops"` inside the directory `Ops`: `verify` warns for each of them, and
+  `verify --contains` reports their heads as missing. Do not register a slug that differs from an
+  existing chain directory only by letter case. (K1-09, K3-03)
+- *Another spelling of the backup URL.* `sync --remote` compares the URL as text (item 5 below).
+  (K3-04)
+- *A hand-edited alias registry.* One invalid entry (for example `"aliases": null`, or a slug key
+  with a space) makes the whole registry count as unreadable: gblog warns on stderr, resolves no
+  names, and strict mode is off, so a display name starts a new chain. Fix the entry. (K3-05)
+- *Git LFS or a clean filter on the ledger repository.* `sync` compares the committed bytes with
+  the files on disk and exits 1 on every run. Remove the filter for gblog's files; there is no
+  override.
+
 ### After upgrading from 0.5 or earlier
 
 Check these things once. The operator does items 3 to 6; a Bot must not.
@@ -484,7 +598,10 @@ Removing witnesses is also exactly what someone hiding a deletion would do; the 
 daily routine and the git history of the backup remote are what let you tell the two apart.
 
 **5. Backup remote.** `gblog sync --remote <url>` no longer replaces an existing `origin`. A routine
-that passes the same `--remote` on every run keeps working. To move the backup, the operator runs
+that passes the same `--remote` on every run keeps working, as long as the URL is written exactly
+as `origin` has it. Another spelling of the same repository (`…/r` for `…/r.git`, https for ssh)
+also exits 2, before the local commit: use the stored spelling
+(`git -C <root> remote get-url origin`). To move the backup, the operator runs
 `gblog sync --remote <new url> --replace-remote` once; the change is recorded in the ledger. If the
 remote is a GitHub repository written with a port, as `ssh.github.com` or through an ssh host alias,
 0.6.1 checks its visibility: a public or unconfirmed repository that 0.6.0 pushed to with a warning

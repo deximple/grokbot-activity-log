@@ -42,7 +42,7 @@ A crash inside `append` can leave state exactly one record **behind** the file. 
 5. `gblog anchor` — OK chains get anchors resumed from their previous anchor. kim-biseo stays FAIL with the break descriptor and both segment heads. Do not skip the other chains.
 6. Jay writes down the real approval id.
 7. Once: `gblog seal --bot kim-biseo --jay-approval-id <that id>`.
-   The command refuses (exit 2, nothing appended) if the on-disk line, seq, or full hashes differ from `KIM_BISEO_BREAK`, if the id is a placeholder, if a `break_ack` is already present, or if the `ledger` witness chain has a tail mismatch. It only appends. It does not rewrite 164/165.
+   The command refuses (exit 2, nothing appended and nothing spooled) if the on-disk line, seq, or full hashes differ from `KIM_BISEO_BREAK`, if the id is a placeholder, if a `break_ack` is already present, or if `kim-biseo` itself or the `ledger` witness chain has a tail mismatch. It only appends. It does not rewrite 164/165.
 8. `gblog verify --bot kim-biseo` — expect exit 0 and `PASS (1 approved break)`, with no `!` line under it (see "Witness warning"). `gblog verify --all` must not print FAIL. A new break is still FAIL, and so is any second or different `break_ack`.
 9. `gblog verify --bot kim-biseo --json` must show `"fixture_ack": false`. If it shows `true` (the text output then also has the line `! fixture break_ack honoured: this root is a temporary test copy`), verify honoured the fabricated test-fixture ack because the root resolves under the temporary directory. That is not the live seal: stop and report.
 10. `gblog anchor` again. kim-biseo is now PASS with `approved_breaks` 1 and the same id. Other chains still resume from their own anchors.
@@ -66,6 +66,6 @@ After the seal, verify cross-checks the witness. If the pinned ack is honoured a
 
 Tail mismatch: CLI exit **4**, stderr `ALERT tail mismatch`, event JSON in `spool/<bot>/`, latest copy in `state/<bot>.alert.json`. gblog does not send mail or chat. Page on that exit code and file. Do not edit the log to make the next append succeed.
 
-Known limit: `seal` preflights the `ledger` chain only. If `kim-biseo` itself has a tail mismatch, step 7 exits 4 and the `break_ack` goes to `spool/kim-biseo/`. `gblog spool replay` never appends a `break_ack`, so do not replay it. Report and wait. A later version will refuse with exit 2 before anything is spooled (CHANGELOG, "Known open findings").
+`seal` preflights both chains. If `kim-biseo` itself has a tail mismatch, step 7 exits 2 with `refusing: kim-biseo has a tail mismatch (state does not match the log tail); nothing was sealed`, and nothing is spooled. Report and wait. A `break_ack` found in `spool/kim-biseo/` (left by an older version) is never appended by `gblog spool replay`; do not move or edit it.
 
 `gblog spool list` shows the refused events and is read-only. Within this procedure do not go further than that: no `gblog spool replay`, no `gblog state rebuild`. Report the alert and wait for the operator.

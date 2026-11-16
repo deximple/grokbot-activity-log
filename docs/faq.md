@@ -344,7 +344,7 @@ only in `gblog status`.
 It copies each history database it finds (Chromium-family `History` files and Firefox
 `places.sqlite`; add more with `--history PATH` or `GBLOG_BROWSER_HISTORY`) and imports visits
 newer than its per-history marker. The first import of a history file is bounded by `--hours`
-(default 24; a value below 1 exits 2). A marker dated more than a day in the future is ignored
+(default 24; a negative value exits 2). A marker dated more than a day in the future is ignored
 with a notice.
 
 Each record stores `scheme://host/path` without query string or fragment, the page title (first
@@ -441,7 +441,7 @@ Partly, and it is untested there: CI runs on Linux and macOS only.
 | `tail` | Reads the newest day files of each chain until it has enough records. Use `--bot` to narrow it. |
 | `tune` | Reads from the start of the `--days` window or from 90 days ago, whichever is earlier, plus the `tune` records of any age. Use `--bot` to narrow it. |
 | `coverage`, `export` | Read from `--days` or `--since` onward. |
-| `sync` | git cost, plus a re-hash of the log, anchor-history and archive files to compare them with the commit. |
+| `sync` | git cost, plus a comparison of the log, anchor-history and archive files with the commit. A file that is unchanged since the last run is not hashed again. |
 
 Logs are split into one file per UTC day, so there is nothing to rotate. Do not delete old day
 files: the chain walk starts at the first record, and a missing prefix is a FAIL.
