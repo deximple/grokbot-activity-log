@@ -765,6 +765,35 @@ def _tmp_name(path: str) -> str:
     return "%s.%d.tmp" % (path, os.getpid())
 
 
+def _atomic_write(path: str, write_fn, mode: str = "w", keep: bool = True, fsync_dir: bool = True,
+                  errors: Optional[str] = None) -> None:
+    """Replace ``path`` atomically: per-process temp file, ``write_fn(fh)``, flush, fsync, ``os.replace``.
+
+    ``keep`` carries the permission bits of an existing ``path`` over to the new file (a new file is
+    0o600). With ``fsync_dir`` the directory entry is made durable as well. On any failure the temp
+    file is removed again, so a full disk or a refused write leaves no ``*.tmp`` behind."""
+    tmp = _tmp_name(path)
+    kwargs: Dict[str, str] = {}
+    if "b" not in mode:
+        kwargs["encoding"] = "utf-8"
+        if errors:
+            kwargs["errors"] = errors
+    try:
+        with _open_private(tmp, mode, keep=path if keep else None, **kwargs) as fh:
+            write_fn(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)  # removes only the temp name itself (a planted symlink is unlinked, never followed)
+        except OSError:
+            pass
+        raise
+    if fsync_dir:
+        _fsync_dir(os.path.dirname(path))
+
+
 class _GuardSkip(Exception):
     """Raised by an ``append(_guard=...)`` callback: under the bot lock the record turned out to be written already."""
 
@@ -917,13 +946,7 @@ class Ledger:
         """Atomically replace state/<bot>.json. Caller must already have fsynced the new log line."""
         _makedirs(self.state_dir)
         path = self._state_path(bot)
-        tmp = _tmp_name(path)
-        with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(self.state_dir)
+        _atomic_write(path, lambda fh: json.dump(state, fh, indent=2, sort_keys=True))
 
     class _Lock:
         """flock() on state/<bot>.lock: exclusive for writers, shared (``shared=True``) for readers.
@@ -1095,13 +1118,7 @@ class Ledger:
         """Atomically replace state/aliases.json. The caller holds ``aliases.lock``."""
         path = self.aliases_path()
         doc = {k: v for k, v in data.items() if k != "unreadable"}
-        tmp = _tmp_name(path)
-        with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
-            json.dump(doc, fh, indent=2, sort_keys=True, ensure_ascii=False)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(self.state_dir)
+        _atomic_write(path, lambda fh: json.dump(doc, fh, indent=2, sort_keys=True, ensure_ascii=False))
 
     def save_aliases(self, data: Dict) -> None:
         """Replace the whole registry. Refuses (exit 2) when the file on disk is unreadable."""
@@ -1264,7 +1281,7 @@ class Ledger:
 
         Repair commands need to address a legacy variant chain that an alias would otherwise merge away."""
         raw = (name or "").strip()
-        if raw in self.bots() or raw in self.spool_bots():
+        if raw in self.valid_chains() or raw in self.spool_bots():
             return raw
         return self.canonical(raw)
 
@@ -1341,14 +1358,13 @@ class Ledger:
 
     def _atomic_json(self, path: str, obj: Dict) -> None:
         _makedirs(os.path.dirname(path))
-        tmp = "%s.%d.tmp" % (path, os.getpid())  # per-process temp name: concurrent writers never share one temp file
-        with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
+
+        def emit(fh) -> None:
             json.dump(obj, fh, indent=2, sort_keys=True, ensure_ascii=False)
             fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(os.path.dirname(path))
+
+        # per-process temp name: concurrent writers never share one temp file; removed again on failure
+        _atomic_write(path, emit)
 
     def _append_line(self, path: str, line: str) -> None:
         """O_APPEND + fsync of the file and its directory. Never rewrites earlier bytes."""
@@ -2205,6 +2221,41 @@ class Ledger:
             ts = data.get("ts") if data and isinstance(data.get("ts"), str) else "unknown"
         return ts, len(self.spool_files(bot))
 
+    @staticmethod
+    def _spool_scan_from(spool_id: str, payload: Dict) -> Optional[str]:
+        """Oldest day (``YYYY-MM-DD``) whose log file can hold the replayed copy of a spooled event.
+
+        A replayed record is appended after the refusal, so it sits in a day file that is not older
+        than both the day of the spool stamp and the day file the refused append saw as the tail.
+        None means "no usable bound: search every file of the chain"."""
+        observed = payload.get("observed") if isinstance(payload, dict) else None
+        seen = observed.get("file") if isinstance(observed, dict) else None
+        name = seen.replace("\\", "/").rsplit("/", 1)[-1] if isinstance(seen, str) else ""
+        if not _DAY_FILE_RE.match(name):
+            return None
+        days = [name[:10]]
+        m = re.match(r"([0-9]{4})([0-9]{2})([0-9]{2})T", spool_id)
+        if m:
+            days.append("%s-%s-%s" % m.groups())
+        return min(days)
+
+    def _spool_replayed(self, bot: str, spool_id: str, since_day: Optional[str] = None) -> bool:
+        """True when the chain already holds a record carrying ``spool_id`` (the event was replayed).
+
+        Day files older than ``since_day`` are not read. A line is parsed only when it contains the
+        id bytes, so the scan stays cheap on a large chain."""
+        plain = re.match(r"[A-Za-z0-9._-]+\Z", spool_id) is not None
+        needle = spool_id.encode("ascii") if plain else b""  # b"" is in every line: parse them all
+        for path in self.log_files(bot):
+            name = os.path.basename(path)
+            if since_day and _DAY_FILE_RE.match(name) and name[:10] < since_day:
+                continue
+            with open(path, "rb") as fh:
+                for raw in fh:
+                    if needle in raw and _parse_line(raw).get("spool_id") == spool_id:
+                        return True
+        return False
+
     def spool_replay(self, bot: str) -> Dict:
         """Append every pending spooled event of ``bot`` in file-name order; move each file to ``replayed/``.
 
@@ -2228,31 +2279,31 @@ class Ledger:
                 continue
             spool_id = os.path.basename(path)[:-5]
             done_dir = os.path.join(os.path.dirname(path), "replayed")
-            _tail_path, tail = self._tail_record(bot)
-            if not (tail and tail.get("spool_id") == spool_id):  # else: appended earlier, crashed before the move
-                if not self._tail_ok(bot):
-                    refused = True
-                    break
-                rec = dict(rec)
-                if "ts" in rec:
-                    rec["original_ts"] = rec.pop("ts")
-                rec["spooled_at"] = payload.get("ts")
-                rec["spool_id"] = spool_id
+            if not self._tail_ok(bot):
+                refused = True
+                break
+            since_day = self._spool_scan_from(spool_id, payload)
+            rec = dict(rec)
+            if "ts" in rec:
+                rec["original_ts"] = rec.pop("ts")
+            rec["spooled_at"] = payload.get("ts")
+            rec["spool_id"] = spool_id
 
-                def _still_pending(path: str = path, spool_id: str = spool_id) -> None:
-                    # Runs inside append, under the bot lock: a second `spool replay` running at the same
-                    # time finds the event already appended (or its file already moved) and skips it.
-                    _tp, last = self._tail_record(bot)
-                    if not os.path.exists(path) or (last and last.get("spool_id") == spool_id):
-                        raise _GuardSkip()
+            def _still_pending(path: str = path, spool_id: str = spool_id, since_day: Optional[str] = since_day) -> None:
+                # Runs inside append, under the bot lock. The event counts as replayed when its file was
+                # already moved away, or when a record with its spool_id is anywhere in the chain since
+                # the refusal: a concurrent `spool replay`, or an earlier run that appended the record
+                # and died before the move (even when other records were appended after it).
+                if not os.path.exists(path) or self._spool_replayed(bot, spool_id, since_day):
+                    raise _GuardSkip()
 
-                try:
-                    replayed.append(self.append(bot, rec, _guard=_still_pending))
-                except _GuardSkip:
-                    pass
-                except RecordError:
-                    skipped.append(path)  # a planted or damaged event: left in place, like an unreadable file
-                    continue
+            try:
+                replayed.append(self.append(bot, rec, _guard=_still_pending))
+            except _GuardSkip:
+                pass  # already in the chain: only the file is left to move
+            except RecordError:
+                skipped.append(path)  # a planted or damaged event: left in place, like an unreadable file
+                continue
             _makedirs(done_dir)
             try:
                 os.replace(path, os.path.join(done_dir, os.path.basename(path)))
@@ -2632,21 +2683,13 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     # damaged file (or a symbolic link) is rewritten instead of being chained as if it were the evidence.
     existed = (not created) and os.path.isfile(full) and not os.path.islink(full) and _archive_intact(full, digest)
     if not existed:
-        tmp = _tmp_name(full)
-        with _open_private(tmp, "wb") as raw:
+        def _emit(raw) -> None:
             # fixed gzip header (no name, mtime 0): the same content always gives the same bytes
             with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=raw, mtime=0) as gz:
                 gz.write(data)
-            raw.flush()
-            os.fsync(raw.fileno())
-        try:
-            os.replace(tmp, full)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
+
+        # always a private (0o600) file; the directory is fsynced just below
+        _atomic_write(full, _emit, mode="wb", keep=False, fsync_dir=False)
     # the file and its directory entry must be durable before the hash is chained
     _fsync_dir(os.path.dirname(full))
     rel_posix = rel.replace(os.sep, "/")
@@ -3238,7 +3281,7 @@ __gblog_hook() {
   # Only a plain gblog call is skipped. A command that can carry a second one (list, pipe, substitution,
   # redirection, line break) is logged, so "gblog status; rm -rf x" cannot hide behind the gblog prefix.
   case "$cmd" in
-    *";"*|*"&"*|*"|"*|*"\$"*|*'`'*|*"<"*|*">"*|*$'\n'*) ;;
+    *";"*|*"&"*|*"|"*|*"\$("*|*'`'*|*"<"*|*">"*|*$'\n'*) ;;
     gblog|gblog\ *|__gblog*) return 0;;
   esac
   command -v gblog >/dev/null 2>&1 || return 0
@@ -3338,9 +3381,12 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
     added, changed = 0, False
     failed: List[str] = []
 
-    def save_markers(strict: bool = True) -> None:
+    def save_markers(strict: bool = True, final: bool = True) -> None:
+        # The v0.2 "*" marker stays in state until every history of this run has a marker of its own
+        # (``final``); a run that stops half-way must not lose it for the histories it did not reach.
+        keep = {k: v for k, v in markers.items() if not (final and k == "*")}
         try:
-            ledger.update_state(bot, {"capture_browser_last": {k: v for k, v in markers.items() if k != "*"}})
+            ledger.update_state(bot, {"capture_browser_last": keep})
         except OSError:
             if strict:
                 raise
@@ -3383,17 +3429,21 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         last_target, newest = None, since
+        horizon = time.time() + 86400  # a visit dated more than one day ahead is not believed
         for visit_time, url, title in rows:
             try:
                 visit_time = int(visit_time)
-            except (TypeError, ValueError, OverflowError):
-                continue  # NULL or non-numeric visit time
+                epoch = to_epoch(visit_time)
+                observed = _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError, ValueError, OverflowError, OSError):
+                # NULL, non-numeric, or a time no calendar can hold: skipped, and the marker does not move past it
+                continue
+            if epoch > horizon:
+                continue  # dated in the future: skipped without moving the marker, or it would hide every later visit
             target = _url_target(url) if isinstance(url, str) else None  # a BLOB or numeric url cell is not a visit
             if target and target != last_target:
-                try:
-                    observed = _dt.datetime.fromtimestamp(to_epoch(visit_time), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                except (OverflowError, ValueError, OSError):
-                    continue  # a visit time no calendar can hold: skipped, and the marker does not move past it
+                if isinstance(title, bytes):
+                    title = title.decode("utf-8", "replace")  # a BLOB title is shown as text; any other type is dropped
                 # redact before cutting, so a token cut below a pattern's minimum length cannot slip through
                 page_title = (redact(title) or "")[:120] if isinstance(title, str) else ""
                 try:
@@ -3403,9 +3453,10 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
                 except BaseException:
                     # The rows before this one are in the ledger: keep their marker, so the next run does
                     # not import them a second time.
-                    if changed or newest != markers.get(path):
+                    # (Histories that were finished earlier in this run already have their marker saved.)
+                    if newest != markers.get(path):
                         markers[path] = newest
-                        save_markers(strict=False)
+                        save_markers(strict=False, final=False)
                     raise
                 last_target = target
                 added += 1
@@ -3413,12 +3464,15 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
         if newest != markers.get(path):
             markers[path] = newest
             changed = True
-    if changed:
-        save_markers()
+            # Saved per history file: a failure in a later history cannot make this one be imported twice.
+            save_markers(final=False)
+    if changed and "*" in markers:
+        save_markers()  # every history that was read has its own marker now: drop the v0.2 "*" marker
     return {"histories": paths, "added": added, "failed": failed}
 
 
-def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] = (), limit: int = 200) -> Dict:
+def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] = (), limit: int = 200,
+                  record_baseline: bool = False) -> Dict:
     bot = safe_name(bot)
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isdir(path):
@@ -3446,15 +3500,11 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
     def save_snapshot(files: Optional[Dict] = None) -> None:
         # atomic, and only called once every change it covers has been appended
         ledger.ensure()
-        tmp = _tmp_name(snap_path)
-        with _open_private(tmp, "w", keep=snap_path, encoding="utf-8") as fh:
-            json.dump({"path": path, "taken": now_iso(), "files": current if files is None else files}, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, snap_path)
-        _fsync_dir(os.path.dirname(snap_path))
+        doc = {"path": path, "taken": now_iso(), "files": current if files is None else files}
+        _atomic_write(snap_path, lambda fh: json.dump(doc, fh))
 
     previous: Optional[Dict[str, List[float]]] = None
+    baseline_reason: Optional[str] = None  # why a new baseline is taken: first run / snapshot missing / unreadable / path changed
     if os.path.exists(snap_path):
         snap_rel = "state/" + os.path.basename(snap_path)
         try:
@@ -3462,28 +3512,36 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
                 snap = json.load(fh)
             if not isinstance(snap, dict) or not isinstance(snap.get("files"), dict):
                 raise ValueError("not a snapshot")
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
+            baseline_reason = "snapshot unreadable"
             sys.stderr.write("notice: %s is unreadable; taking a new baseline (no changes logged this run)\n" % snap_rel)
         else:
             if snap.get("path") not in (None, path):
+                baseline_reason = "path changed"
                 sys.stderr.write("notice: capture path changed from %s to %s; taking a new baseline (no changes logged this run)\n"
                                  % (snap.get("path"), path))
             else:
                 previous = snap["files"]
     if previous is None:
-        if not os.path.exists(snap_path):
+        if baseline_reason is None:
             # No snapshot although this chain already holds file-capture records: the snapshot was removed,
             # and whatever changed since the last run goes unreported. Say so instead of re-baselining silently.
             try:
                 earlier = any(rec.get("capture") == "files" for _p, _n, rec in ledger.iter_records(bot))
             except OSError:
                 earlier = False
+            baseline_reason = "snapshot missing" if earlier else "first run"
             if earlier:
                 sys.stderr.write("notice: state/%s is missing although %s already has file-capture records; taking a new "
                                  "baseline (file changes since the last capture were not logged)\n"
                                  % (os.path.basename(snap_path), bot))
+        if record_baseline:
+            # Appended before the snapshot is saved: if the append is refused, no snapshot is written
+            # and the next run reports the new baseline again.
+            ledger.append(bot, {"type": "note", "source": "auto", "capture": "files",
+                                "detail": "file capture: new baseline of %d file(s) (%s)" % (len(current), baseline_reason)})
         save_snapshot()
-        return {"baseline": len(current), "changes": 0}
+        return {"baseline": len(current), "changes": 0, "pending": 0, "new_baseline": baseline_reason}
     changes: List[Tuple[str, str]] = []
     for rel, meta in current.items():
         if rel not in previous:
@@ -3513,7 +3571,8 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
         save_snapshot(pending)
     else:
         save_snapshot()
-    return {"baseline": len(previous), "changes": len(changes), "pending": max(0, len(changes) - limit)}
+    return {"baseline": len(previous), "changes": len(changes), "pending": max(0, len(changes) - limit),
+            "new_baseline": None}
 
 
 # --------------------------------------------------------------------------- coverage (self-report vs. auto)
@@ -4007,12 +4066,8 @@ def save_proposals(ledger: "Ledger", analysis: Dict) -> Dict:
         kept.append(dict(p, generated=stamp))
     doc = {"generated": generated, "proposals": fresh + kept}
     _makedirs(ledger.tuning_dir)
-    tmp = _tmp_name(path)
-    with _open_private(tmp, "w", keep=path, encoding="utf-8", errors="backslashreplace") as fh:
-        json.dump(doc, fh, indent=2, ensure_ascii=False)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    _atomic_write(path, lambda fh: json.dump(doc, fh, indent=2, ensure_ascii=False),
+                  fsync_dir=False, errors="backslashreplace")
     return doc
 
 
@@ -4326,6 +4381,8 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--path", default="/workspace")
     s.add_argument("--exclude", action="append", default=[])
     s.add_argument("--limit", type=int, default=200)
+    s.add_argument("--record-baseline", action="store_true",
+                   help="when a new baseline is taken, also append an auto note that says so and why")
 
     s = sub.add_parser("coverage", help="how much of the auto-captured activity the Bot reported itself")
     s.add_argument("--bot")
@@ -4597,8 +4654,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         if args.bot:
             bots = ledger.chains_on_disk(args.bot)
             if not bots:  # a typo must not create anchors/<typo>.json
-                out.write("FAIL  %-20s %6d records\n" % (args.bot, 0))
-                out.write("      - no chain on disk for '%s'\n" % args.bot)
+                out.write("FAIL  %-20s %6d records\n" % (_term(args.bot), 0))
+                out.write("      - no chain on disk for '%s'\n" % _term(args.bot))
                 return 1
         rollup = ledger.anchor(bots)
         for c in rollup["chains"]:
@@ -4614,8 +4671,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (c["bot"], where, heads))
         lost_chains = rollup.get("missing") or []
         for m in lost_chains:  # logs/<bot> is gone while a witness survives: reported, never skipped
-            out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (m["bot"], "-", ""))
-            out.write("".join("      - %s\n" % p for p in m["problems"]))
+            # the name comes from a file name under anchors/ or state/, the text from an anchor file: no raw escapes
+            out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (_term(m["bot"]), "-", ""))
+            out.write("".join("      - %s\n" % _term(p) for p in m["problems"]))
         return 0 if all(c["ok"] for c in rollup["chains"]) and not lost_chains else 1
 
     if args.cmd == "report":
@@ -4785,7 +4843,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             if not data["bots"]:
                 out.write("(no aliases; every name is its own chain)%s\n" % (" strict" if data.get("strict") else ""))
                 return 0
-            chains = set(ledger.bots())
+            chains = set(ledger.valid_chains())  # an invalid directory under logs/ (`---`) is not a chain
             out.write("strict: %s\n" % ("on" if data.get("strict") else "off"))
             for slug, e in sorted(data["bots"].items()):
                 on_disk = [c for c in [slug] + e.get("aliases", []) if c in chains]
@@ -4836,11 +4894,15 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 res["added"], len(res["histories"]), ", %d unreadable" % len(failed) if failed else ""))
             return 1 if len(failed) == len(res["histories"]) else 0
         if args.what == "files":
-            if not os.path.isdir(os.path.abspath(os.path.expanduser(args.path))):
-                sys.stderr.write("error: capture path %s does not exist or is not a directory; nothing was logged\n" % args.path)
-                return 2
-            res = capture_files(ledger, args.bot, args.path, args.exclude, args.limit)
-            out.write("files: %d change(s) against a snapshot of %d file(s)\n" % (res["changes"], res["baseline"]))
+            # capture_files itself refuses a missing --path (exit 2: nothing was logged and the snapshot is unchanged)
+            res = capture_files(ledger, args.bot, args.path, args.exclude, args.limit,
+                                record_baseline=bool(getattr(args, "record_baseline", False)))
+            line = "files: %d change(s) against a snapshot of %d file(s)" % (res["changes"], res["baseline"])
+            if res.get("new_baseline"):
+                line += " (new baseline: %s)" % res["new_baseline"]
+            if res.get("pending"):
+                line += ", %d pending" % res["pending"]
+            out.write(line + "\n")
             return 0
 
     if args.cmd == "coverage":
