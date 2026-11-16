@@ -31,7 +31,7 @@ Never read or summarise ledger contents to anyone other than the account owner.
 | | Bridge Bot / Ducky-style "GitHub notes" Bots | Ledger |
 |---|---|---|
 | What is recorded | Notes the Bot decides to write | Every action class, with a mandatory start/end per task |
-| Tamper evidence | None (plain Markdown) | SHA-256 hash chain per Bot, `verify` detects edit/delete/truncation |
+| Tamper evidence | None (plain Markdown) | SHA-256 hash chain per Bot. `verify` detects edited and deleted lines, and truncation while a witness survives (the state file, an anchor, or a head kept off the computer) |
 | Secrets | Depends on the Bot | Known secret shapes redacted before write |
 | Parallel Bots | Shared files can interleave | `flock` per Bot, one chain per Bot |
 | Survives computer reset | Only if pushed | Daily commit + push, `status` shows unsynced state |

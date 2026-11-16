@@ -36,7 +36,9 @@ Improvements to them are welcome as ordinary issues.
 
 Upgrading never needs a migration; the record format is unchanged. Versions before 0.6 accept a
 forged `break_ack` and do not detect several truncation cases, so do not rely on their `verify`
-output.
+output. Run the newest 0.6.x: 0.6.0 still reports an emptied chain as `OK … 0 records` while its
+state file survives, and does not refuse reserved bot names on append. Both are fixed in 0.6.1 (see
+[`CHANGELOG.md`](CHANGELOG.md)).
 
 ## Threat model (summary)
 
@@ -56,10 +58,12 @@ transcript where the daily routine posts chain heads, and a git remote that reje
 - a deleted, inserted, re-ordered or duplicated line;
 - a forged `break_ack`;
 - a modified or missing archived file;
-- a truncated tail or a rewritten chain, as long as at least one witness survives:
+- a truncated tail, an emptied chain or a rewritten chain, as long as at least one witness survives:
   `state/<bot>.json`, an anchor or anchor-history entry, or a head you pass to
   `verify --contains`;
-- a deleted chain whose anchor survives (`verify --all`).
+- a deleted chain whose state file, anchor or anchor-history file survives (`verify --all`);
+- a directory under `logs/` whose name is not a valid chain key (`verify --all`). Its records are
+  never treated as verified and are left out of reports.
 
 **Not guaranteed.**
 
@@ -68,7 +72,9 @@ transcript where the daily routine posts chain heads, and a git remote that reje
   Bot name, including `verify`, `sync` and `note` records.
 - *A full rewrite with no surviving witness.* Someone who rewrites the log, state, every anchor file
   and the remote is not detected when nobody kept a head off the computer.
-- *Timestamps.* `ts` is the writer's clock, or a `--ts` value. It is ordered, not attested.
+- *Timestamps.* `ts` is the writer's clock, or a `--ts` value. It is ordered, not attested. A record
+  dated in the future makes every later record carry that time. `verify` and `status` warn about
+  it; it is not a FAIL.
 - *Confidentiality at rest.* New files are `0o600`, which does not protect against the same user.
 
 There is deliberately no HMAC or signature with a key stored on the same computer, because the
@@ -113,7 +119,7 @@ text. It is a safety net. The primary control is that Bots are told never to pas
 - strings nested inside structured fields (`proposal`, `break`);
 - binary or non-UTF-8 archive content (UTF-16 text, images, PDFs, screenshots). It is stored
   unscanned and the record carries `scanned: false`;
-- anything archived with `--no-redact`;
+- anything archived with `--no-redact` (the record carries `scanned: false`);
 - page titles captured from browser history, which are stored in `detail` and may contain private
   information that is not a "secret" by shape.
 
@@ -140,6 +146,10 @@ Notes:
 
 - The GitHub host match is strict (`github.com` or `www.github.com`). Look-alike hosts are treated
   as "any other host", never as a confirmed-private GitHub repository.
+- The check reads the host name as it is written in the URL. An ssh host alias that points at
+  github.com (a `Host` entry in `~/.ssh/config`, used as `git@gh-backup:owner/repo.git`) is treated
+  as another host and is not checked: gblog warns and pushes. Use the literal `github.com` host in
+  the backup remote so that the visibility check applies.
 - `--no-push` never contacts the network.
 - The local commit is made even when the push is refused, so anchors, spool and alert files are
   still captured.
@@ -164,6 +174,13 @@ the single kim-biseo 2026-11-02 discontinuity whose file, lines, sequence number
 hashes are compiled into `KIM_BISEO_BREAK`. An ack for any other break, on any chain, makes `verify`
 FAIL whatever id it carries. To audit the approval itself, compare the stored id with the operator's
 own record of it.
+
+The only other descriptor `verify` can honour is the fabricated test fixture, whose three hashes are
+also compiled in (`KIM_BISEO_FIXTURE_BREAK`). It is honoured only when the ledger root is under the
+system temporary directory, and `verify` then prints
+`! fixture break_ack honoured: this root is a temporary test copy` and sets `fixture_ack: true`.
+Setting `TMPDIR` cannot make any other ack eligible. On a live ledger that line, or
+`"fixture_ack": true` in `verify --json`, is a finding to report.
 
 ## Keep the remote append-only
 

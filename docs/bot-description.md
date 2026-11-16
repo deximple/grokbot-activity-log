@@ -10,7 +10,8 @@ Activity ledger rule (always on): before any work run `TID=$(gblog task-start --
 After every significant action (web page, shell command, connector call, file, message sent, desktop use,
 delegation, memory/skill/routine change) run `gblog log --bot "<BOT_NAME>" --task-id "$TID" --action <kind> --target <what> --outcome ok|fail|denied`.
 Record every approval with `gblog approval ...` and close with `gblog task-end ...`.
-Never edit files under the ledger by hand. End each reply with "Ledger: N records, task TID, head HASH".
+Never edit files under the ledger by hand. If a gblog command exits 4, stop and report.
+End each reply with "Ledger: N records, task TID, head HASH".
 If gblog is missing, reinstall it from /workspace/grokbot-activity-log/install.sh and log that you did.
 Use the `activity-log` skill for the full procedure.
 ```

@@ -1,6 +1,6 @@
 # gblog design
 
-This document describes how `gblog` 0.6 behaves and why. The README is the user guide and
+This document describes how `gblog` 0.6 behaves, including the 0.6.1 fixes, and why. The README is the user guide and
 [`SECURITY.md`](../SECURITY.md) is the policy. This is the reference for people who change the code
 or audit a ledger.
 
@@ -54,12 +54,26 @@ changing a file. It makes the change show up in `gblog verify`.
 | A line that is not a JSON object, not UTF-8, or has wrong field types | corrupt-record rule |
 | A `break_ack` that is not the pinned incident (section 9) | verify-time pin |
 | An archived file modified, missing, or addressed outside `archive/` | re-hash and path check |
-| The tail truncated, or the chain rewritten, **while a witness survives** | state head mismatch; anchor containment (section 8); `verify --contains` |
-| A whole chain deleted while `anchors/<bot>.json` survives | missing-chain check in `verify --all` |
+| The tail truncated, the chain emptied, or the chain rewritten, **while a witness survives** | state head mismatch (checked even when the walk finds zero records); anchor containment (section 8); `verify --contains` |
+| A whole chain deleted while `anchors/<bot>.json`, `anchors/<bot>.history.jsonl` or `state/<bot>.json` survives | missing-chain check in `verify --all` |
+| A directory under `logs/` whose name is not a valid chain key (`logs/my bot`, `logs/ops.`, `logs/---`) | invalid-directory check in `verify --all`. Its records are not verified, and readers ignore the directory |
 
 `gblog verify` prints a warning (a `!` line, exit code unchanged) when it has lost a witness:
 `state/<bot>.json` is missing, unreadable or reset to genesis. A warning means "truncation can no
 longer be detected from state". It does not mean "nothing happened".
+
+`gblog verify` also warns when the last record of a chain is dated more than 300 s in the future:
+`last record is dated <ts>, in the future: new records are stamped with that time (see
+clock_regressed)`. Because of the clamp in section 4 (step 4), one future-dated record pins every
+later record to that timestamp and to that day file, so daily reports stop showing the chain. The
+same condition is reported in two more places:
+
+- `append` prints `warning: last record of <bot> is dated <tail ts> (future); this record is
+  stamped with it` on stderr each time it clamps to such a tail;
+- `status` prints `CLOCK <chain>: last record dated <ts> (future)` after the `ALERT` lines, and
+  `status --json` rows carry `future_tail` (the timestamp, or `null`).
+
+This is a warning, not a FAIL. The chain is intact, and refusing to append would stop logging.
 
 ### Not guaranteed
 
@@ -76,7 +90,8 @@ longer be detected from state". It does not mean "nothing happened".
 - **Redaction.** Pattern matching only. See `SECURITY.md` for covered and uncovered shapes.
 - **Approval authenticity.** `jay_approval_id` is a recorded reference, not authentication.
 - **Temporary-copy ledgers.** A ledger whose root is under the system temporary directory is treated
-  as a test copy for the purposes of section 9. Never keep a production ledger there.
+  as a test copy for the purposes of section 9: the committed, fabricated fixture ack is honoured
+  there (with a `!` warning). Never keep a production ledger there.
 
 ## 3. On-disk layout
 
@@ -157,7 +172,17 @@ it is a UTF-8 JSON object whose `hash` equals the hash of its body.
 | present | present | tail self-consistent, `tail.prev == state.head`, `tail.seq == state.seq + 1` | **roll forward** |
 | present | present | anything else (state ahead, state far behind, tail corrupt) | **refuse** |
 
-"Unreadable" includes a state file that parses but is not a JSON object.
+"Unreadable" includes a state file that parses but is not a JSON object. In the first column,
+"present" means the file exists and parses to an object.
+
+A state file that exists but cannot be read follows exactly the same rule as a missing one, in
+`append` and in `update_state`. When a tail is adopted this way, the command prints one of these
+lines on stderr:
+
+- `notice: state/<bot>.json was missing; adopted the log tail (seq <n>)`
+- `notice: state/<bot>.json was unreadable; adopted the log tail (seq <n>)`
+
+`verify` reports the same condition as a `!` warning.
 
 **Roll-forward rule.** Step 6 makes the line durable before step 7 replaces state. A process killed
 between the two, or an `ENOSPC` while writing the state file, leaves state exactly one record behind
@@ -188,7 +213,12 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
   written, and the message tells the caller to omit `--ts` and put the original time in `--detail`.
 - An implicit `now` earlier than the tail's `ts` (the clock stepped backwards) is clamped to the
   tail's `ts`, and the record gains `clock_regressed` holding the real wall-clock value. The chain
-  stays valid and the anomaly is visible.
+  stays valid and the anomaly is visible. When the tail is more than 300 s ahead of the wall clock,
+  the cause is more likely a future-dated record than a clock step. `append` then also prints
+  `warning: last record of <bot> is dated <tail ts> (future); this record is stamped with it` on
+  stderr. The clamp and the exit code are the same in both cases.
+- `archive` checks an explicit `ts` against the tail before it stores the file, so a refused
+  timestamp leaves no `.gz` behind.
 - The CLI additionally rejects a `--ts` more than 300 s in the future. The library does not, because
   tests use fixed dates.
 
@@ -222,6 +252,9 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
 
   It preserves other state keys, appends a `note` (`source: auto`,
   `state rebuilt from log tail (was seq A head B)`) and prints `rebuilt <bot> seq N head <12 hex>`.
+  N and the head are the values state holds after that note.
+  When state already equals the tail, the command prints
+  `state/<bot>.json already matches the log tail; nothing to do`, exits 0 and writes nothing.
   State ahead of the log is always refused with `restore the log from backup`.
 - **`gblog spool list [--bot B]`** shows pending refused events.
 - **`gblog spool replay --bot B`** appends each spooled `record` in file-name order with
@@ -236,8 +269,9 @@ Neither command rewrites, trims, quarantines or rehashes a log line.
 ### Other writers of state
 
 `sync` (`last_sync`) and `capture browser` (history markers) go through `Ledger.update_state()`. It
-takes the bot lock, and if the state file is missing while logs exist it seeds `seq` / `head` from a
-self-consistent tail, or writes nothing and warns. A genesis state is never written over a non-empty
+takes the bot lock, and if the state file is missing or unreadable while logs exist it seeds `seq` /
+`head` from a self-consistent tail (the same test and the same `notice:` line as `append`), or
+writes nothing and warns. A genesis state is never written over a non-empty
 chain.
 
 ## 5. Locks and lock order
@@ -245,8 +279,8 @@ chain.
 | Lock file | Mode | Held by |
 |---|---|---|
 | `state/<bot>.lock` | exclusive (`LOCK_EX`) | `append`, `update_state`, `state rebuild` |
-| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it snapshots log items, state and anchor files |
-| `state/aliases.lock` | exclusive | `save_aliases` |
+| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it snapshots the log lines (parsed record and raw text), `state/<bot>.json`, `anchors/<bot>.json` and the lines of `anchors/<bot>.history.jsonl` |
+| `state/aliases.lock` | exclusive | `alias add`, `alias remove`, `alias strict`: the read, the change and the write of `state/aliases.json` happen in one hold |
 
 Rules:
 
@@ -257,9 +291,14 @@ Rules:
 2. **Readers release before slow work and before returning.** `verify` drops its shared lock before
    it re-hashes archives and before it returns. Callers such as `seal_break` and
    `verify --record` call `append` right after `verify`, so `verify` must never return holding the
-   lock.
+   lock. Everything `verify` judges is computed from the one snapshot taken under the lock: the
+   chain walk, the state check, anchor containment, the layout findings (`bot` field, file names,
+   non-canonical lines) and `--contains`. No file of the chain is read again after the lock is
+   released; only archived files are. A concurrent `append` followed by `anchor` therefore cannot
+   make a running `verify` report a head that is "no longer in the chain".
 3. **No re-entry.** `flock` is per open file description. Code that already holds a bot lock must
    not call the public `append` for the same bot, because the second acquisition would deadlock.
+   `_Lock` is a plain exclusive-or-shared flock holder and keeps no re-entrancy state.
 4. **`aliases.lock` is a leaf.** It is taken alone and nothing else is acquired while it is held.
 5. **Readers other than `verify` do not lock.** `records()`, `report`, `status` and `tail` tolerate
    a half-written last line by treating it as corrupt and skipping it.
@@ -340,7 +379,7 @@ and:
 
 | Field | Meaning |
 |---|---|
-| `proposal` | object: `title`, `category`, `key`, `metric`, `baseline`, `better`, `window` — a snapshot of the proposal, so its effect can be measured later |
+| `proposal` | object: `title`, `category`, `key`, `metric`, `baseline`, `better`, `window`, `count` — a snapshot of the proposal, so its effect can be measured later. `count` is the number of evidence records at decision time (written since 0.6.1). A rejected proposal stays hidden for 28 days unless its evidence reaches twice that `count`. Older `tune` records have no `count`; for them the evidence still inside the window is counted instead |
 
 **`archive`**
 
@@ -352,7 +391,7 @@ and:
 | `bytes` | length of the stored content |
 | `path` | `archive/<bot>/<date>/<sha256>.gz`, relative to the ledger root |
 | `redacted` | `true` if redaction changed the content |
-| `scanned` | present and `false` only when redaction was requested but the content was binary or not UTF-8, so it was stored unscanned |
+| `scanned` | present and `false` whenever the content was stored without secret scanning: redaction was requested but the content was binary or not UTF-8, or `--no-redact` was given. Absent when the content was scanned |
 
 **`break_ack`** — written only by `seal`.
 
@@ -362,10 +401,24 @@ and:
 | `jay_approval_id` | the operator's approval reference (not authentication) |
 | `break` | object: `file`, `line_before`, `line_after`, `seq_before`, `seq_after`, `hash_before`, `orphan_prev`, `hash_after`, `missing_seqs` |
 
-Not stored on disk: `chain` (added in memory when variant chains are merged under one slug) and
-`_dedup` (returned by `archive_file`).
+Not stored on disk:
+
+- `chain`: added in memory when variant chains are merged under one slug.
+- `bot_field`: readers attribute a record to the chain directory it is stored in. When the stored
+  `bot` differs from that directory, the in-memory copy gets `bot` set to the directory name and
+  `bot_field` set to the stored value. `gblog export` prints records as stored and never adds it.
+  `verify` warns about such a record, and FAILs it with `--strict`.
+- `_dedup`: returned by `archive_file`.
+
+Readers other than `export` also replace a non-string value in a text field (`type`, `task_id`,
+`task`, `action`, `target`, `outcome`, `detail`, `source`, `decision`, `observed`, `kind`) with its
+JSON text in memory, so a hash-valid record with odd field types cannot crash a report.
 
 ## 7. Verification
+
+`verify` takes one snapshot under the shared bot lock (section 5): every log line with its raw
+text, the state file, `anchors/<bot>.json` and the lines of `anchors/<bot>.history.jsonl`. All
+checks below, including the layout findings and `--contains`, use that snapshot and one parser.
 
 `verify` walks one chain in file-name order:
 
@@ -376,7 +429,9 @@ Not stored on disk: `chain` (added in memory when variant chains are merged unde
    eligible `break_ack` (section 9) or is a problem. The walk continues into the next segment, so
    every break and both segment heads are reported.
 4. `ts` must not go backwards.
-5. The state head, if present and not genesis, must equal the final head.
+5. The state head, if present and not genesis, must equal the final head. This also applies when
+   the walk found no records: a state file that names a head while the chain is empty is a FAIL,
+   not `OK … 0 records`. A state file whose `head` is not a string counts as unreadable (warning).
 6. Anchor containment (section 8).
 7. Archived files are re-hashed unless `--skip-archives` is given.
 
@@ -384,21 +439,70 @@ The lines printed are `OK`, `PASS (N approved break(s))` or `FAIL`, followed by 
 and `      ! <warning>` lines. Warnings do not change the exit code. `PASS` is not a clean chain;
 callers must report the count.
 
-Warnings: state missing, unreadable or reset to genesis; witness note missing on the `ledger` chain;
-a record whose `bot` differs from its chain directory; a `*.jsonl` file whose name is not
-`YYYY-MM-DD.jsonl`.
+Warnings:
+
+- state missing, unreadable or reset to genesis;
+- witness note missing on the `ledger` chain;
+- the last record dated more than 300 s in the future (section 2);
+- a fixture `break_ack` honoured on a temporary copy (section 9);
+- a record whose `bot` differs from its chain directory;
+- a `*.jsonl` file whose name is not `YYYY-MM-DD.jsonl`.
 
 Flags:
 
-- `--strict` turns the last two warnings into problems, and requires every raw line to equal the
+- `--strict` turns the `bot`-field and file-name warnings into problems, and requires every raw line to equal the
   canonical serialisation of its record. This catches duplicate keys and reformatted lines.
 - `--contains HASH` (repeatable, with `--bot`) fails with `expected hash <12 hex> not found in chain`.
+  It is checked against the hashes of the same snapshot. Together with `--all` it is a usage error
+  (exit 2, `verify --contains cannot be combined with --all`).
 - `--skip-archives` skips step 7 and prints `(archives not checked)`.
-- `--json` prints the result objects, including `warnings` and `fixture_ack`.
+- `--json` prints the result objects as one JSON list (schema below).
 
 `verify --bot` accepts a slug, display name or alias and verifies every chain of that Bot. A name
 with no chain on disk is `FAIL … no chain on disk`. `verify --all` also fails for every anchored
 chain whose `logs/<bot>` directory has disappeared.
+
+`verify --all` prints one `FAIL  <name>  0 records` block, and exits 1, for each of these. A name is
+listed once even when several apply.
+
+| Situation | Problem line |
+|---|---|
+| `anchors/<bot>.json` records more than zero records, `logs/<bot>` is gone | `chain was anchored on <ts> but logs/<bot> is missing` |
+| `anchors/<bot>.history.jsonl` lists at least one head, `logs/<bot>` is gone | `chain was anchored (history, last <ts>) but logs/<bot> is missing` |
+| `state/<bot>.json` holds a non-genesis head, `logs/<bot>` is gone | `state/<bot>.json records seq <n> head <12 hex> but logs/<bot> is missing` |
+| a directory under `logs/` whose name is not in sanitised form (section 10) | `logs/<dir>: directory name is not a valid chain key; its records are not verified` |
+
+The state check skips gblog's own side files (`aliases`, `capture-files-*`, `*.alert`,
+`*.alert.resolved-*`). An invalid directory name is never passed to the chain walk.
+
+### `verify --json` entries
+
+`gblog verify --json` prints one JSON list. Text and JSON output are rendered from the same list of
+result objects, so every chain block of the text output has exactly one entry, including a FAIL for
+a name that has no chain. Exit codes are the same as without `--json`.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `bot` | string | chain directory name. On a synthetic entry: the name that was asked for, or the name of the missing or invalid chain |
+| `ok` | bool | `false` is FAIL. `true` covers `OK` and `PASS (N approved break(s))`; read `approved_breaks` to tell them apart |
+| `records` | int | records walked |
+| `head` | string or null | hash of the last record of the last segment; `genesis` for an empty chain; `null` on a synthetic entry |
+| `problems` | list of strings | the `-` lines. A `--contains` miss is added to the last chain's entry |
+| `warnings` | list of strings | the `!` lines |
+| `missing` | bool | present and `true` only on a synthetic entry (no chain on disk for the name, logs missing while a witness survives, invalid directory). Treat an absent key as `false` |
+| `archives` | int | number of `archive` records in the chain (0 when the walk already had a problem) |
+| `archives_checked` | bool | `false` when `--skip-archives` was given |
+| `approved_breaks` | int | 0 or 1 |
+| `approved` | list | descriptor of the approved break, if any |
+| `jay_approval_id` | string or null | id stored on the honoured ack |
+| `fixture_ack` | bool | `true` when the honoured ack is the fabricated test fixture (section 9). Always `false` for a live seal |
+| `breaks` | list | descriptors of unapproved breaks: the keys of the `break` object in section 6, plus `file_before` when the break spans two day files |
+| `segments` | list | one object per contiguous segment: `seq_start`, `seq_end`, `head`, `line_start`, `line_end`, `file_start`, `file_end`, `records`, `index_start`, `index_end` |
+| `state_problem` | string or null | the state-head mismatch text when that problem is in `problems`, otherwise `null`. `state rebuild` uses it to tell this one repairable problem from every other |
+| `record_error` | string | only with `--record`, and only when the `verify` record itself could not be appended (tail mismatch). `ok` is not changed by it, but the exit code is 1 |
+
+A synthetic entry has exactly these keys: `bot`, `ok` (`false`), `records` (0), `head` (`null`),
+`problems`, `warnings` (empty) and `missing` (`true`).
 
 ## 8. Anchor files and history
 
@@ -428,6 +532,12 @@ the `hash` of some record in the chain. If not, the problem is
 tail truncated)`. A corrupt history line is itself a problem. Chains that were never anchored behave
 as before.
 
+**Missing chain (checked by `verify --all`).** Both anchor files count as witnesses of a chain whose
+log directory is gone: `anchors/<bot>.json` with `records` above zero, and any history line with a
+non-empty `heads` list. Section 7 lists the problem lines. A chain that was removed on purpose keeps
+failing until its anchor files and its state file are removed too; the README ("Upgrading") gives
+the procedure.
+
 **Off-box anchors.** Anchor files live beside the log, so an adversary who rewrites the log can
 rewrite them too. The files only raise the cost. The witnesses that count are outside the computer:
 
@@ -446,10 +556,27 @@ Until 0.6 only `seal` enforced this; `verify` accepted any single self-consisten
 `kim-biseo` and one of these holds:
 
 - its descriptor equals `KIM_BISEO_BREAK` exactly (all nine keys, full hashes); or
-- the ledger root is a temporary copy (its real path is under the real path of the system temporary
-  directory) **and** the six coordinate keys (`file`, `line_before`, `line_after`, `seq_before`,
-  `seq_after`, `missing_seqs`) equal the pinned ones. This is the fabricated test fixture, whose
-  hashes necessarily differ. The result then carries `fixture_ack: true`.
+- its descriptor equals `KIM_BISEO_FIXTURE_BREAK` exactly (the pinned coordinates plus the three
+  hashes of the fabricated test fixture, the same values as
+  `tests/fixtures/kim-biseo-break/expected-break.json`) **and** the ledger root is a temporary copy
+  (its real path is under the real path of the system temporary directory). The result then
+  carries `fixture_ack: true`, and `verify` adds the warning
+  `fixture break_ack honoured: this root is a temporary test copy`.
+
+**`TMPDIR` no longer matters.** In 0.6.0 the fixture rule compared only the six coordinate keys
+(`file`, `line_before`, `line_after`, `seq_before`, `seq_after`, `missing_seqs`) on a temporary
+copy. `tempfile.gettempdir()` honours `TMPDIR`, so `TMPDIR=/workspace` made a live root count as
+"temporary", and an ack at the pinned coordinates with any three hashes became eligible. Since
+0.6.1 both eligible descriptors are compiled in with full hashes:
+
+- Whatever `TMPDIR` says, an ack with other hashes is never eligible.
+- The fixture hashes belong to synthetic record bodies, so they cannot describe a join in a real
+  chain.
+- The temporary-copy condition is kept on purpose: the fixture must never be honoured on a live
+  root.
+- When the fixture ack is honoured, the `!` line shows it in the text output as well as in `--json`.
+- `Ledger.seal_break(copy_fixture=True)` applies the same rule and refuses any other descriptor
+  with `refusing: copy fixture hashes do not match the committed fixture`.
 
 Every other ack, on any chain, adds the problem
 `<file>:<line>: break_ack is not the pinned kim-biseo 2026-11-02 approval` and is ignored when
@@ -488,7 +615,10 @@ there:
 | suffix `.tmp` | `state/<bot>.json.tmp` |
 
 `append` and `alias add` refuse these names (exit 2) unless `logs/<name>` already exists, so a
-legacy chain with such a name keeps appending and verifying.
+legacy chain with such a name keeps appending and verifying. In `append` the check runs right after
+the name is sanitised, before the directory tree is created and before the lock is taken. A refused
+name therefore writes nothing: `gblog note --bot aliases --detail x` exits 2 and creates neither
+`logs/aliases/` nor a `state/aliases.json` that would overwrite the alias registry.
 
 Two names are conventional, not reserved: `ledger` (the seal witness chain and the usual owner of
 the daily routine) and `system` (the default `--bot` of `sync`).
@@ -496,16 +626,37 @@ the daily routine) and `system` (the default `--bot` of `sync`).
 Chain names are otherwise sanitised to `[A-Za-z0-9._-]`. Display names with spaces or non-ASCII
 characters must be registered with `gblog alias add`.
 
+gblog only ever creates chain directories whose name is already in sanitised form. A directory
+under `logs/` whose name is not (it contains a space, starts or ends with `-` or `.`, or has no
+letter or digit at all) is not a chain:
+
+- `verify --all` FAILs it (section 7) and never walks it under a different name;
+- `report`, `status`, `tail`, `coverage`, `tune` and `export` skip it and print
+  `warning: ignoring logs/<dir> (invalid chain directory name); run gblog verify --all` on stderr;
+- one such directory no longer makes `status` or `verify --all` exit 2 for the whole ledger.
+
 ## 11. Exit codes
 
 | Code | Meaning | Examples |
 |---|---|---|
 | 0 | Success | any write; `verify` with only `OK` / `PASS (N approved break(s))` lines (warnings do not change it); `sync --no-push`; a closed output pipe |
-| 1 | Integrity FAIL, or not pushed | `verify` / `anchor` with a FAIL chain; `verify --bot` or `anchor --bot` with no chain on disk; an anchored chain whose logs are missing; a `--contains` miss; `verify --record` whose record append was refused; `sync` that committed but did not push; `capture browser` with no readable history |
-| 2 | Usage or environment error; nothing was written | unknown flag or value; invalid, past or far-future `--ts`; an invalid date; unregistered name under `alias strict on`; reserved name; alias conflict; unreadable `--file`; corrupt side file; `git` failure; `seal` refusal; `state rebuild` refusal; unknown proposal id |
+| 1 | Integrity FAIL, or not pushed | `verify` / `anchor` with a FAIL chain; `verify --bot` or `anchor --bot` with no chain on disk; a chain whose logs are missing while its state file, anchor or anchor history survives; an invalid directory name under `logs/`; a `--contains` miss; `verify --record` whose record append was refused; `sync` that committed but did not push; `capture browser` with no readable history |
+| 2 | Usage or environment error (see below for what may have been written) | unknown flag or value; invalid, past or far-future `--ts`; an invalid date; `verify --contains` with `--all`; unregistered name under `alias strict on`; reserved name; alias conflict; unreadable `--file`; corrupt side file; an unreadable `state/aliases.json` that an `alias` command would overwrite; `git` failure; `seal` refusal; `state rebuild` refusal; unknown proposal id; `OSError` such as a full disk |
 | 3 | Policy refusal | `sync` would push to a public GitHub remote, or to one whose visibility cannot be confirmed |
 | 4 | Tail mismatch | an append was refused and the event is in `spool/<bot>/`; `sync` after committing, when one of its own records was refused; `spool replay` refused again |
 | 130 | Interrupted | Ctrl-C |
+
+Exit 2 covers two situations, and only the first guarantees that nothing was written:
+
+- **Usage error.** An argparse message, or `error: --…`, a reserved or unregistered name, an alias
+  conflict, a `seal:` or `state rebuild:` refusal. Nothing was written.
+- **Environment error.** `error: <strerror>[: <path>]`. The failing step may come after the log
+  line is durable. Example: `ENOSPC` while `state/<bot>.json` is replaced leaves the record in the
+  log, and the next append rolls forward (section 4). Check `gblog tail --bot <bot> -n 1` before
+  retrying, or the record is written twice.
+- Two commands exit 2 after partial work by design. `sync` with a `git` failure has already written
+  its `sync pending` record. `spool replay` exits 2 when it had to skip an unreadable spool file,
+  after appending every readable one; it lists what it replayed.
 
 When several apply to `sync`, 2 and 3 take precedence over 4. No code path prints a traceback for
 malformed ledger input; that would be a bug.
@@ -525,3 +676,12 @@ malformed ledger input; that would be a bug.
   the evidence.
 - **`log --type` still accepts housekeeping types** (`verify`, `sync`, `tune`, `archive`) for
   backward compatibility. Treat such records as claims.
+- **No refusal to append when the tail is future-dated.** That would stop logging. gblog keeps the
+  clamp and warns in `append`, `verify` and `status`.
+- **No failed write when `state/aliases.json` is unreadable.** Losing an event is worse than
+  logging it under an unresolved name. gblog warns, resolves nothing and refuses only to overwrite
+  the registry.
+- **No `allow_abbrev=False`, and `--root` stays on every subcommand.** The abbreviations that became
+  ambiguous are documented in the README instead.
+- **No fixture ack outside a temporary copy.** Pinning the fixture by hash did not remove the
+  temporary-copy condition (section 9).

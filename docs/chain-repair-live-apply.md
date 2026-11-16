@@ -15,7 +15,8 @@ N1 found no seq 1920 anywhere searched, so the live path is this seal, not inser
 - A `break_ack` approves a discontinuity only when it is on the `kim-biseo` chain **and** its descriptor equals `KIM_BISEO_BREAK` in every field: `logs/kim-biseo/2026-11-02.jsonl`, lines 164/165, seq 1919→1921, missing `{1920}`, and the three full hashes.
 - Any other `break_ack` (on another bot, at other coordinates, covering a longer gap, with different hashes, or appended by hand) is itself a problem: `<file>:<line>: break_ack is not the pinned kim-biseo 2026-11-02 approval`. That chain is FAIL.
 - There is therefore no way to approve a break by appending an ack outside this checklist, and this checklist cannot be reused for another chain or another gap.
-- Test-only exception: on a ledger root under the system temporary directory (compared after `realpath`), an ack at the six pinned coordinates with the fabricated fixture hashes is accepted and marked `fixture_ack` in the verify result. This never applies to the live root. Do not move or copy the live ledger under a temporary directory to run this procedure.
+- Test-only exception: on a ledger root under the system temporary directory (compared after `realpath`), an ack whose descriptor equals the committed fabricated fixture (the six pinned coordinates and the three fixture hashes, `KIM_BISEO_FIXTURE_BREAK`) is accepted. Verify then marks the result `fixture_ack` and prints `! fixture break_ack honoured: this root is a temporary test copy`. This never applies to the live root. Do not move or copy the live ledger under a temporary directory to run this procedure.
+- The temporary directory is whatever `TMPDIR` says. From 0.6.1 that no longer widens the rule: the fixture hashes are compiled in, so an ack with any other hashes is FAIL wherever the root is. If `TMPDIR` on the ledger host points at or above the ledger root, unset it before you start, so that a fixture ack can never be honoured there.
 
 ## Not part of this procedure
 
@@ -43,8 +44,9 @@ A crash inside `append` can leave state exactly one record **behind** the file. 
 7. Once: `gblog seal --bot kim-biseo --jay-approval-id <that id>`.
    The command refuses (exit 2, nothing appended) if the on-disk line, seq, or full hashes differ from `KIM_BISEO_BREAK`, if the id is a placeholder, if a `break_ack` is already present, or if the `ledger` witness chain has a tail mismatch. It only appends. It does not rewrite 164/165.
 8. `gblog verify --bot kim-biseo` — expect exit 0 and `PASS (1 approved break)`, with no `!` line under it (see "Witness warning"). `gblog verify --all` must not print FAIL. A new break is still FAIL, and so is any second or different `break_ack`.
-9. `gblog anchor` again. kim-biseo is now PASS with `approved_breaks` 1 and the same id. Other chains still resume from their own anchors.
-10. Leave the witness note on the `ledger` bot chain. `gblog tail --bot ledger -n 1` shows it: a `note` with target `kim-biseo` and detail `break_ack witness logs/kim-biseo/2026-11-02.jsonl seq 1919->1921 missing [1920]`. Do not delete `spool/` or `state/*.alert.json` if an append was refused; report those and stop.
+9. `gblog verify --bot kim-biseo --json` must show `"fixture_ack": false`. If it shows `true` (the text output then also has the line `! fixture break_ack honoured: this root is a temporary test copy`), verify honoured the fabricated test-fixture ack because the root resolves under the temporary directory. That is not the live seal: stop and report.
+10. `gblog anchor` again. kim-biseo is now PASS with `approved_breaks` 1 and the same id. Other chains still resume from their own anchors.
+11. Leave the witness note on the `ledger` bot chain. `gblog tail --bot ledger -n 1` shows it: a `note` with target `kim-biseo` and detail `break_ack witness logs/kim-biseo/2026-11-02.jsonl seq 1919->1921 missing [1920]`. Do not delete `spool/` or `state/*.alert.json` if an append was refused; report those and stop.
 
 ## Witness warning
 
@@ -57,7 +59,7 @@ After the seal, verify cross-checks the witness. If the pinned ack is honoured a
 - It is a warning, not a FAIL. The line above it still says `PASS (1 approved break)` and the exit code is still 0.
 - It means the ack is on the kim-biseo chain but its witness is not on the `ledger` chain: the witness append did not happen, or the `ledger` chain was replaced or truncated afterwards.
 - Do not run `seal` again (it refuses: a `break_ack` is already present). Do not hand-append a note. Report the line verbatim to Jay and stop.
-- The warning is only raised when a `ledger` chain exists. If `logs/ledger` is absent after the seal, no warning is printed and the witness is also missing; step 10 catches that.
+- The warning is only raised when a `ledger` chain exists. If `logs/ledger` is absent after the seal, no warning is printed and the witness is also missing; step 11 catches that.
 - Other `!` lines (for example `state/kim-biseo.json missing or unreadable: …` or `state/kim-biseo.json was reset to genesis`) are separate warnings. Report them verbatim too; they are not expected in this procedure.
 
 ## Alert

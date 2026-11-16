@@ -77,8 +77,12 @@ If the ledger directory is missing, report "ledger missing" instead of creating 
   refused events and `gblog state rebuild` rewrites `state/<bot>.json` from the log tail; both change what
   the ledger says and need the operator. A handled alert is renamed to
   `state/<bot>.alert.resolved-<stamp>.json` and no longer counts as open.
-- **Exit codes.** 0 ok; 1 integrity FAIL or not pushed; 2 usage or environment error (nothing was written);
-  3 policy refusal; 4 tail mismatch.
+- **Exit codes.** 0 ok; 1 integrity FAIL or not pushed; 2 usage or environment error; 3 policy refusal;
+  4 tail mismatch. After exit 2, a usage error (an argparse message, `error: --…`) wrote nothing. An
+  environment error (`error: <system message>`) may already have written the record: check
+  `gblog tail -n 1` before retrying.
+- **No capture step.** `gblog capture browser` and `gblog capture files` run in the weekly tune routine
+  (`docs/routine-weekly-tune.md`, step 2) and nowhere else. The shell hook needs no routine.
 
 ## Weekly cross-check (manual, 5 minutes)
 

@@ -22,8 +22,17 @@ changes that do not help get reverted.
 
 ## Sequence of work
 
+When this runs as the weekly routine, open the run with
+`gblog task-start --bot <your slug> --source routine --task "Weekly tune"` and close it with
+`gblog task-end` (activity-log skill, step 1).
+
 1. **Refresh evidence**: `gblog verify --all` must exit 0. `FAIL` stops the tune. `PASS (N approved break(s))` is a sealed break to report, not a clean chain; do not seal it yourself. Run `gblog capture browser --bot <bot>`
    and `gblog capture files --bot <bot>` for each Bot that has a computer session, then `gblog coverage`.
+   This weekly run is the one place where browser and file capture run: the daily audit routine does not
+   capture, and Bots do not run capture inside ordinary tasks.
+   On a shared computer all Bots share one browser profile and one `/workspace`, so browser and file capture
+   cannot attribute activity to one Bot: read per-Bot coverage for those two kinds as "someone on this
+   computer did it".
 2. **Generate proposals**: `gblog tune --days 28` (writes `tuning/<date>.md` and `tuning/proposals.json`).
    Read the whole report. Categories and what they map to:
 
@@ -71,6 +80,8 @@ changes that do not help get reverted.
 - Next week's report shows the change in "Effect of applied changes". If it says **not helping**
   for 7+ days, propose the revert — do not keep stacking fixes on the same problem.
 - Never edit `logs/` or `tuning/proposals.json` by hand.
+- Lines that start with `!` in `gblog verify` output are warnings: report them verbatim. If any command
+  exits 4 with `ALERT tail mismatch`, stop and report; do not run `gblog spool replay` or `gblog state rebuild`.
 
 ## What requires approval
 

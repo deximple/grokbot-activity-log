@@ -31,6 +31,9 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
    ```
    Keep `$TID` for the rest of the task. If the task spans several turns, record
    the id in your reply so you can pick it up again (`--task-id "$TID"`).
+   In a routine run, add `--source routine`:
+   `TID=$(gblog task-start --bot "$BOT" --source routine --task "<routine name>")`.
+   Without it the weekly tune counts the runs as manual repeats and proposes the routine again.
 
 2. **Log each significant action immediately after it happens**, not in a batch at the end:
 
@@ -81,9 +84,19 @@ Also use it when the user asks "what did you do?" — answer from the ledger, no
 
 ## Common mistakes
 
-- **Exit 2 means nothing was written.** A rejected flag or value is a usage error. Fix the command and run it
-  again before you do anything else; do not carry on as if the record existed. Spell flags in full
-  (`--source`, not `--s`): abbreviations can be ambiguous.
+- **Exit 2 is an error. The message tells you whether anything was written.**
+  - A *usage error* wrote nothing. You see an argparse message (`usage: gblog …` followed by
+    `gblog <command>: error: …`), or a line such as `error: --ts must look like …`,
+    `error: bot name '…' is reserved …` or `error: bot name '…' is not registered …`.
+    Fix the command and run it again before you do anything else; do not carry on as if the record existed.
+  - An *environment error* may already have written the record. You see `error: <system message>`, for
+    example `error: No space left on device: <path>`. Run `gblog tail --bot "$BOT" -n 1` before you retry.
+    If your record is the last line, do not run the command again (that would log it twice); report the
+    error to the user instead.
+  - `gblog spool replay` (operator only) exits 2 when it had to skip an unreadable spool file. It lists the
+    events it did replay.
+
+  Spell flags in full (`--source`, not `--s`): abbreviations can be ambiguous.
 - **`--detail` is the canonical flag for free text.** `--summary` is accepted as the same flag
   (`gblog task-end ... --summary "report sent"` works). There is no `--message`, `--result` or `--description`.
 - **Always attach the task.** Pass `--task-id "$TID"` on every command, or `export GBLOG_TASK="$TID"` right
@@ -142,15 +155,25 @@ bash /workspace/grokbot-activity-log/install.sh
 ```
 Log the recovery itself: `gblog log --bot "$BOT" --action shell --target "install.sh" --detail "reinstalled gblog after reset"`.
 
-## Automatic evidence (do this once per computer)
+## Automatic evidence
 
-Your self-report is checked against evidence collected without you. Install it once and never disable it:
+Your self-report is checked against evidence collected without you. Install the shell hook once per
+computer and never disable it:
 ```bash
-gblog capture shell-hook --bot "$BOT" --install      # every shell command -> ledger (source=auto)
-gblog capture browser --bot "$BOT"                    # new Chrome visits -> ledger; run from the daily routine
-gblog capture files --bot "$BOT" --path /workspace    # changed files -> ledger; run from the daily routine
+gblog capture shell-hook --bot "$BOT" --install      # interactive bash only: commands typed at a prompt -> ledger (source=auto)
+gblog capture browser --bot "$BOT"                    # new visits from browser history (Chromium family and Firefox) -> ledger
+gblog capture files --bot "$BOT" --path /workspace    # changed files -> ledger
 gblog coverage                                        # % of observed actions you also reported
 ```
+- **The shell hook is interactive bash only.** Non-interactive tool shells and zsh are not captured, so the
+  hook never replaces your own `gblog log --action shell` records.
+- **Where capture runs.** `capture browser` and `capture files` run in one place: step 2 of the weekly tune
+  routine (`docs/routine-weekly-tune.md`, the `bot-tune` skill). The daily audit routine does not run them,
+  and you do not run them inside an ordinary task.
+- **Shared computer.** All Bots share one browser profile and one `/workspace`, so browser and file capture
+  cannot attribute activity to one Bot: read per-Bot coverage for those two kinds as "someone on this
+  computer did it", not as proof of which Bot did.
+
 A coverage below 80% for an action kind means you are forgetting that kind; the `bot-tune` skill turns that into a rule change.
 
 ## Limits you must disclose

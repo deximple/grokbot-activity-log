@@ -10,7 +10,127 @@ any release listed here. A ledger written by any version still verifies with the
 Entries for 0.1 to 0.5 are retroactive. They were reconstructed from the code and the README, and
 their release dates were not recorded.
 
-## [0.6.0] - Unreleased
+## [0.6.1] - Unreleased
+
+Implements the round-2 audit of 2026-11-16. The item ids in parentheses (R-01 … R-25) refer to that
+audit. The record format and the hash rule are unchanged. A healthy ledger prints the same
+`gblog verify --all` output as with 0.6.0.
+
+### Behaviour changes
+
+Read these before upgrading a routine or a script that branches on output or exit codes.
+
+- **An emptied or deleted chain no longer verifies while a witness survives (R-01).**
+  - `verify` applies the state-head check even when the walk found no records. A chain whose day
+    files were emptied while `state/<bot>.json` names a head is now FAIL. It used to print
+    `OK … 0 records  head genesis`.
+  - `verify --all` prints `FAIL  <bot>  0 records` for a name without a `logs/<bot>` directory whose
+    `state/<bot>.json` still holds a head, or whose `anchors/<bot>.history.jsonl` still lists one.
+    0.6.0 looked at `anchors/<bot>.json` only.
+  - To retire a chain on purpose, see "Upgrading" in the README.
+- **Reserved bot names are refused on append (R-02).** `gblog note --bot aliases …` exits 2 and
+  writes nothing. 0.6.0 refused these names only in `alias add`, so the command above overwrote the
+  alias registry.
+- **Invalid chain directories (R-04).** A directory under `logs/` whose name is not a valid chain
+  key (`logs/my bot`, `logs/ops.`, `logs/---`) is FAIL in `verify --all`. Readers skip it with a
+  warning on stderr. It used to be read by reports without being verified, and `logs/---` made
+  `status` and `verify --all` exit 2.
+- **Records are attributed by chain directory (R-04).** `report`, `status`, `tail`, `coverage` and
+  `tune` list a record under the chain it is stored in, even when its `bot` field names another
+  Bot. `export` still prints records as stored.
+- **An unreadable `state/<bot>.json` is treated like a missing one (R-07).** `append` adopts a
+  self-consistent tail and prints `notice: state/<bot>.json was unreadable; adopted the log tail
+  (seq <n>)`. It used to refuse with exit 4. A corrupt tail is still refused.
+- **`verify --contains` with `--all` exits 2 (R-08).** It used to search every chain.
+- **The fixture `break_ack` is pinned by hash (R-09).** On a temporary copy, an ack at the pinned
+  coordinates with any other hashes is now FAIL. `Ledger.seal_break(copy_fixture=True)` refuses any
+  descriptor other than the committed fixture.
+- **An unreadable `state/aliases.json` is reported (R-10).** gblog warns on stderr, resolves no
+  names and treats strict mode as off until the file is restored. `alias add`, `alias remove` and
+  `alias strict` refuse to overwrite it (exit 2). It used to be treated as an empty registry
+  without a message.
+- `alias add` compares case-insensitively when it decides whether `--move` is needed (R-10).
+- `state rebuild` on a chain whose state already matches the tail prints
+  `state/<bot>.json already matches the log tail; nothing to do` and writes nothing. It used to
+  rewrite state and append a note. The `rebuilt …` line now shows the seq and head that state holds
+  after the note (R-13).
+- `archive --no-redact` records carry `scanned: false` (R-13).
+- `archive --ts` earlier than the Bot's last record stores no file. It used to leave the `.gz`
+  behind (R-13).
+- `sync` commits `<root>/.gitignore` and removes `state/*.lock` and `state/capture-files-*.json`
+  from the git index. The files stay on disk (R-14).
+- `status` can print two new kinds of line after the table: `CLOCK <chain>: last record dated <ts>
+  (future)`, and `ALERT` lines for chains that have an alert or spool files but no log directory
+  (R-03, R-13).
+- New stderr lines (stdout is unchanged):
+  - `warning: last record of <bot> is dated <ts> (future); this record is stamped with it` (R-03);
+  - `warning: skipped <n> unreadable line(s) in logs/<chain>; run gblog verify` (R-06);
+  - `warning: ignoring logs/<dir> (invalid chain directory name); run gblog verify --all` (R-04);
+  - `notice: state/<bot>.json was missing; adopted the log tail (seq <n>)` (R-07).
+- Tuning Markdown has an empty line before `### already applied` (R-11).
+
+### Security
+
+- **State is a witness for an empty or missing chain (R-01).** See above. This restores the
+  guarantee stated in `SECURITY.md`.
+- **Future-dated tail is signalled (R-03).** `verify` warns
+  `last record is dated <ts>, in the future: new records are stamped with that time (see
+  clock_regressed)`. The clamp and the exit codes do not change.
+- **Unverified directories no longer reach reports (R-04).**
+- **`TMPDIR` can no longer widen the fixture rule (R-09).** `KIM_BISEO_FIXTURE_BREAK` pins the three
+  fixture hashes. A fixture ack that is honoured prints
+  `! fixture break_ack honoured: this root is a temporary test copy`.
+- **Redaction (R-12).** The JSON-key rules also cover keys ending in `pwd` and `access_key`
+  (`{"db_pwd": "…"}`, `{"SecretAccessKey": "…"}`), as the documentation already said. No pattern was
+  removed.
+- **Private files (R-14).** Lock files are created `0o600`; `state/` and `spool/<bot>/replayed/`
+  are created `0o700`.
+
+### Added
+
+- `status --json` rows gain `future_tail` (R-03).
+- `verify --json` has an entry for every FAIL, including a name with no chain on disk and a chain
+  whose logs are missing (`"missing": true`) (R-08).
+- `tune` records store `count` in the `proposal` snapshot (R-11).
+- In-memory record key `bot_field` (R-04).
+
+### Changed
+
+- `verify` takes one snapshot of the log, state and anchor files under the shared lock and uses one
+  parser for every check, including `--strict` and `--contains` (R-05).
+- `verify --json` is rendered from the same result list as the text output (R-08).
+- `alias add`, `alias remove` and `alias strict` read, modify and write the registry in one hold of
+  `aliases.lock` (R-10).
+- A rejected tuning proposal stays hidden for 28 days unless its evidence reaches twice the count
+  stored at decision time. Evidence ageing out of the window no longer brings it back early (R-11).
+- `task-end` looks for the matching `task-start` newest day first and stops at the first hit (R-13).
+- Atomic JSON writes use a per-process temporary file name (R-14).
+- Dead code and duplicate helpers were removed; behaviour is unchanged (R-15).
+
+### Fixed
+
+- A concurrent `append` followed by `anchor` no longer makes a running `verify` report
+  `anchored head … is no longer in the chain` (R-05).
+- `verify --bot <unknown> --json` printed `[]` with exit 1 (R-08).
+- Crash paths (R-05, R-06, R-10). Each of these used to end in a traceback:
+  - a deeply nested JSON line in a log file;
+  - an archive with a corrupted gzip stream (now `<path>: unreadable (…)`);
+  - wrong-typed `seq`, `head`, `updated` or `last_sync` in a state file (`status`);
+  - a `state/aliases.json` that is not an object;
+  - records with a lone surrogate, or a non-ASCII display name, written to an ASCII stream;
+  - non-string `detail`, `target`, `task` or `task_id` in a hash-valid record;
+  - an unusable browser-capture marker;
+  - a `proposals.json` entry without `bot`.
+- Readers no longer skip unreadable lines without saying so (R-06).
+
+### Documentation
+
+- `docs/DESIGN.md`, README, `SECURITY.md`, both skills, both routine prompts and the template docs
+  were brought in line with the code (R-22 … R-25). In particular: exit 2 no longer claims that
+  nothing was written, the Auto-review rule is an allow-list, and browser and file capture run in
+  the weekly tune routine only.
+
+## [0.6.0] - 2026-11-16
 
 Implements the 2026-11-16 audit. The item ids in parentheses (I-01 … I-42) refer to that audit.
 
@@ -46,6 +166,7 @@ Read these before upgrading a routine or a script that branches on output or exi
   to move the alias silently (I-19).
 - New chains cannot use the reserved bot names: `aliases`, anything starting with `capture-files-`,
   anything ending in `.alert`, `.lock` or `.tmp`. Existing chains with such names keep working (I-19).
+  Correction: in 0.6.0 only `alias add` enforced this. `append` enforces it from 0.6.1.
 - `seal` rejects more placeholder approval ids, case-insensitively: `pending-jay`, `pending`, `tbd`,
   `todo`, `placeholder`, `<id>`, and any id shorter than 4 characters (I-01).
 - `sync` exits 4 when one of its own bookkeeping appends was refused by the tail check. It still
@@ -56,8 +177,20 @@ Read these before upgrading a routine or a script that branches on output or exi
   (I-16).
 - `tune --apply X --reject Y` is a usage error (exit 2). It used to record X as rejected (I-13).
 - `tail -n 0` prints nothing. It used to print the whole ledger (I-13).
-- The prefix abbreviation `--s` on `log` is now ambiguous (`--source` / `--summary`). Spell the flag
-  out (I-13).
+- Some prefix abbreviations of flags are now ambiguous and exit 2. Spell the flag out (I-12, I-13):
+  - `--s` on `log` (`--source` / `--summary`), on `archive` (was `--stdin`) and on `tune` (was
+    `--stdout`);
+  - `--r` on `verify` (was `--record`), `sync` (was `--remote`), `tune` (was `--reject`) and
+    `capture shell-hook` (was `--rc`), because every subcommand now accepts `--root`;
+  - `--a`, `--al` and `--allow` on `sync` (`--allow-public` / `--allow-unknown-visibility`).
+- `gblog init` writes `.gitignore`, but `state/*.lock` and `state/capture-files-*.json` files that
+  an existing backup repository already tracks stay tracked until they are removed from the index.
+  The README ("Upgrading") has the command; 0.6.1 `sync` does it (I-22).
+- `status` prints an `ALERT` line for every `state/<bot>.alert.json`, including stale files left by
+  0.4 or 0.5. The README ("Upgrading") says how to dismiss one without replaying it (I-05).
+- A chain that was retired by removing `logs/<bot>` while `anchors/<bot>.json` remains makes
+  `verify --all` FAIL until its anchor files are removed. The README ("Upgrading") has the
+  procedure (I-02).
 - New ledger files are created `0o600` and new directories `0o700`. Existing files are not changed
   (I-22).
 - Report, tune and coverage Markdown collapses newlines and tabs in ledger-derived text to one
@@ -195,7 +328,9 @@ Read these before upgrading a routine or a script that branches on output or exi
 - A log file whose last line has no trailing newline no longer gets the next record glued onto that
   line (I-22).
 - Finding the tail record no longer scans the whole day file on every append (I-22).
-- Tests no longer use the network, the developer's browser history or the wall clock (I-30).
+- Tests no longer use the network or the developer's browser history, and no longer call the
+  deprecated `utcnow()`. Tests of relative windows (tune, the future `--ts` bound, browser capture)
+  still read the wall clock (I-30).
 
 ## [0.5.0]
 

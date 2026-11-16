@@ -47,10 +47,15 @@ OK    ops                       5 records  head 3c4241c25eb5
   - **Detected (FAIL):** an edited record; a deleted, inserted, re-ordered or duplicated line; a
     timestamp that goes backwards; a forged `break_ack`. A truncated tail or a rewritten chain is
     detected **while a witness survives**: `state/<bot>.json`, an anchor under `anchors/`, or a head
-    you pass to `gblog verify --bot <bot> --contains <hash>`. A whole chain deleted while its anchor
-    remains is reported by `gblog verify --all`.
+    you pass to `gblog verify --bot <bot> --contains <hash>`. An emptied chain whose state file
+    remains is FAIL. A whole chain deleted while its state file, anchor or anchor history remains is
+    reported by `gblog verify --all`, and so is a directory under `logs/` whose name is not a valid
+    chain key.
   - **Warned (`!` lines, exit code unchanged):** `state/<bot>.json` is missing, unreadable or reset to
     genesis. Truncation can then no longer be detected from state. Report these lines verbatim.
+    Also warned: a last record dated in the future. Every later record is then stamped with that
+    time and lands in that day file, so daily reports stop showing the chain; `gblog status` prints
+    a `CLOCK <chain>: last record dated <ts> (future)` line for it.
   - **Not detected:** truncation or a full rewrite by someone who also removes or rewrites state, the
     anchors and the git remote, when nobody kept a head off the computer. For that reason the daily
     routine posts every chain head in the conversation, and the backup remote should refuse
@@ -161,7 +166,7 @@ cat body.txt | gblog archive --bot ops --kind message --stdin --name "reply to v
 ```
 
 UTF-8 text is redacted *before* hashing, using the same best-effort patterns as records (add `--no-redact`
-to store verbatim). Non-UTF-8/binary content is stored unscanned (`scanned: false` on the record, with a
+to store verbatim; the record then carries `scanned: false`). Non-UTF-8/binary content is stored unscanned (`scanned: false` on the record, with a
 warning on stderr), so do not archive binaries or UTF-16 exports that may hold credentials. Identical content
 is stored once per Bot and day. `gblog verify` re-hashes every archived file: a modified or missing archive
 fails verification exactly like an edited log line. Use `gblog verify --skip-archives` for a quick chain-only
@@ -187,6 +192,12 @@ gblog alias strict on       # refuse unknown names instead of warning
   byte-for-byte as they were (and still verify).
 - `alias add` refuses a variant or display name that is already another Bot's slug or display name, and a slug
   that is already another Bot's alias. `alias list` prints any such conflicts left by older versions, with the fix.
+- `alias add` also refuses a variant that is currently another Bot's alias (`'<variant>' is an alias of <other>; use --move`).
+  Add `--move` to take it over on purpose; it is then removed from the other Bot. The comparison ignores letter case.
+- Reserved names cannot be used for a new chain or a new slug: `aliases`, anything starting with `capture-files-`,
+  and anything ending in `.alert`, `.lock` or `.tmp`. They would collide with gblog's own files under `state/`.
+  `alias add` and every write command refuse them with exit 2 and write nothing. A chain that already exists
+  under such a name keeps working.
 - Name Bots by role, in English (`chief-of-staff`, `personal-assistant`, `editor`, …). The slug is the chain key
   and never changes; rename freely through `--display` and keep old names as `--alias`.
 - Unknown names log normally but warn on stderr (or are refused with `strict on`).
@@ -259,7 +270,9 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 - Do not pass `--ts` unless you must. It has to be a real timestamp (`2026-11-16T09:30:00Z`), not earlier
   than the Bot's last record and not in the future; otherwise gblog exits 2 and writes nothing. Put a
   historical time in `--detail`.
-- Spell flags out: on `log`, the abbreviation `--s` is ambiguous (`--source` / `--summary`).
+- Spell flags out. Abbreviations that became ambiguous in 0.6 exit 2: `--s` on `log`, `archive` and `tune`;
+  `--r` on `verify`, `sync`, `tune` and `capture shell-hook`; `--a`, `--al` and `--allow` on `sync`.
+  The full table is under "Upgrading".
 - `log --type` still accepts housekeeping types (`verify`, `sync`, `tune`, `archive`). A `verify ok` record
   in the ledger is therefore a claim, not proof; rerun `gblog verify`.
 
@@ -267,7 +280,7 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 |---|---|
 | 0 | OK. For `verify`: `OK` or `PASS (N approved break(s))`; `!` warnings do not change it. |
 | 1 | Integrity FAIL (`verify`, `anchor`, unknown `--bot` on those, `--contains` miss), or `sync` committed but did not push. |
-| 2 | Usage or environment error (bad flag or value, invalid `--ts` or date, unregistered name in strict mode, unreadable file, `git` failure, `seal` or `state rebuild` refused). Nothing was written. |
+| 2 | Usage or environment error. A **usage error** wrote nothing: an argparse message, or `error: --…` and similar lines for a bad flag or value, an invalid `--ts` or date, an unregistered name in strict mode, a reserved name, a `seal` or `state rebuild` refusal. An **environment error** (`error: <system message>`, for example `error: No space left on device: <path>`, or `git failed: …` from `sync`) may already have written the record, so check `gblog tail --bot <bot> -n 1` before you retry. `spool replay` exits 2 when it had to skip an unreadable spool file; it lists the events it did replay. |
 | 3 | Policy refusal: `sync` will not push to a public or unconfirmed-visibility GitHub remote. |
 | 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. |
 
@@ -297,7 +310,10 @@ Full field reference per record type: [`docs/DESIGN.md`](docs/DESIGN.md).
    > Run `gblog sync --remote <git-url> --no-push` once, then sign in to GitHub in the computer's browser / `gh auth login` when asked.
    Use a fine-grained token scoped to that one repo and enter it through the secure secret request, never in chat.
 5. Create the daily audit routine from `docs/routine-daily-audit.md` and the weekly tune routine from `docs/routine-weekly-tune.md`; save `skills/bot-tune/SKILL.md` as a skill too.
-6. Add an Auto-review *Allow automatically* rule for `gblog` commands in `/workspace/activity-log` so routine runs don't stall on approvals.
+6. Add Auto-review *Allow automatically* rules for `/workspace/activity-log` so routine runs don't stall on approvals. Use an allow-list, not one rule for every `gblog` command:
+   - **Allow automatically:** `gblog task-start`, `log`, `approval`, `note`, `task-end`, `archive`, `verify`, `anchor`, `report`, `status`, `tail`, `coverage`, `tune`, `capture`, and `sync` without any `--allow-*` flag.
+   - **Never allow automatically:** `gblog seal`, `gblog spool replay`, `gblog state rebuild`, `gblog alias`, and the `sync` override flags `--allow-public` and `--allow-unknown-visibility`. Each of these changes what the ledger means or where it may be pushed, and needs your explicit yes every time (see [`SECURITY.md`](SECURITY.md)).
+   - Everything else asks as usual. `gblog spool list` is read-only; add it if you want the daily routine to include its output without waiting for you.
 
 Run it anywhere else (laptop, CI, another agent) with `GBLOG_ROOT=/path ./bin/gblog …`.
 
@@ -330,6 +346,72 @@ git -C /workspace/grokbot-activity-log pull && bash /workspace/grokbot-activity-
 gblog verify --all                  # chains are format-compatible; nothing to migrate
 gblog alias add --slug <slug> --display <name> --alias <old-variant> ...   # once per Bot that has name variants
 ```
+
+### After upgrading from 0.5 or earlier
+
+Check these four things once. The operator does the last two; a Bot must not.
+
+**1. Abbreviated flags.** New flags made some prefix abbreviations ambiguous, and argparse then exits 2.
+Spell the flag out in routines and scripts.
+
+| Command | No longer accepted | Now ambiguous between | Shortest form that still works |
+|---|---|---|---|
+| `verify` | `--r` | `--record`, `--root` | `--rec` |
+| `sync` | `--r` | `--remote`, `--root` | `--rem` |
+| `sync` | `--a`, `--al`, `--allow` | `--allow-public`, `--allow-unknown-visibility` | `--allow-p` |
+| `tune` | `--r` | `--reject`, `--root` | `--rej` |
+| `tune` | `--s` | `--stdout`, `--summary` | `--std` |
+| `capture shell-hook` | `--r` | `--rc`, `--root` | `--rc` |
+| `archive` | `--s` | `--stdin`, `--source`, `--summary` | `--std` |
+| `log` | `--s` | `--source`, `--summary` | `--so` |
+
+**2. Lock and snapshot files already in git.** `gblog init` writes `<root>/.gitignore`
+(`state/*.lock`, `*.tmp`, `state/capture-files-*.json`), but an ignore file does not untrack files
+that an older version already committed. From 0.6.1 `gblog sync` commits `.gitignore` and removes
+those files from the git index itself; they stay on disk. On 0.6.0, do it once by hand:
+
+```bash
+git -C "${GBLOG_ROOT:-/workspace/activity-log}" rm -r -q --cached --ignore-unmatch -- 'state/*.lock' 'state/capture-files-*.json'
+gblog sync -m "untrack lock and snapshot files"
+```
+
+**3. Stale alerts.** `gblog status` prints `ALERT <bot>: tail mismatch since <ts> (<n> spooled)` for
+every `state/<bot>.alert.json`, including files left behind by 0.4 or 0.5 after the problem was
+fixed. Upgrading does not clear them.
+
+- If you want the refused events in the ledger, run `gblog spool replay --bot B`. It appends them
+  with `spooled_at` and resolves the alert.
+- To dismiss them without replaying:
+
+```bash
+cd "${GBLOG_ROOT:-/workspace/activity-log}"
+gblog spool list --bot B          # read what was refused first
+gblog verify --bot B              # must print OK; a chain that still mismatches is not a stale alert
+mkdir -p spool/B/replayed
+mv spool/B/*.json spool/B/replayed/    # skip this line if `spool list` printed nothing
+gblog note --bot B --detail "dismissed stale alert from <date>; <n> spooled event(s) moved to spool/B/replayed without replay"
+gblog spool replay --bot B        # nothing is left to replay; the alert becomes state/B.alert.resolved-<stamp>.json
+```
+
+**4. Retired chains.** `gblog verify --all` FAILs for every name that has no `logs/<bot>` directory
+but still has a witness: `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, or (from 0.6.1) a
+`state/<bot>.json` that names a head. That is what the check is for, so a chain you removed on
+purpose keeps failing until you retire it explicitly.
+
+- The simplest way to retire a chain is to leave its logs in place. It keeps verifying and costs nothing.
+- If the logs are already gone, record the retirement and then remove the witnesses:
+
+```bash
+cd "${GBLOG_ROOT:-/workspace/activity-log}"
+gblog note --bot ledger --detail "retired chain B: logs removed on <date>, last head <64-hex head from anchors/B.json>, reason: <why>"
+rm -f anchors/B.json anchors/B.history.jsonl state/B.json state/B.lock
+gblog verify --all
+gblog sync -m "retire chain B"
+```
+
+The note is then the only record of that chain on the computer, so put the full last head in it.
+Removing witnesses is also exactly what someone hiding a deletion would do; the heads posted by the
+daily routine and the git history of the backup remote are what let you tell the two apart.
 
 ## Development
 
