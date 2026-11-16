@@ -277,7 +277,7 @@ class DailyAuditTest(ExamplesBase):
         stub = self.stub()
         log = os.path.join(self.tmp, "stub.log")
         url = "https://deploy:s3cretTok3n@git.example.invalid/private-ledger.git"
-        steps = ["verify --all --record", "anchor", "report --date yesterday",
+        steps = ["verify --all --record", "anchor --skip-archives", "report --date yesterday",
                  "sync --remote=%s -m daily ledger sync" % url, "status"]
         cases = (  # verify, anchor, report, sync -> script
             (0, 0, 0, 0, 0),
@@ -315,7 +315,7 @@ class DailyAuditTest(ExamplesBase):
         log = os.path.join(self.tmp, "stub.log")
         rc, out, err = self.audit(GBLOG_BIN=self.stub(), STUB_LOG=log)
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.calls(log), ["verify --all --record", "anchor", "report --date yesterday", "status"])
+        self.assertEqual(self.calls(log), ["verify --all --record", "anchor --skip-archives", "report --date yesterday", "status"])
 
     def test_missing_gblog_is_an_environment_error(self):
         os.makedirs(os.path.join(self.root, "logs"))

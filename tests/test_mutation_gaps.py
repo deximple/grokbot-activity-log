@@ -1490,7 +1490,6 @@ class ArchiveClaimGapTest(Base):
 
     # bug: D-8. A bare `archive` record names no file ("a claim, not stored evidence"), yet verify counts
     # it in the "(N archived file(s) intact)" suffix of the OK line.
-    @unittest.expectedFailure
     def test_bare_archive_record_is_not_counted_as_intact(self):
         self._claim()
         rc, out, err = run(["verify", "--bot", "ops"], self.root)

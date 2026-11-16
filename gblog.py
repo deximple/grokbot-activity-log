@@ -214,6 +214,100 @@ _SECRET_PATTERNS = [
 
 
 # --------------------------------------------------------------------------- utils
+# -- K4-04: two rules of _SECRET_PATTERNS (env-style names, JWT) took quadratic time on crafted text. They are
+# replaced by one-pass functions with the same matches and the same output; the former expression stays on the
+# rule object (``former``) as the oracle of the differential tests.
+_ENV_KW = r"(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key)"
+_ENV_KW_ANY_RE = re.compile(r"(?i)" + _ENV_KW)
+_ENV_CHAIN_RE = re.compile(r"(?i)[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*")
+_ENV_GROUP_RE = re.compile(r"(?i)[A-Za-z0-9]+")
+_ENV_KW_RE = re.compile(r"(?i)" + _ENV_KW + r"(?![A-Za-z0-9])")
+_ENV_TAIL_RE = re.compile(r"(?i)\s*[:=]\s*(?:\"[^\"\n]{1,}\"|'[^'\n]{1,}'|[^\s'\"&]{6,})")
+_JWT_RUN_RE = re.compile(r"[A-Za-z0-9_-]+")
+_JWT_HEAD_RE = re.compile(r"\beyJ")
+_JWT_REST_RE = re.compile(r"\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+
+
+def _redact_env_names(text: str) -> str:
+    """The env-style rule (audit I-08) in one pass.
+
+    A match can only start at a group of a chain ``G([_-]G)*``, its name always ends where the chain ends,
+    and whether an assignment follows depends only on the text after the chain: so each chain is decided once."""
+    if _ENV_KW_ANY_RE.search(text) is None:
+        return text
+    out: List[str] = []
+    pos = 0
+    for chain in _ENV_CHAIN_RE.finditer(text):
+        start, end = chain.span()
+        if start < pos:
+            continue  # inside a value that was just redacted
+        tail = _ENV_TAIL_RE.match(text, end)
+        if tail is None:
+            continue
+        starts = [g.start() for g in _ENV_GROUP_RE.finditer(text, start, end)]
+        first = next((i for i, g in enumerate(starts) if _ENV_KW_RE.match(text, g, end)), None)
+        if first is None:
+            continue
+        name_start = starts[max(0, first - 8)]  # leftmost start with the keyword at most 8 groups ahead
+        out.append(text[pos:name_start])
+        out.append(text[name_start:end])
+        out.append("=[REDACTED]")
+        pos = tail.end()
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _redact_jwt(text: str) -> str:
+    """The JWT rule in one pass: the first part of a token ends where its run of ``[A-Za-z0-9_-]`` ends,
+    so the remainder is checked once per run."""
+    at = text.find("eyJ")
+    if at < 0:
+        return text
+    out: List[str] = []
+    pos, run_end, rest = 0, -1, None
+    while at >= 0:
+        if at >= run_end:
+            run_end = _JWT_RUN_RE.match(text, at).end()
+            rest = _JWT_REST_RE.match(text, run_end)
+        if rest is None:
+            at = text.find("eyJ", run_end)
+            continue
+        if run_end - at - 3 >= 10 and _JWT_HEAD_RE.match(text, at):
+            out.append(text[pos:at])
+            out.append("[REDACTED]")
+            pos = rest.end()
+            run_end = -1
+            at = text.find("eyJ", pos)
+            continue
+        at = text.find("eyJ", at + 1)
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+class _LinearRule:
+    """A rule of _SECRET_PATTERNS implemented as a function; ``sub`` has the signature redact() calls."""
+
+    def __init__(self, fn, former):
+        self.fn = fn
+        self.former = former  # the (compiled pattern, replacement) pair this rule stands for
+        self.pattern = former[0].pattern
+
+    def sub(self, _repl, text):
+        return self.fn(text)
+
+
+for _i, (_pat, _repl) in enumerate(_SECRET_PATTERNS):
+    _src = getattr(_pat, "pattern", "")
+    if _src.startswith(r"\beyJ"):
+        _SECRET_PATTERNS[_i] = (_LinearRule(_redact_jwt, (_pat, _repl)), None)
+    elif _src.startswith(r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_-]){0,8}"):
+        _SECRET_PATTERNS[_i] = (_LinearRule(_redact_env_names, (_pat, _repl)), None)
+
+
 def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -280,6 +374,42 @@ def _past_ts_error(ts: str, bot: str, tail_ts: str) -> "TimestampError":
     return TimestampError(
         "--ts %s is earlier than the last record of %s (%s); omit --ts and put the original time in --detail"
         % (ts, bot, tail_ts))
+
+
+def _ts_floor(tail: Optional[Dict], tail_path: Optional[str]) -> Optional[str]:
+    """Smallest normalised timestamp the next record of a chain may carry, or None (K3-01).
+
+    verify compares ``ts`` as text and walks day files in name order, so the bound is textual: the new ``ts``
+    must not sort below the tail's ``ts`` as written (a pre-0.6 tail can be ``2026-11-17T08:00:00+09:00``),
+    and the record must be filed in the tail's day file or a later one."""
+    floor = None
+    raw = tail.get("ts") if isinstance(tail, dict) else None
+    if _is_norm_ts(raw):
+        floor = raw
+    elif isinstance(raw, str) and _is_date(raw[:10]):
+        try:
+            day = _dt.datetime.strptime(raw[:10], "%Y-%m-%d")
+
+            def at(seconds: int) -> str:
+                w = day + _dt.timedelta(seconds=seconds)
+                return "%04d-%02d-%02dT%02d:%02d:%02dZ" % (w.year, w.month, w.day, w.hour, w.minute, w.second)
+
+            lo, hi = 0, 86400  # at(86400) is the next midnight: above any text with this date prefix
+            while lo < hi:     # normalised text order is time order, so the test is monotone
+                mid = (lo + hi) // 2
+                if at(mid) >= raw:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            floor = at(lo)
+        except (OverflowError, ValueError):
+            floor = None
+    name = os.path.basename(tail_path) if tail_path else ""
+    if _DAY_FILE_RE.match(name) and _is_date(name[:10]):
+        day_floor = name[:10] + "T00:00:00Z"
+        if floor is None or day_floor > floor:
+            floor = day_floor
+    return floor
 
 
 def _die(message: str) -> None:
@@ -941,6 +1071,52 @@ def _atomic_write(path: str, write_fn, mode: str = "w", keep: bool = True, fsync
         raise
     if fsync_dir:
         _fsync_dir(os.path.dirname(path))
+
+
+class _ReplayedIds:
+    """Spool ids already present in a chain, for one ``spool replay`` run (K4-07).
+
+    ``refresh`` reads only the bytes appended since the previous call, so a replay of S events reads each log
+    line once, not once per event. Call it under the bot lock. Day files older than ``bound`` are not read."""
+
+    def __init__(self, ledger: "Ledger", bot: str, bound: Optional[str]):
+        self.ledger, self.bot, self.bound = ledger, bot, bound
+        self.found: Dict[str, Tuple[str, bool]] = {}  # id -> (newest day file holding it, seen in a non-day file)
+        self.offsets: Dict[str, int] = {}
+
+    def refresh(self) -> None:
+        for path in self.ledger.log_files(self.bot):
+            name = os.path.basename(path)
+            is_day = bool(_DAY_FILE_RE.match(name))
+            if self.bound and is_day and name[:10] < self.bound:
+                continue
+            done = self.offsets.get(path, 0)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size < done:
+                done = 0  # replaced outside gblog: read it again
+            if size == done:
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(done)
+                for raw in fh:
+                    if b"spool_id" in raw or b"\\u" in raw:
+                        sid = _parse_line(raw).get("spool_id")
+                        if isinstance(sid, str):
+                            day, other = self.found.get(sid, ("", False))
+                            self.found[sid] = (max(day, name[:10]), other) if is_day else (day, True)
+                self.offsets[path] = fh.tell()
+
+    def replayed(self, spool_id: str, since_day: Optional[str]) -> bool:
+        if self.bound is not None and (since_day is None or since_day < self.bound):
+            return self.ledger._spool_replayed(self.bot, spool_id, since_day)  # outside what the index covers
+        self.refresh()
+        hit = self.found.get(spool_id)
+        if hit is None:
+            return False
+        return hit[1] or since_day is None or hit[0] >= since_day
 
 
 class _GuardSkip(Exception):
@@ -1719,6 +1895,7 @@ class Ledger:
         raw = self._load_state(bot) if state_exists else None
         if seen is not None:
             seen.append(raw)  # handed to append(), which updates and writes it within the same lock hold
+            seen.append(path)  # the tail's day file: append() derives the timestamp floor from it (K3-01)
         state_path = self._state_path(bot)
         if state_exists and os.path.isdir(state_path) and not os.path.islink(state_path):
             # A directory where the state file belongs cannot be replaced (K2-08). Without this refusal every
@@ -1771,6 +1948,10 @@ class Ledger:
                 explicit_ts = parse_ts(record["ts"])
             except ValueError:
                 raise TimestampError("--ts must look like %s" % TS_HINT)
+        # Redaction happens before the lock is taken (K4-04): a slow value must not stall the chain's writers.
+        stored = {key: _stored_value(record, key, value) for key, value in record.items()
+                  if key not in ("v", "seq", "ts", "bot", "prev", "hash", "_corrupt")
+                  and value is not None and value != ""}
         self.ensure()
         with self.lock(bot):
             seen: List[Optional[Dict]] = []  # state/<bot>.json as _append_head read it; reused for the update below
@@ -1798,9 +1979,8 @@ class Ledger:
             elif recovered:
                 _adopt_notice(bot, recovered, seq)
             # Timestamps never go backwards inside a chain (verify would FAIL forever otherwise).
-            tail_ts = tail.get("ts") if tail else None
-            if not _is_norm_ts(tail_ts):
-                tail_ts = None
+            # The bound is what verify will read: the tail's ts as text and the tail's day file (K3-01).
+            tail_ts = _ts_floor(tail, seen[1] if len(seen) > 1 else None)
             wall = now_iso()
             regressed = False
             if explicit_ts is not None:
@@ -1816,12 +1996,7 @@ class Ledger:
                         sys.stderr.write("warning: last record of %s is dated %s (future); this record is stamped with it\n"
                                          % (bot, tail_ts))
             full = {"v": SCHEMA_VERSION, "seq": seq + 1, "ts": ts, "bot": bot}
-            for key, value in record.items():
-                if key in ("v", "seq", "ts", "bot", "prev", "hash", "_corrupt"):
-                    continue  # reserved keys; ``_corrupt`` is the readers' in-band marker for an unreadable line
-                if value is None or value == "":
-                    continue
-                full[key] = _stored_value(record, key, value)
+            full.update(stored)  # reserved keys and ``_corrupt`` (the readers' in-band marker) were left out above
             if regressed:
                 full["clock_regressed"] = wall
             if recovered in ("missing", "unreadable"):
@@ -1970,7 +2145,387 @@ class Ledger:
         return paths, problems, links
 
     # -- verify
+    # Set by the CLI (verify, anchor): the record hashes the caller will look up. With a list, ``result.hashes``
+    # and ``result.own_hashes`` hold only those and the anchored heads, not every hash of the chain.
+    verify_want_hashes: Optional[List[str]] = None
+
+    def _own_name(self, chain: str):
+        """Predicate: does a record's ``bot`` value name the directory ``logs/<chain>``? Equal text, or a case
+        variant that is the same directory (case-insensitive file systems, K3-03)."""
+        chain_dir = os.path.join(self.logs_dir, chain)
+        low = chain.lower()
+        seen: Dict[str, bool] = {chain: True}
+
+        def own(value: object) -> bool:
+            if not isinstance(value, str):
+                return False
+            hit = seen.get(value)
+            if hit is None:
+                hit = False
+                if value.lower() == low and _chain_key(value) == value:
+                    variant = os.path.join(self.logs_dir, value)
+                    try:
+                        hit = not os.path.islink(variant) and os.path.samefile(variant, chain_dir)
+                    except OSError:
+                        hit = False
+                if len(seen) < 1024:
+                    seen[value] = hit
+            return hit
+
+        return own
+
+    @staticmethod
+    def _anchor_heads(snapshot: Tuple) -> set:
+        """Every head string the anchor files of a snapshot name: what ``_anchor_checks`` will look up."""
+        _exists, data, history, _problems, rollup = snapshot
+        heads: set = set()
+
+        def take(values: object) -> None:
+            for h in values if isinstance(values, list) else []:
+                if isinstance(h, str):
+                    heads.add(h)
+
+        if data is not None:
+            take([data.get("head")] if data.get("ok") else data.get("segment_heads"))
+        for _lineno, raw in history or []:
+            take(_parse_line(raw).get("heads"))
+        if rollup:
+            take(rollup[1])
+        return heads
+
+    def _snapshot_extents(self, paths: Iterable[str]) -> List[Tuple]:
+        """Under the shared bot lock: ``(path, size, st_dev, st_ino)`` of every regular log file as it is now.
+
+        Log files are append-only and writers hold the exclusive lock, so the first ``size`` bytes of each file
+        are a consistent snapshot that can be read after the lock is released (K4-02)."""
+        extents = []
+        for path in paths:
+            st = os.stat(path)
+            extents.append((path, st.st_size, st.st_dev, st.st_ino))
+        return extents
+
+    def _snapshot_lines(self, extents: Iterable[Tuple], keep_text: bool, dup_lines: set,
+                        problems: List[str]) -> Iterator[Tuple[str, int, Dict, Optional[str]]]:
+        """Yield ``(rel, lineno, record, text)`` for the bytes a snapshot covers, one line at a time."""
+        for path, size, dev, ino in extents:
+            rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+            with _open_regular(path) as fh:
+                st = os.fstat(fh.fileno())
+                if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < size:
+                    # never caused by gblog: the file was swapped or cut by something else after the snapshot
+                    problems.append("%s: log file was replaced or shortened while it was being verified" % rel)
+                    continue
+                left = size
+                if left <= 0:
+                    continue
+                for lineno, raw in enumerate(fh, 1):
+                    if len(raw) > left:
+                        raw = raw[:left]  # appended after the snapshot was taken
+                    left -= len(raw)
+                    raw = raw.strip()
+                    if raw:
+                        text: Optional[str] = None
+                        if keep_text:
+                            try:
+                                text = raw.decode("utf-8")
+                            except UnicodeDecodeError:
+                                text = None
+                        rec, dup = _parse_line_dups(raw)
+                        if dup:
+                            dup_lines.add((rel, lineno))
+                        yield rel, lineno, rec, text
+                    if left <= 0:
+                        break
+
     def verify(self, bot: str, strict: Optional[bool] = None, skip_archives: Optional[bool] = None) -> Dict:
+        """Walk every segment. One break_ack may approve one exact link; any other break FAILs.
+
+        A passing sealed chain is ok with approved_breaks >= 1. Callers print
+        ``PASS (N approved break(s))`` and must not treat that as a chain with no gap.
+
+        ``strict`` and ``skip_archives`` default to the ledger presets, which is what the CLI sets.
+
+        The chain is read in one streaming pass (K4-02). Under the shared lock only the file sizes, the state
+        file and the anchor files are taken; the lines are parsed after the lock is released and no parsed
+        record is kept, so memory does not grow with the chain and appends do not wait for the parse.
+        ``_verify_reference`` is the former whole-list implementation; both return the same result.
+        """
+        bot = safe_name(bot)
+        strict = bool(self.verify_strict if strict is None else strict)
+        skip_archives = bool(self.verify_skip_archives if skip_archives is None else skip_archives)
+        dup_lines: set = set()
+        with self.lock(bot, shared=True):
+            log_paths, odd_files, link_files = self._file_findings(bot)
+            extents = self._snapshot_extents(log_paths)
+            raw_state = self._load_state(bot)
+            anchor_snapshot = self._anchor_snapshot(bot)
+        log_names = [os.path.relpath(e[0], self.root).replace(os.sep, "/") for e in extents]
+        own = self._own_name(bot)
+        want = self.verify_want_hashes
+        needed = None if want is None else (set(want) | self._anchor_heads(anchor_snapshot))
+        pinned_bot = bot == KIM_BISEO_BREAK["bot"]
+        ack_problems: List[str] = []
+        walk_problems: List = []
+        snap_problems: List[str] = []
+        acks: List[Dict] = []
+        segments: List[Dict] = []
+        breaks: List = []
+        joins: List[Tuple] = []  # (index, same day file, descriptor, position in walk_problems, position in breaks)
+        hashes: set = set()
+        own_hashes: set = set()
+        adopted: List[Tuple] = []
+        arch_recs: List[Dict] = []
+        bare: List[Tuple[str, int]] = []
+        linked_archives: List[str] = []
+        n_items = n_adopted = n_bare = count = 0
+        expected_prev: object = GENESIS
+        expected_seq = 1
+        last_ts = ""
+        seg_start = 0
+        seg_first: Optional[Tuple] = None
+        prev_item: Optional[Tuple] = None
+        stopped = False
+
+        def close(first: Tuple, last: Tuple, start: int, end: int) -> None:
+            if end < start:
+                return
+            segments.append({
+                "index_start": start,
+                "index_end": end,
+                "seq_start": first[2].get("seq"),
+                "seq_end": last[2].get("seq"),
+                "head": last[2].get("hash"),
+                "line_start": first[1],
+                "line_end": last[1],
+                "file_start": first[0],
+                "file_end": last[0],
+                "records": end - start + 1,
+            })
+
+        def stop(i: int) -> None:
+            nonlocal stopped
+            stopped = True
+            if i > seg_start:
+                close(seg_first, prev_item, seg_start, i - 1)
+
+        def step(i: int, cur: Tuple) -> None:
+            """The chain walk for line ``i``. Only the previous line and the first line of the open segment are kept."""
+            nonlocal count, expected_prev, expected_seq, last_ts, seg_start, seg_first, prev_item
+            rel, lineno, rec = cur
+            where = "%s:%d" % (rel, lineno)
+            if i == 0:
+                seg_first = cur
+            if "_corrupt" in rec:
+                walk_problems.append("%s: not valid JSON" % where)
+                return stop(i)
+            if rec.get("hash") != _safe_hash(rec):
+                walk_problems.append("%s: hash mismatch (record edited)" % where)
+                return stop(i)
+            if not _fields_ok(rec):
+                walk_problems.append("%s: malformed record fields" % where)
+                return stop(i)
+            try:
+                seq_i = int(rec["seq"])
+            except (KeyError, TypeError, ValueError):
+                walk_problems.append("%s: seq %s, expected %d (missing or duplicated line)"
+                                     % (where, rec.get("seq"), expected_seq))
+                return stop(i)
+            prev_ok = rec.get("prev") == expected_prev
+            if not (prev_ok and seq_i == expected_seq):
+                if not prev_ok:
+                    msg = "%s: broken chain (prev=%s expected=%s)" % (where, str(rec.get("prev"))[:12], str(expected_prev)[:12])
+                else:
+                    msg = "%s: seq %s, expected %d (missing or duplicated line)" % (where, rec.get("seq"), expected_seq)
+                if i == 0:
+                    walk_problems.append(msg)
+                    return stop(i)
+                # Whether the one eligible break_ack approves this join is decided after the pass (it lies
+                # later in the chain). The walk itself goes on in the same way in both cases.
+                desc = _describe_join(prev_item, cur)
+                joins.append((i, prev_item[0] == rel, desc, len(walk_problems), len(breaks)))
+                walk_problems.append(msg)
+                breaks.append(desc)
+                close(seg_first, prev_item, seg_start, i - 1)
+                seg_start, seg_first = i, cur
+                expected_prev = rec.get("prev")
+                expected_seq = seq_i
+            ts = rec.get("ts", "") or ""
+            if ts < last_ts:
+                walk_problems.append("%s: timestamp goes backwards" % where)
+                return stop(i)
+            if ts:
+                last_ts = ts
+            expected_prev = rec["hash"]
+            expected_seq = seq_i + 1
+            count += 1
+            prev_item = cur
+
+        def feed() -> Iterator[Tuple]:
+            """Every line of the snapshot, once: collects what verify needs and hands the line on to the layout checks."""
+            nonlocal n_items, n_adopted, n_bare
+            for i, item in enumerate(self._snapshot_lines(extents, strict, dup_lines, snap_problems)):
+                rel, lineno, rec, _text = item
+                n_items = i + 1
+                h = rec.get("hash")
+                if isinstance(h, str) and (needed is None or h in needed):
+                    hashes.add(h)
+                    b = rec.get("bot")
+                    if b == bot or own(b):
+                        own_hashes.add(h)
+                kind = rec.get("type")
+                if rec.get("state_adopted") is not None and "_corrupt" not in rec:
+                    n_adopted += 1
+                    if len(adopted) < _MAX_ADOPTED_LINES:
+                        adopted.append((rel, lineno, rec.get("state_adopted"), rec.get("seq")))
+                if kind == "archive":
+                    arch_recs.append({k: rec[k] for k in ("type", "seq", "bot", "path", "sha256", "bytes") if k in rec})
+                    apath = rec.get("path")
+                    if not apath and not rec.get("sha256"):
+                        n_bare += 1
+                        if len(bare) < _MAX_LAYOUT_FINDINGS:
+                            bare.append((rel, lineno))
+                    if (not skip_archives and isinstance(apath, str) and _ARCHIVE_PATH_RE.match(apath)
+                            and len(linked_archives) < _MAX_LAYOUT_FINDINGS
+                            and os.path.islink(os.path.join(self.root, *apath.split("/")))):
+                        linked = "%s: symbolic link (gblog does not write through one)" % apath
+                        if linked not in linked_archives:
+                            linked_archives.append(linked)
+                elif kind == "break_ack" and "_corrupt" not in rec and h == _safe_hash(rec):
+                    parsed = _parse_ack(rec)
+                    if parsed is None:
+                        ack_problems.append("%s:%d: malformed break_ack" % (rel, lineno))
+                    else:
+                        # Verify is as strict as seal: only the pinned incident, or the committed fixture on a temp copy.
+                        pinned = pinned_bot and _same_break(parsed, KIM_BISEO_BREAK)
+                        fixture = (not pinned and pinned_bot
+                                   and _same_break(parsed, KIM_BISEO_FIXTURE_BREAK)
+                                   and self._is_temp_copy())
+                        if not (pinned or fixture):
+                            ack_problems.append("%s:%d: break_ack is not the pinned kim-biseo 2026-11-02 approval" % (rel, lineno))
+                        else:
+                            acks.append({"index": i, "break": parsed,
+                                         "jay_approval_id": str(rec.get("jay_approval_id")).strip(),
+                                         "fixture": bool(fixture)})
+                if not stopped:
+                    step(i, (rel, lineno, rec))
+                yield item
+
+        layout_warnings, noncanonical = _layout_findings(bot, feed(), log_names, strict, dup_lines, own)
+        if not stopped and n_items > seg_start:
+            close(seg_first, prev_item, seg_start, n_items - 1)
+
+        sole = acks[0] if len(acks) == 1 else None
+        used = False
+        approved: List[Dict] = []
+        if sole is not None:
+            for at, same_file, desc, p_at, b_at in joins:
+                if sole["index"] > at and same_file and _same_break(sole["break"], desc):
+                    walk_problems[p_at] = None
+                    breaks[b_at] = None
+                    approved.append(sole["break"])
+                    used = True
+                    break
+            if used:
+                walk_problems = [p for p in walk_problems if p is not None]
+                breaks = [b for b in breaks if b is not None]
+        problems: List[str] = ack_problems + walk_problems
+        warnings: List[str] = []
+        if len(acks) > 1:
+            problems.append("multiple break_ack records; only one approved discontinuity is allowed")
+        if sole is not None and not used:
+            problems.append("break_ack does not match the discontinuity at the pinned coordinates")
+        if sole is not None and used and not any(s["index_start"] <= sole["index"] <= s["index_end"] for s in segments):
+            problems.append("break_ack is outside a verified segment")
+        problems.extend(snap_problems)
+
+        final_head = segments[-1]["head"] if segments else GENESIS
+        # The state witness counts even when the walk found no record at all (emptied day file, deleted logs/<bot>).
+        state_head = raw_state.get("head", GENESIS) if raw_state is not None else None
+        state_readable = isinstance(state_head, str)  # a non-string head is as good as no state file
+        state_problem = None
+        if not problems and state_readable and state_head not in (GENESIS, final_head):
+            state_problem = "state/%s.json: head does not match last record (state tampered or log truncated)" % bot
+            problems.append(state_problem)
+        if n_items:
+            if not state_readable:
+                warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
+            elif state_head == GENESIS:
+                warnings.append("state/%s.json was reset to genesis" % bot)
+        elif not state_readable and os.path.lexists(self._state_path(bot)):
+            warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
+        last_seq = segments[-1].get("seq_end") if segments else None
+        if (not problems and n_items and state_readable and state_head == final_head and _is_int(last_seq)
+                and _state_head(raw_state)[0] != last_seq):
+            warnings.append("state/%s.json: seq %s does not match the last record (seq %d); appends are refused "
+                            "until `gblog state rebuild` is run" % (bot, raw_state.get("seq"), last_seq))
+        if _future_ts(last_ts):
+            warnings.append("last record is dated %s, in the future: new records are stamped with that time "
+                            "(see clock_regressed)" % last_ts)
+        for rel, lineno, how, seq_n in adopted:
+            warnings.append(
+                "%s:%d: appended while state/%s.json was %s; truncation before seq %s cannot be ruled out from state"
+                % (rel, lineno, bot, how if how in ("missing", "unreadable") else "missing or unreadable",
+                   seq_n if _is_int(seq_n) else "?"))
+        if n_adopted > _MAX_ADOPTED_LINES:
+            warnings.append("%d more record(s) appended while state/%s.json was missing or unreadable"
+                            % (n_adopted - _MAX_ADOPTED_LINES, bot))
+        seeded = raw_state.get("state_adopted") if raw_state is not None else None
+        if isinstance(seeded, dict):
+            how, seq_n = seeded.get("how"), seeded.get("seq")
+            warnings.append(
+                "state/%s.json was re-created from the log tail at seq %s (it was %s): truncation before that record "
+                "cannot be ruled out from state"
+                % (bot, seq_n if _is_int(seq_n) else "?",
+                   how if how in ("missing", "unreadable") else "missing or unreadable"))
+        # Every head that was ever anchored must still be a record of this chain.
+        anchor_problems, anchor_warnings = self._anchor_checks(bot, hashes, anchor_snapshot)
+        problems.extend(anchor_problems)
+        warnings.extend(anchor_warnings)
+        fixture_ack = bool(used and sole is not None and sole.get("fixture"))
+        if fixture_ack:
+            warnings.append("fixture break_ack honoured: this root is a temporary test copy")
+        if used and sole is not None and not fixture_ack \
+                and self._witness_present(sole["break"], sole["jay_approval_id"]) is False:
+            warnings.append("witness note missing on ledger chain")
+        archives = 0
+        if not problems:
+            # A bare claim (no path, no sha256) addresses no file and is not counted as archived evidence.
+            archives = sum(1 for r in arch_recs if r.get("path") or r.get("sha256"))
+            problems.extend(verify_archives(self, arch_recs, check=not skip_archives))
+        problems.extend(odd_files)  # a FIFO, directory or device named *.jsonl: never opened, never OK
+        bare_archives = ["%s:%d: archive record without path and sha256: no archived file backs it" % item
+                         for item in bare]
+        if n_bare > _MAX_LAYOUT_FINDINGS:
+            bare_archives.append("%d more archive record(s) without path and sha256" % (n_bare - _MAX_LAYOUT_FINDINGS))
+        layout_warnings = layout_warnings + link_files + linked_archives + bare_archives
+        if strict:
+            problems.extend(layout_warnings + noncanonical)
+        else:
+            warnings.extend(layout_warnings)
+        res = _VerifyResult({
+            "bot": bot,
+            "records": count,
+            "head": final_head,
+            "ok": not problems,
+            "problems": problems,
+            "archives": archives,
+            "approved_breaks": len(approved),
+            "approved": approved,
+            "breaks": breaks,
+            "segments": segments,
+            "jay_approval_id": sole["jay_approval_id"] if used and sole is not None else None,
+            "warnings": warnings,
+            "fixture_ack": fixture_ack,
+            "state_problem": state_problem,
+            "archives_checked": not skip_archives,
+        })
+        res.hashes = hashes  # type: ignore[assignment]
+        res.own_hashes = own_hashes  # type: ignore[assignment]
+        return res
+
+    # The whole-list implementation that ``verify`` replaced (K4-02). gblog does not call it; it is kept as the
+    # oracle of the differential tests in tests/test_k3_k4.py.
+    def _verify_reference(self, bot: str, strict: Optional[bool] = None, skip_archives: Optional[bool] = None) -> Dict:
         """Walk every segment. One break_ack may approve one exact link; any other break FAILs.
 
         A passing sealed chain is ok with approved_breaks >= 1. Callers print
@@ -2182,7 +2737,7 @@ class Ledger:
         archives = 0
         if not problems:
             arch_recs = [rec for _rel, _lineno, rec in items if rec.get("type") == "archive"]
-            archives = len(arch_recs)
+            archives = sum(1 for r in arch_recs if r.get("path") or r.get("sha256"))
             problems.extend(verify_archives(self, arch_recs, check=not skip_archives))
         # Layout findings come from the same snapshot as the walk (no second read, no second parser).
         layout_warnings, noncanonical = _layout_findings(bot, snap_lines, log_names, strict, dup_lines)
@@ -2701,7 +3256,18 @@ class Ledger:
         skipped: List[str] = []
         rejected: List[str] = []
         refused = False
-        for path in self.spool_files(bot):
+        files = self.spool_files(bot)
+        # One index of the spool ids already in the chain for the whole run (K4-07). It starts at the oldest
+        # day any pending event can have been replayed on; without such a bound it covers the whole chain.
+        bound: Optional[str] = "9999-99-99"
+        for path in files:
+            day = self._spool_scan_from(os.path.basename(path)[:-5], _read_json(path))
+            if day is None:
+                bound = None
+                break
+            bound = min(bound, day)
+        index = _ReplayedIds(self, bot, bound if files else None)
+        for path in files:
             payload = _read_json(path)
             rec = payload.get("record") if payload else None
             if not isinstance(rec, dict):
@@ -2728,7 +3294,7 @@ class Ledger:
                 # already moved away, or when a record with its spool_id is anywhere in the chain since
                 # the refusal: a concurrent `spool replay`, or an earlier run that appended the record
                 # and died before the move (even when other records were appended after it).
-                if not os.path.exists(path) or self._spool_replayed(bot, spool_id, since_day):
+                if not os.path.exists(path) or index.replayed(spool_id, since_day):
                     raise _GuardSkip()
 
             try:
@@ -3099,6 +3665,11 @@ def _task_context(ledger: "Ledger", bot: Optional[str], recs: List[Dict], date: 
     return ctx
 
 
+def _title_key(title: object) -> str:
+    """A task title without letter case and spacing differences (the "twin" comparison of the report)."""
+    return " ".join(str(title).lower().split())
+
+
 def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, str]] = None,
                   context: Optional[Dict] = None) -> str:
     labels = labels or {}
@@ -3150,13 +3721,30 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
             # The one-line result given to task-start / task-end (--detail, --summary) is shown as a line of its own.
             if r.get("type") not in ("task_start", "task_end") or r.get("detail"):
                 t["actions"].append(r)
-        for tid in order:
+        # K4-08: closed tasks by title (positions in ``order``), so an open task is compared only with its
+        # possible twins and not with every task of the Bot.
+        from bisect import insort
+        closed: Dict[str, List[int]] = {}
+        closed_chains: Dict[str, set] = {}
+        for pos, oid in enumerate(order):
+            o = tasks[oid]
+            if o["end"] and o["title"]:
+                k = _title_key(o["title"])
+                closed.setdefault(k, []).append(pos)
+                closed_chains.setdefault(k, set()).add(o.get("end_chain") or o["chain"])
+        for pos, tid in enumerate(order):
             t = tasks[tid]
             # What other days know about this task (see _task_context): its start and title, or its end.
             extra = context.get((bot, tid), {}) if context else {}
             if not t["start"] and extra.get("start"):
+                untitled = not t["title"]
                 t["start"] = extra["start"]
                 t["title"] = t["title"] or extra.get("title") or ""
+                if untitled and t["title"] and t["end"]:
+                    # it has a title from now on: a possible twin for the tasks after it, as before
+                    k = _title_key(t["title"])
+                    insort(closed.setdefault(k, []), pos)
+                    closed_chains.setdefault(k, set()).add(t.get("end_chain") or t["chain"])
             head = "### %s" % _md(t["title"] or tid)
             if tid != "(no task)":
                 head += "  `%s`" % _md(tid)
@@ -3177,14 +3765,16 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
                 twin = None
                 if t["title"]:
                     # The twin has the same title (letter case and spacing aside) and was closed in another chain.
-                    key = " ".join(str(t["title"]).lower().split())
-                    for oid in order:
-                        o = tasks[oid]
-                        if (oid != tid and o["end"] and o["title"] and " ".join(str(o["title"]).lower().split()) == key
-                                and (o.get("end_chain") or o["chain"]) != t["chain"]
-                                and (o["start"] or o["end"]) >= (t["start"] or "")):
-                            twin = (oid, o)
-                            break
+                    key = _title_key(t["title"])
+                    chains = closed_chains.get(key)
+                    if chains and (len(chains) > 1 or t["chain"] not in chains):
+                        for at in closed[key]:
+                            oid = order[at]
+                            o = tasks[oid]
+                            if (oid != tid and (o.get("end_chain") or o["chain"]) != t["chain"]
+                                    and (o["start"] or o["end"]) >= (t["start"] or "")):
+                                twin = (oid, o)
+                                break
                 if twin:
                     meta.append("outcome **open** — likely closed as `%s` in chain `%s` (%s)" % (_md(twin[0]), _md(twin[1].get("end_chain") or twin[1]["chain"], 100), _md(twin[1]["outcome"])))
                 else:
@@ -3288,9 +3878,9 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
         ts = parse_ts(ts)  # ValueError before anything is written; the day below becomes a directory name
         # An explicit past timestamp is refused before the file is stored (append would refuse it afterwards).
         _tail_path, _tail = ledger._tail_record(bot)
-        _tail_ts = _tail.get("ts") if _tail else None
-        if _is_norm_ts(_tail_ts) and ts < _tail_ts:
-            raise _past_ts_error(ts, bot, _tail_ts)
+        _floor = _ts_floor(_tail, _tail_path)  # the same bound append applies (K3-01)
+        if _floor and ts < _floor:
+            raise _past_ts_error(ts, bot, _floor)
     day = today(ts)
     rel = os.path.join("archive", bot, day, digest + ".gz")
     full = os.path.join(ledger.root, rel)
@@ -3411,7 +4001,7 @@ _MAX_ADOPTED_LINES = 3  # record-level state_adopted warnings listed one by one;
 
 
 def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[str], strict: bool,
-                     dup_lines: Iterable[Tuple[str, int]] = ()) -> Tuple[List[str], List[str]]:
+                     dup_lines: Iterable[Tuple[str, int]] = (), own=None) -> Tuple[List[str], List[str]]:
     """Things the hash walk does not look at, computed from verify()'s own snapshot.
 
     Returns (warnings, strict_only_problems).
@@ -3466,7 +4056,7 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
             nonfinite += 1
             if nonfinite <= _MAX_LAYOUT_FINDINGS:
                 warnings.append("%s:%d: non-finite number (NaN or Infinity) in record" % (rel, lineno))
-        if rec.get("bot") != bot:
+        if rec.get("bot") != bot and not (own is not None and own(rec.get("bot"))):
             mismatched += 1
             if mismatched <= _MAX_LAYOUT_FINDINGS:
                 warnings.append("%s:%d: bot field '%s' does not match chain '%s'" % (rel, lineno, rec.get("bot"), bot))
@@ -3977,6 +4567,41 @@ def _linked_parent(root: str, rel: str) -> Optional[str]:
     return None
 
 
+def _same_remote(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two spellings name the same repository (K3-04): equal text; the same GitHub owner/repo over
+    any transport; the same absolute local directory; or the same text apart from a trailing ``/`` or ``.git``.
+    Anything else (another port, another user, another host) is a different remote."""
+    a, b = (a or "").strip(), (b or "").strip()
+    if a == b:
+        return True
+
+    def bare(url: str) -> str:
+        t = url.rstrip("/")
+        return (t[:-4] if t.lower().endswith(".git") else t).rstrip("/")
+
+    ga, gb = github_remote(a), github_remote(b)
+    if ga[0] or gb[0]:
+        return bool(ga[0] and gb[0] and ga[1] and gb[1] and ga[2] and gb[2]
+                    and (ga[1].lower(), ga[2].lower()) == (gb[1].lower(), gb[2].lower())
+                    and bare(a).lower().endswith(".wiki") == bare(b).lower().endswith(".wiki"))
+    ha, hb = _remote_host_path(a), _remote_host_path(b)
+    if ha[0] is None and hb[0] is None and ha[2] in ("", "file") and hb[2] in ("", "file"):
+        pa = os.path.expanduser((ha[1] if ha[2] == "file" else a) or "")
+        pb = os.path.expanduser((hb[1] if hb[2] == "file" else b) or "")
+        if os.path.isabs(pa) and os.path.isabs(pb):
+            try:
+                return os.path.realpath(pa) == os.path.realpath(pb)
+            except (OSError, ValueError):
+                return False
+    return bare(a) == bare(b)
+
+
+def _local_origin(root: str) -> List[str]:
+    """The URLs of ``origin`` in the ledger repository's own configuration (.git/config), nothing else."""
+    return [u.strip() for key in ("remote.origin.url", "remote.origin.pushurl")
+            for u in _git(root, "config", "--local", "--get-all", key, check=False).stdout.splitlines() if u.strip()]
+
+
 def _set_origin(root: str, had_url: bool, url: str) -> None:
     """Point ``origin`` at exactly ``url``: one url, no separate pushurl. Called only when the URL really changes."""
     if had_url or _git(root, "remote", "add", "origin", url, check=False).returncode != 0:
@@ -4033,10 +4658,13 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         # --local: only the ledger repository's own origin counts (the same scope `git remote get-url` reads).
         current = [u.strip() for u in _git(root, "config", "--local", "--get-all", "remote.origin.url",
                                            check=False).stdout.splitlines() if u.strip()]
-        if current and remote not in current and not replace_remote:
+        same = any(_same_remote(remote, u) for u in current)
+        if current and not same and not replace_remote:
             raise _UsageError("origin is already %s; pass --replace-remote to send backups to %s instead"
                               % (_safe_url(current[0]), _safe_url(remote)))
-        changed = remote not in current
+        # Another spelling of the current origin (…/r for …/r.git, https for ssh) is not a change: .git/config
+        # stays as it is and the run goes on (K3-04). --replace-remote stores the new spelling.
+        changed = remote not in current and not (same and not replace_remote)
         old_push: List[str] = []
         if changed:
             # Nothing is touched when the URL is already one of origin's URLs (a multi-URL origin stays as it is).
@@ -4120,6 +4748,11 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     if push:
         # Every push URL counts: remote.origin.pushurl may differ from the fetch URL and may list several.
         urls = [u.strip() for u in _git(root, "remote", "get-url", "--push", "--all", "origin", check=False).stdout.splitlines() if u.strip()]
+        if not _local_origin(root):
+            # D3-03: only an origin configured in the ledger repository itself is a push target. A remote of
+            # that name that git would find elsewhere (global configuration, a legacy .git/remotes/origin file,
+            # a directory called origin) is never checked and never pushed to.
+            urls = []
         # GitHub is recognised by parsed host (any port, ssh.github.com, *.github.com); an ssh-config alias
         # of github.com is checked as the repository it points at.
         targets = {u: _ssh_alias_target(u) for u in urls}
@@ -5727,6 +6360,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise _UsageError("--since must be YYYY-MM-DD")
     if args.cmd == "capture" and args.what == "browser" and args.hours < 0:
         raise _UsageError("--hours must be 0 or more")
+    if args.cmd == "capture" and args.what == "browser" and args.hours < 1:
+        raise _UsageError("--hours must be 1 or more (a window of 0 hours imports nothing)")
     if args.cmd == "coverage" and args.window < 0:
         raise _UsageError("--window must be 0 or more")
     if args.cmd in ("coverage", "tune"):
@@ -5878,6 +6513,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             raise _UsageError("verify --contains requires --bot")
         if any(not _is_full_hash(h) for h in wanted):
             raise _UsageError("verify --contains needs a full 64-hex record hash")
+        ledger.verify_want_hashes = wanted  # verify keeps only these hashes (and the anchored heads)
         # Chains that left a witness (anchor, anchor history, state head) but have no logs/<name>: name -> problem lines.
         missing: Dict[str, List[str]] = {}
         invalid: List[str] = []
@@ -5972,6 +6608,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 out.write("FAIL  %-20s %6d records\n" % (_term(args.bot), 0))
                 out.write("      - no chain on disk for '%s'\n" % _term(args.bot))
                 return 1
+        ledger.verify_want_hashes = []  # anchor looks no hash up: verify need not keep them
         rollup = ledger.anchor(bots)
         for c in rollup["chains"]:
             if c["ok"]:

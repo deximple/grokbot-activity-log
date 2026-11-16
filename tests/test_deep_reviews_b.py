@@ -591,7 +591,6 @@ class SyncDeepTest(Base):
         self.assertEqual(seen, ["https://api.github.com/repos/octocat/Hello-World"])
 
     # pending: D3-03 remotes-file case — a legacy .git/remotes/origin file is still pushed to
-    @unittest.expectedFailure
     def test_no_repo_origin_is_never_pushed(self):
         # D3-03: a remote named origin that git would find outside the ledger repository's own config
         for case in ("directory", "remotes-file", "global-config"):
@@ -805,7 +804,6 @@ class BrowserWindowTest(Base):
         self.assertIn("browser: 1 new visit(s)", out)
 
     # bug: D4-03. README and CHANGELOG say `capture browser --hours` below 1 exits 2; --hours=0 is accepted.
-    @unittest.expectedFailure
     def test_hours_zero_is_a_usage_error(self):
         rc, out, err = run(["capture", "browser", "--bot", "ops", "--history", self.hist, "--hours=0"], self.root)
         self.assertEqual(rc, 2, out + err)
