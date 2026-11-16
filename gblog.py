@@ -107,6 +107,11 @@ class TimestampError(ValueError):
     """Append refused because of its timestamp. Nothing was written."""
 
 
+class RecordError(ValueError):
+    """Append refused because the record cannot be stored as written (a non-string text field,
+    NaN/Infinity, a value that is not JSON). Nothing was written."""
+
+
 class StateRebuildError(Exception):
     """State rebuild refused. Nothing was written."""
 
@@ -123,6 +128,8 @@ class _VerifyResult(dict):
     not a key: the result keys are unchanged."""
 
     hashes: frozenset = frozenset()
+    # The subset whose ``bot`` field names the chain they are stored in: what ``verify --contains`` accepts.
+    own_hashes: frozenset = frozenset()
 
 RECORD_TYPES = ("task_start", "action", "approval", "task_end", "note", "sync", "verify", "tune", "archive")
 SOURCES = ("self", "auto", "routine")
@@ -142,7 +149,8 @@ OUTCOMES = ("ok", "fail", "denied", "pending", "skipped", "n/a")
 
 # (pattern, replacement) pairs mirroring the kinds of secrets Cursor/Grok Bot scrub before export.
 _SECRET_PATTERNS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
+    # PEM private-key blocks are handled by _redact_pem(), which redact() calls first: the same result for a
+    # well-formed block, linear time on repeated BEGIN markers, and a block without an END marker is redacted too.
     (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED]"),
@@ -173,6 +181,14 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bya29\.[A-Za-z0-9._-]{12,}"), "[REDACTED]"),  # Google OAuth access token
     (re.compile(r"\bxapp-[A-Za-z0-9-]{8,}"), "[REDACTED]"),  # Slack app-level token
     (re.compile(r"(?i)(https?://hooks\.slack\.com/services/)[A-Za-z0-9/_-]+"), r"\1[REDACTED]"),  # Slack incoming webhook
+    # Security review (additive, each replacement idempotent):
+    # Python-repr dicts ({'password': '...'}).
+    (re.compile(r"(?i)('[A-Za-z0-9_-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key)'\s*:\s*)'(?:[^'\\]|\\.)*'"), r"\1'[REDACTED]'"),
+    # Prefixed flags (--db-password X, --client-secret X, --auth-token=X); the value must not look like another flag.
+    (re.compile(r"(?i)(--(?:[A-Za-z0-9]+-)+(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key)[ =]+)(?!-)(?:\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
+    # Names with a secret word glued or camelCased into them (dbPassword=, accessToken:, secretKey=, PASSWORD2=,
+    # APITOKEN=, userpwd=). Bounded on both sides so matching stays linear on long blobs.
+    (re.compile(r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,40}?(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key)[A-Za-z0-9_-]{0,40})\s*[:=]\s*(?:\"[^\"\n]{1,}\"|'[^'\n]{1,}'|[^\s'\"&]{6,})"), r"\1=[REDACTED]"),
 ]
 
 
@@ -285,7 +301,39 @@ def _adopt_notice(bot: str, how: str, seq: object) -> None:
 
 
 # Record fields that readers and renderers treat as text.
-_TEXT_FIELDS = ("type", "task_id", "task", "action", "target", "outcome", "detail", "source", "decision", "observed", "kind")
+_TEXT_FIELDS = ("type", "task_id", "task", "action", "target", "outcome", "detail", "source", "decision", "observed", "kind",
+                "capture", "profile", "chain")
+_TEXT_FIELD_SET = frozenset(_TEXT_FIELDS)
+_INF = float("inf")
+
+
+def _has_nonfinite(value: object) -> bool:
+    """True when a parsed JSON value holds NaN or +/-Infinity anywhere (json.loads accepts them; strict JSON has none)."""
+    if isinstance(value, float):
+        return value != value or value in (_INF, -_INF)
+    try:
+        if isinstance(value, dict):
+            return any(_has_nonfinite(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(_has_nonfinite(v) for v in value)
+    except RecursionError:
+        return False
+    return False
+
+
+def _check_record(record: object) -> None:
+    """Refuse, before anything is written, a record that readers would have to work around:
+    a non-string value in a text field, NaN/Infinity, or a value that is not JSON at all."""
+    if not isinstance(record, dict):
+        raise RecordError("record must be a JSON object")
+    for key in _TEXT_FIELDS:
+        value = record.get(key)
+        if value is not None and not isinstance(value, str):
+            raise RecordError("record field '%s' must be a string, not %s" % (key, type(value).__name__))
+    try:
+        json.dumps(record, allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RecordError("record cannot be stored as strict JSON (%s)" % exc)
 
 
 def _text_fields(rec: Dict) -> Dict:
@@ -381,10 +429,51 @@ def default_root() -> str:
     return os.path.join(os.path.expanduser("~"), "activity-log")
 
 
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+# Between two lines of a key: real white space or JSON-escaped line breaks (bounded, so matching stays linear).
+_PEM_SEP = r"(?:\s|\\[nr]?){0,64}"
+# What follows the header of a block whose END marker is missing (truncated output): optional legacy encryption
+# headers, base64 lines, and one last shorter fragment. This pattern can match the empty string, so it never fails.
+_PEM_BODY_RE = re.compile(
+    r"(?:" + _PEM_SEP + r"(?:Proc-Type|DEK-Info): [^\r\n\\]{1,120}){0,2}"
+    r"(?:" + _PEM_SEP + r"[A-Za-z0-9+/=]{16,})*"
+    r"(?:" + _PEM_SEP + r"[A-Za-z0-9+/=]+)?"
+)
+
+
+def _redact_pem(text: str) -> str:
+    """Replace PEM private-key blocks with ``[REDACTED]`` in one linear pass.
+
+    A BEGIN marker is matched with the first END marker after it, exactly as the former regular
+    expression did. When no END marker follows (a truncated key), the header and the base64 body
+    after it are redacted instead of being stored verbatim."""
+    if "PRIVATE KEY-----" not in text:
+        return text
+    out: List[str] = []
+    pos = 0
+    more_ends = True
+    while True:
+        begin = _PEM_BEGIN_RE.search(text, pos)
+        if begin is None:
+            break
+        end = _PEM_END_RE.search(text, begin.end()) if more_ends else None
+        if end is not None:
+            stop = end.end()
+        else:
+            more_ends = False  # no END after this point, so none after any later BEGIN either: never search again
+            stop = _PEM_BODY_RE.match(text, begin.end()).end()
+        out.append(text[pos:begin.start()])
+        out.append("[REDACTED]")
+        pos = stop
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def redact(text: Optional[str]) -> Optional[str]:
     if not text:
         return text
-    out = text
+    out = _redact_pem(text)
     for pat, repl in _SECRET_PATTERNS:
         out = pat.sub(repl, out)
     return out
@@ -560,7 +649,8 @@ def _open_private(path: str, mode: str = "w", keep: Optional[str] = None, **kwar
             perm = os.stat(keep).st_mode & 0o777
         except OSError:
             pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), perm)
+    # O_NOFOLLOW: gblog never writes through a symbolic link (a ledger cloned from elsewhere may contain one).
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0), perm)
     try:
         return os.fdopen(fd, mode, **kwargs)
     except Exception:
@@ -572,18 +662,20 @@ def _touch_private(path: str) -> None:
     """Create an empty 0o600 file if it is missing (lock files). An existing file is untouched."""
     if not os.path.exists(path):
         try:
-            os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600))
         except OSError:
             pass
 
 
 def _open_lock(path: str, mode: str = "a+"):
     """Open a lock file for flock(). ``a+`` creates a missing file 0o600 (an existing file keeps its mode); ``r`` never creates."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)  # a lock file is never a symbolic link
     if mode == "r":
-        return open(path, "r")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    else:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
     try:
-        return os.fdopen(fd, "r+")
+        return os.fdopen(fd, "r" if mode == "r" else "r+")
     except Exception:
         os.close(fd)
         raise
@@ -615,7 +707,42 @@ def _last_line(path: str, block: int = 65536) -> bytes:
         return buf.strip()
 
 
-_MD_BREAKS_RE = re.compile("[\r\n\t\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
+# Line breaks and every other C0/C1 control character (ESC included): none of them may reach a report line.
+_MD_BREAKS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+# What must never reach a terminal raw: control characters, line/paragraph separators and bidi overrides.
+_TERM_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_TERM_NAMES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _term(text: object) -> str:
+    """Ledger-derived text for one terminal line (tail, status, verify, spool list, alias list).
+
+    Control characters (line breaks, ESC sequences, bidi overrides) become visible escapes, so record
+    text, a page title or a file name can neither forge a second output line nor drive the terminal.
+    Text without such characters is returned unchanged."""
+    s = text if isinstance(text, str) else str(text)
+    if not _TERM_CTRL_RE.search(s):
+        return s
+
+    def visible(match) -> str:
+        ch = match.group(0)
+        if ch in _TERM_NAMES:
+            return _TERM_NAMES[ch]
+        return "\\x%02x" % ord(ch) if ord(ch) < 0x100 else "\\u%04x" % ord(ch)
+
+    return _TERM_CTRL_RE.sub(visible, s)
+
+
+def _tmp_name(path: str) -> str:
+    """Temporary sibling of ``path`` for an atomic replace.
+
+    The name is per process, so two gblog processes never write through one shared ``<path>.tmp``.
+    It still ends in ``.tmp`` (ignored by the ledger's .gitignore)."""
+    return "%s.%d.tmp" % (path, os.getpid())
+
+
+class _GuardSkip(Exception):
+    """Raised by an ``append(_guard=...)`` callback: under the bot lock the record turned out to be written already."""
 
 
 def _md(text: object, limit: int = 500) -> str:
@@ -639,7 +766,9 @@ RESERVED = {"names": ("aliases",), "prefixes": ("capture-files-",), "suffixes": 
 
 def is_reserved(name: str) -> bool:
     low = name.lower()
-    return low in RESERVED["names"] or low.startswith(RESERVED["prefixes"]) or low.endswith(RESERVED["suffixes"])
+    # "<bot>.alert.resolved-<stamp>" would collide with state/<bot>.alert.resolved-<stamp>.json
+    return (low in RESERVED["names"] or low.startswith(RESERVED["prefixes"]) or low.endswith(RESERVED["suffixes"])
+            or ".alert.resolved-" in low)
 
 
 # --------------------------------------------------------------------------- store
@@ -711,14 +840,27 @@ class Ledger:
             if d not in warned:
                 warned.add(d)
                 sys.stderr.write("warning: ignoring logs/%s (invalid chain directory name); run gblog verify --all\n"
-                                 % _clean_text(d))
+                                 % _term(_clean_text(d)))
         return [d for d in names if d not in bad]
 
     def log_files(self, bot: str) -> List[str]:
         d = os.path.join(self.logs_dir, bot)
         if not os.path.isdir(d):
             return []
-        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl"))
+        # Regular files only: a FIFO, directory or device named *.jsonl would hang or abort every reader and append.
+        paths = (os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl"))
+        return sorted(p for p in paths if os.path.isfile(p))
+
+    def irregular_logs(self, bot: str) -> List[str]:
+        """``*.jsonl`` entries of logs/<bot> that are not regular files, as root-relative paths.
+
+        They are never opened. ``verify`` reports each one as a problem."""
+        d = os.path.join(self.logs_dir, bot)
+        try:
+            names = sorted(f for f in os.listdir(d) if f.endswith(".jsonl"))
+        except OSError:
+            return []
+        return ["logs/%s/%s" % (bot, f) for f in names if not os.path.isfile(os.path.join(d, f))]
 
     def _state_path(self, bot: str) -> str:
         return os.path.join(self.state_dir, bot + ".json")
@@ -751,7 +893,7 @@ class Ledger:
         """Atomically replace state/<bot>.json. Caller must already have fsynced the new log line."""
         _makedirs(self.state_dir)
         path = self._state_path(bot)
-        tmp = path + ".tmp"
+        tmp = _tmp_name(path)
         with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
             json.dump(state, fh, indent=2, sort_keys=True)
             fh.flush()
@@ -861,6 +1003,10 @@ class Ledger:
                     if isinstance(rec.get("ts"), str):
                         state["updated"] = rec["ts"]
                     _adopt_notice(bot, "unreadable" if existed else "missing", rec["seq"])
+                    # No record is appended here, so the marker lives in state itself: verify keeps warning
+                    # that state was re-created from the tail (the stderr notice alone would be gone tomorrow).
+                    state["state_adopted"] = {"how": "unreadable" if existed else "missing", "seq": rec["seq"],
+                                              "ts": now_iso()}
             state.update(fields)
             self.write_state(bot, state)
             return True
@@ -881,7 +1027,8 @@ class Ledger:
             return {"bots": {}, "strict": False}, False
         data = _read_json(path)
         bots = data.get("bots", {}) if data is not None else None
-        usable = isinstance(bots, dict) and all(
+        # A slug key that is not a valid chain key (``../x``, a name with a space) would reach file paths: unreadable.
+        usable = isinstance(bots, dict) and all(k and _chain_key(k) == k for k in bots) and all(
             isinstance(e, dict)
             and (e.get("display") is None or isinstance(e.get("display"), str))
             and isinstance(e.get("aliases", []), list)
@@ -924,7 +1071,7 @@ class Ledger:
         """Atomically replace state/aliases.json. The caller holds ``aliases.lock``."""
         path = self.aliases_path()
         doc = {k: v for k, v in data.items() if k != "unreadable"}
-        tmp = path + ".tmp"
+        tmp = _tmp_name(path)
         with _open_private(tmp, "w", keep=path, encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2, sort_keys=True, ensure_ascii=False)
             fh.flush()
@@ -955,6 +1102,10 @@ class Ledger:
             self._check_reserved(slug)
         display = display.strip() if display else None
         variants = [v.strip() for v in variants if v and v.strip()]
+        for name in variants + ([display] if display else []):
+            if _TERM_CTRL_RE.search(name):
+                # a line break or an escape sequence in a name would end up in every report heading and status line
+                _die("display names and aliases may not contain control characters")
         for other, e in data["bots"].items():
             if other == slug:
                 continue
@@ -1076,7 +1227,8 @@ class Ledger:
         slug = self.canonical(bot)
         names = {slug} | set(self.aliases()["bots"].get(slug, {}).get("aliases", []))
         existing = [c for c in self.valid_chains() if c in names or self.canonical(c) == slug]
-        return existing or [slug]
+        # A hand-edited registry key is never used as a path component as it stands.
+        return existing or [c for c in (_chain_key(slug),) if c]
 
     def chains_on_disk(self, name: str) -> List[str]:
         """chains_for(name), limited to chains that have a logs/<chain> directory or a state file."""
@@ -1179,7 +1331,8 @@ class Ledger:
         _makedirs(os.path.dirname(path))
         data = line.encode("utf-8")
         # A new day file is private (0o600). O_RDWR only so the last byte can be inspected.
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+        # O_NOFOLLOW: a day file (or anchor history) that is a symbolic link is refused, never written through.
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             size = os.fstat(fd).st_size
             if size > 0:
@@ -1187,11 +1340,24 @@ class Ledger:
                 if os.read(fd, 1) != b"\n":
                     data = b"\n" + data  # tail without a final newline: never glue two records onto one line
             view = data
-            while view:
-                wrote = os.write(fd, view)
-                if wrote <= 0:
-                    raise OSError("short write appending %s" % path)
-                view = view[wrote:]
+            written = 0
+            try:
+                while view:
+                    wrote = os.write(fd, view)
+                    if wrote <= 0:
+                        raise OSError("short write appending %s" % path)
+                    written += wrote
+                    view = view[wrote:]
+            except BaseException:
+                # A failed write (full disk) must not leave a torn line behind. Only the bytes this call
+                # wrote are removed, and only while they are still the end of the file (no other writer
+                # appended in between); earlier bytes are never touched.
+                try:
+                    if written and os.fstat(fd).st_size == size + written:
+                        os.ftruncate(fd, size)
+                except OSError:
+                    pass
+                raise
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -1294,7 +1460,7 @@ class Ledger:
         return self._append_head(safe_name(bot))[3] is None
 
     # -- append
-    def append(self, bot: str, record: Dict) -> Dict:
+    def append(self, bot: str, record: Dict, _guard=None) -> Dict:
         """Append one record under the bot lock.
 
         The current code writes the line and fsyncs it before replacing state, so a crash
@@ -1309,6 +1475,7 @@ class Ledger:
         bot = safe_name(bot)
         self._check_reserved(bot)  # a new chain may not use a name that collides with gblog's own files under state/
         record = _clean_text(record)
+        _check_record(record)  # RecordError before the tree, the lock or the spool is touched
         explicit_ts = None
         if record.get("ts"):
             try:
@@ -1320,6 +1487,8 @@ class Ledger:
             seq, head, tail, observed, recovered = self._append_head(bot)
             if observed is not None:
                 self._refuse_tail(bot, record, seq, head, observed)
+            if _guard is not None:
+                _guard()  # the caller's last check, made under the bot lock (seal, spool replay); it may raise
             if recovered == "interrupted":
                 sys.stderr.write("notice: recovered state/%s.json after an interrupted append\n" % bot)
             elif recovered:
@@ -1353,6 +1522,10 @@ class Ledger:
                 full[key] = redact(value) if isinstance(value, str) else value
             if regressed:
                 full["clock_regressed"] = wall
+            if recovered in ("missing", "unreadable"):
+                # Hash-chained marker: this append rewrites state, which would otherwise erase verify's
+                # "state missing or unreadable" warning together with the evidence of a truncated tail.
+                full["state_adopted"] = recovered
             full["prev"] = head
             full["hash"] = compute_hash(full)
             path = os.path.join(self.logs_dir, bot, today(ts) + ".jsonl")
@@ -1391,6 +1564,44 @@ class Ledger:
                     snap_lines.append((rel, lineno, _parse_line(raw), text))
         return snap_lines, log_names
 
+    def _file_findings(self, bot: str) -> Tuple[List[str], List[str]]:
+        """``(problems, warnings)`` about the kind of files one chain is made of.
+
+        Problems: a ``*.jsonl`` entry under logs/<bot> that is not a regular file (FIFO, directory, device,
+        dangling link). ``log_files`` leaves it out, so it is never opened.
+        Warnings: symbolic links. gblog never creates one and refuses to write through one; in a ledger
+        cloned from somewhere else a link can point outside the root. ``--strict`` makes them problems."""
+        problems: List[str] = []
+        links: List[str] = []
+
+        def rel(path: str) -> str:
+            return os.path.relpath(path, self.root).replace(os.sep, "/")
+
+        def link(path: str) -> None:
+            if os.path.islink(path) and len(links) < _MAX_LAYOUT_FINDINGS:
+                links.append("%s: symbolic link (gblog does not write through one)" % rel(path))
+
+        def entries(d: str) -> List[str]:
+            try:
+                return sorted(os.listdir(d))
+            except OSError:
+                return []
+
+        bot_dir = os.path.join(self.logs_dir, bot)
+        link(bot_dir)
+        for name in entries(bot_dir):
+            path = os.path.join(bot_dir, name)
+            link(path)
+            if name.endswith(".jsonl") and not os.path.isfile(path) and len(problems) < _MAX_LAYOUT_FINDINGS:
+                problems.append("%s: not a regular file" % rel(path))
+        for path in (self._state_path(bot), self._anchor_file(bot), self._anchor_history_file(bot)):
+            link(path)
+        arch = os.path.join(self.archive_dir, bot)
+        link(arch)
+        for name in entries(arch):
+            link(os.path.join(arch, name))
+        return problems, links
+
     # -- verify
     def verify(self, bot: str, strict: Optional[bool] = None, skip_archives: Optional[bool] = None) -> Dict:
         """Walk every segment. One break_ack may approve one exact link; any other break FAILs.
@@ -1413,6 +1624,8 @@ class Ledger:
             snap_lines, log_names = self._chain_snapshot(bot)
             raw_state_snapshot = self._load_state(bot)
             anchor_snapshot = self._anchor_snapshot(bot)
+            odd_files, link_files = self._file_findings(bot)
+            irregular = self.irregular_logs(bot)
         items = [(rel, lineno, rec) for rel, lineno, rec, _text in snap_lines]
         problems: List[str] = []
         warnings: List[str] = []
@@ -1554,9 +1767,33 @@ class Ledger:
                 warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
             elif state_head == GENESIS:
                 warnings.append("state/%s.json was reset to genesis" % bot)
+        elif not state_readable and os.path.lexists(self._state_path(bot)):
+            # an emptied chain beside a state file that no longer parses: say that this witness is unusable
+            warnings.append("state/%s.json missing or unreadable: tail truncation cannot be detected from state" % bot)
         if _future_ts(last_ts):
             warnings.append("last record is dated %s, in the future: new records are stamped with that time "
                             "(see clock_regressed)" % last_ts)
+        # A tail that was adopted while state was missing or unreadable stays visible. The append that adopts
+        # it rewrites state, so without these markers the "state missing" warning would erase itself.
+        adopted_recs = [(rel, lineno, rec) for rel, lineno, rec in items
+                        if "_corrupt" not in rec and rec.get("state_adopted") is not None]
+        for rel, lineno, rec in adopted_recs[:_MAX_LAYOUT_FINDINGS]:
+            how, seq_n = rec.get("state_adopted"), rec.get("seq")
+            warnings.append(
+                "%s:%d: appended while state/%s.json was %s; truncation before seq %s cannot be ruled out from state"
+                % (rel, lineno, bot, how if how in ("missing", "unreadable") else "missing or unreadable",
+                   seq_n if isinstance(seq_n, int) and not isinstance(seq_n, bool) else "?"))
+        if len(adopted_recs) > _MAX_LAYOUT_FINDINGS:
+            warnings.append("%d more record(s) appended while state/%s.json was missing or unreadable"
+                            % (len(adopted_recs) - _MAX_LAYOUT_FINDINGS, bot))
+        seeded = raw_state.get("state_adopted") if raw_state is not None else None
+        if isinstance(seeded, dict):
+            how, seq_n = seeded.get("how"), seeded.get("seq")
+            warnings.append(
+                "state/%s.json was re-created from the log tail at seq %s (it was %s): truncation before that record "
+                "cannot be ruled out from state"
+                % (bot, seq_n if isinstance(seq_n, int) and not isinstance(seq_n, bool) else "?",
+                   how if how in ("missing", "unreadable") else "missing or unreadable"))
         # Every head that was ever anchored must still be a record of this chain.
         hashes = {rec.get("hash") for _rel, _lineno, rec in items if isinstance(rec.get("hash"), str)}
         anchor_problems, anchor_warnings = self._anchor_checks(bot, hashes, anchor_snapshot)
@@ -1575,6 +1812,8 @@ class Ledger:
             problems.extend(verify_archives(self, arch_recs, check=not skip_archives))
         # Layout findings come from the same snapshot as the walk (no second read, no second parser).
         layout_warnings, noncanonical = _layout_findings(bot, snap_lines, log_names, strict)
+        # A *.jsonl entry that is not a regular file was not read at all: that is a FAIL in every mode.
+        problems.extend("%s: not a regular file" % rel for rel in irregular)
         if strict:
             problems.extend(layout_warnings + noncanonical)
         else:
@@ -1597,6 +1836,8 @@ class Ledger:
             "archives_checked": not skip_archives,
         })
         res.hashes = hashes  # type: ignore[assignment]
+        res.own_hashes = {rec.get("hash") for _rel, _lineno, rec in items  # type: ignore[assignment]
+                          if isinstance(rec.get("hash"), str) and rec.get("bot") == bot}
         return res
 
     def _anchor_history_file(self, bot: str) -> str:
@@ -1668,10 +1909,14 @@ class Ledger:
                 continue
         return False
 
-    def chain_hashes(self, bot: str) -> set:
-        """Every record hash present in one chain (used by ``verify --contains``)."""
-        return {rec.get("hash") for _path, _lineno, rec in self.iter_records(safe_name(bot))
-                if isinstance(rec.get("hash"), str)}
+    def chain_hashes(self, bot: str, own_only: bool = False) -> set:
+        """Every record hash present in one chain.
+
+        ``own_only`` keeps only records whose ``bot`` field names this chain, which is what
+        ``verify --contains`` accepts: a copy of another chain's records does not count."""
+        bot = safe_name(bot)
+        return {rec.get("hash") for _path, _lineno, rec in self.iter_records(bot)
+                if isinstance(rec.get("hash"), str) and (not own_only or rec.get("bot") == bot)}
 
     def anchored_missing(self) -> List[Tuple[str, str]]:
         """(bot, anchor ts) for every anchors/<bot>.json with records > 0 whose logs/<bot> directory is gone."""
@@ -1739,6 +1984,36 @@ class Ledger:
                     continue
                 if anchored:
                     found.append((name, "chain was anchored (history, last %s) but logs/%s is missing" % (last_ts, name)))
+        # Day rollups name every chain that was anchored that day: a further witness of a chain whose
+        # directory, state file and per-chain anchor files were all removed.
+        days = os.path.join(self.anchors_dir, "days")
+        if os.path.isdir(days):
+            rolled: Dict[str, str] = {}
+            for fname in sorted(os.listdir(days)):
+                if not fname.endswith(".json") or not _DATE_RE.match(fname[:-5]):
+                    continue
+                data = _read_json(os.path.join(days, fname))
+                entries = data.get("chains") if data else None
+                for c in entries if isinstance(entries, list) else []:
+                    if not isinstance(c, dict):
+                        continue
+                    name, n = c.get("bot"), c.get("records")
+                    if (isinstance(name, str) and name and _chain_key(name) == name
+                            and isinstance(n, int) and not isinstance(n, bool) and n > 0 and gone(name)):
+                        rolled[name] = fname[:-5]
+            for name in sorted(rolled):
+                found.append((name, "chain was anchored (day rollup %s) but logs/%s is missing" % (rolled[name], name)))
+        return found
+
+    def missing_witnesses(self, name: str) -> List[str]:
+        """Problem lines for exactly one chain name whose logs/<name> directory is gone while a witness survives.
+
+        Used by ``verify --bot NAME``: the chains an alias resolves NAME to cannot stand in for NAME itself."""
+        if not name or _chain_key(name) != name or os.path.isdir(os.path.join(self.logs_dir, name)):
+            return []
+        found = ["chain was anchored on %s but logs/%s is missing" % (ts, bot)
+                 for bot, ts in self.anchored_missing() if bot == name]
+        found.extend(text for bot, text in self.orphan_witnesses() if bot == name)
         return found
 
     def seal_break(self, bot: str, descriptor: Dict, jay_approval_id: str, copy_fixture: bool = False) -> Dict:
@@ -1780,6 +2055,12 @@ class Ledger:
         # The witness goes on the ledger chain right after the ack; refuse now rather than leave an ack without it.
         if bot != "ledger" and not self._tail_ok("ledger"):
             raise SealError("refusing: ledger witness chain has a tail mismatch")
+
+        def _no_second_ack() -> None:
+            # Runs inside append, under the bot lock: two concurrent seals cannot both add an ack.
+            if any(rec.get("type") == "break_ack" for _p, _n, rec in self.iter_records(bot)):
+                raise SealError("refusing: a break_ack is already present")
+
         ack = self.append(bot, {
             "type": "break_ack",
             "action": "other",
@@ -1788,7 +2069,7 @@ class Ledger:
             "detail": "approved discontinuity seq %s->%s missing %s" % (desc["seq_before"], desc["seq_after"], desc["missing_seqs"]),
             "jay_approval_id": jay,
             "break": desc,
-        })
+        }, _guard=_no_second_ack)
         if bot != "ledger":
             self.append("ledger", {
                 "type": "note",
@@ -1887,12 +2168,17 @@ class Ledger:
         bot = safe_name(bot)
         replayed: List[Dict] = []
         skipped: List[str] = []
+        rejected: List[str] = []
         refused = False
         for path in self.spool_files(bot):
             payload = _read_json(path)
             rec = payload.get("record") if payload else None
             if not isinstance(rec, dict):
-                skipped.append(path)
+                if os.path.exists(path):  # gone: a concurrent replay has just moved it away
+                    skipped.append(path)
+                continue
+            if rec.get("type") == "break_ack":
+                rejected.append(path)  # only `gblog seal` writes a break_ack; a planted spool file must not
                 continue
             spool_id = os.path.basename(path)[:-5]
             done_dir = os.path.join(os.path.dirname(path), "replayed")
@@ -1906,7 +2192,11 @@ class Ledger:
                     rec["original_ts"] = rec.pop("ts")
                 rec["spooled_at"] = payload.get("ts")
                 rec["spool_id"] = spool_id
-                replayed.append(self.append(bot, rec))
+                try:
+                    replayed.append(self.append(bot, rec))
+                except RecordError:
+                    skipped.append(path)  # a planted or damaged event: left in place, like an unreadable file
+                    continue
             _makedirs(done_dir)
             os.replace(path, os.path.join(done_dir, os.path.basename(path)))
         remaining = self.spool_files(bot)
@@ -1915,9 +2205,12 @@ class Ledger:
         if not remaining and not refused and os.path.exists(alert_path) and self._tail_ok(bot):
             stamp = now_iso().replace("-", "").replace(":", "")
             resolved = os.path.join(self.state_dir, "%s.alert.resolved-%s.json" % (bot, stamp))
-            os.replace(alert_path, resolved)
+            try:
+                os.replace(alert_path, resolved)
+            except FileNotFoundError:
+                resolved = None  # a concurrent replay resolved the alert first
         return {"bot": bot, "replayed": replayed, "skipped": skipped, "refused": refused,
-                "remaining": len(remaining), "alert_resolved": resolved}
+                "remaining": len(remaining), "alert_resolved": resolved, "rejected": rejected}
 
     def _anchor_file(self, bot: str) -> str:
         return os.path.join(self.anchors_dir, bot + ".json")
@@ -1926,11 +2219,22 @@ class Ledger:
         try:
             with open(self._anchor_file(bot), encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
         return data if isinstance(data, dict) else None
 
     def anchor(self, bots: Optional[Iterable[str]] = None) -> Dict:
+        """Anchor chains (see ``_anchor``) while holding ``state/.anchors.lock``.
+
+        Two concurrent ``gblog anchor`` runs would otherwise interleave their anchor files and lose each
+        other's entries in the read-merge-write of the day rollup. The lock is taken before any bot lock
+        and never while one is held, so it cannot be part of a lock cycle. Its name starts with a dot,
+        which no chain name can, so it never collides with a bot lock."""
+        self.ensure()
+        with Ledger._Lock(os.path.join(self.state_dir, ".anchors.lock")):
+            return self._anchor(bots)
+
+    def _anchor(self, bots: Optional[Iterable[str]] = None) -> Dict:
         """Anchor each chain. OK chains resume from their previous anchor. A FAIL chain records the break and both segment heads.
 
         There is no whole-ledger skip. One FAIL chain does not drop the others.
@@ -1945,10 +2249,15 @@ class Ledger:
                     "problems": ["no chain for %s" % bot], "break": None, "segments": [],
                     "segment_heads": [], "ts": now_iso(),
                 }
-                self._atomic_json(self._anchor_file(bot), entry)
+                # Never erase a witness: an earlier anchor that recorded real records stays on disk, so that
+                # verify --all (anchored_missing) and the containment check can still use it.
+                kept_anchor = self.read_anchor(bot)
+                kept_records = kept_anchor.get("records") if kept_anchor else None
+                if not (isinstance(kept_records, int) and not isinstance(kept_records, bool) and kept_records > 0):
+                    self._atomic_json(self._anchor_file(bot), entry)
                 chains.append(entry)
                 continue
-            res = self.verify(bot)
+            res = _verify_guarded(self, bot)  # one chain the verifier cannot process must not drop the others
             prev = self.read_anchor(bot)
             segments = res.get("segments") or []
             heads = [s.get("head") for s in segments if s.get("head")]
@@ -1956,7 +2265,9 @@ class Ledger:
             if prev and prev.get("ok"):
                 resumed = prev.get("head")
             elif prev:
-                prev_heads = prev.get("segment_heads") or []
+                prev_heads = prev.get("segment_heads")
+                if not isinstance(prev_heads, list):
+                    prev_heads = []
                 resumed = prev_heads[-1] if prev_heads else prev.get("head")
             if res["ok"]:
                 entry = {
@@ -1994,17 +2305,27 @@ class Ledger:
             }, sort_keys=True) + "\n")
             chains.append(entry)
         rollup = {"mode": "per-chain", "whole_ledger_skip": False, "ts": now_iso(), "chains": chains}
+        if bots is None:
+            # A chain whose logs/<bot> directory is gone while a witness survives is reported, not skipped.
+            # Its witness files (and its earlier rollup entries) are left exactly as they are.
+            lost: Dict[str, List[str]] = {}
+            for name, anchored_ts in self.anchored_missing():
+                lost.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
+            for name, text in self.orphan_witnesses():
+                lost.setdefault(name, []).append(text)
+            if lost:
+                rollup["missing"] = [{"bot": name, "ok": False, "problems": lost[name]} for name in sorted(lost)]
         day = os.path.join(self.anchors_dir, "days", today() + ".json")
         # Merge by bot into today's rollup so `anchor --bot X` does not drop the other chains.
         merged = dict(rollup)
         try:
             with open(day, encoding="utf-8") as fh:
                 earlier = json.load(fh).get("chains")
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, RecursionError):
             earlier = None
         if isinstance(earlier, list):
             mine = {c["bot"] for c in chains}
-            kept = [c for c in earlier if isinstance(c, dict) and c.get("bot") not in mine]
+            kept = [c for c in earlier if isinstance(c, dict) and isinstance(c.get("bot"), str) and c["bot"] not in mine]
             merged["chains"] = sorted(kept + chains, key=lambda c: str(c.get("bot")))
         self._atomic_json(day, merged)
         return rollup
@@ -2032,7 +2353,7 @@ class Ledger:
         def _key(r: Dict) -> Tuple[str, int]:
             try:
                 seq = int(r.get("seq", 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 seq = 0
             return str(r.get("ts") or ""), seq
 
@@ -2049,7 +2370,12 @@ class Ledger:
         out: List[Dict] = []
         for b in (self.chains_for(bot) if bot else self.valid_chains()):
             files = self.log_files(b)
+            later: List[str] = []
             if date:
+                # A clamped record (clock_regressed) is filed under the chain's last timestamp, which can be a
+                # later day than the one the wall clock showed. Those day files are searched as well (below),
+                # so a future-dated tail cannot hide later activity from the daily report.
+                later = [f for f in files if os.path.basename(f)[:10] > date]
                 files = [f for f in files if os.path.basename(f).startswith(date)]
             elif since:
                 files = [f for f in files if os.path.basename(f)[:10] >= since]
@@ -2059,6 +2385,19 @@ class Ledger:
                     continue
                 if not raw and rec.get("bot") != b:
                     rec = dict(rec, bot=b, bot_field=rec.get("bot"))
+                out.append(rec)
+            for _path, _lineno, rec in (self.iter_records(b, later) if later else ()):
+                clock = rec.get("clock_regressed")
+                if "_corrupt" in rec or not isinstance(clock, str) or clock[:10] != date:
+                    continue  # only records whose wall clock showed the requested day
+                if not isinstance(rec.get("ts", ""), str) or not isinstance(rec.get("bot", ""), str):
+                    continue
+                if since and rec.get("ts", "") < since:
+                    continue
+                if not raw:
+                    rec = _text_fields(rec)
+                    if rec.get("bot") != b:
+                        rec = dict(rec, bot=b, bot_field=rec.get("bot"))
                 out.append(rec)
         out.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("bot") or ""), _seq_int(r.get("seq"))))
         return out
@@ -2092,9 +2431,9 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
     ]
     for bot, recs in sorted(by_bot.items()):
         chains = sorted({r.get("chain") or r.get("bot", "?") for r in recs})
-        lines += ["## %s" % labels.get(bot, bot), ""]
+        lines += ["## %s" % _md(labels.get(bot, bot), 200), ""]
         if len(chains) > 1:
-            lines += ["_Chains merged by alias: %s_" % ", ".join("`%s`" % c for c in chains), ""]
+            lines += ["_Chains merged by alias: %s_" % ", ".join("`%s`" % _md(c, 100) for c in chains), ""]
         tasks: Dict[str, Dict] = {}
         order: List[str] = []
         for r in recs:
@@ -2128,7 +2467,7 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
             if t["outcome"]:
                 meta.append("outcome **%s**" % _md(t["outcome"]))
                 if t.get("end_chain") and t["chain"] and t["end_chain"] != t["chain"]:
-                    meta.append("closed from chain `%s`" % t["end_chain"])
+                    meta.append("closed from chain `%s`" % _md(t["end_chain"], 100))
             elif tid != "(no task)":
                 twin = None
                 if t["title"]:
@@ -2139,7 +2478,7 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
                             twin = (oid, o)
                             break
                 if twin:
-                    meta.append("outcome **open** — likely closed as `%s` in chain `%s` (%s)" % (_md(twin[0]), twin[1].get("end_chain") or twin[1]["chain"], _md(twin[1]["outcome"])))
+                    meta.append("outcome **open** — likely closed as `%s` in chain `%s` (%s)" % (_md(twin[0]), _md(twin[1].get("end_chain") or twin[1]["chain"], 100), _md(twin[1]["outcome"])))
                 else:
                     meta.append("outcome **open**")
             if meta:
@@ -2149,6 +2488,9 @@ def render_report(records: List[Dict], title: str, labels: Optional[Dict[str, st
                 kind = r.get("action") or r.get("type")
                 mark = {"fail": "FAIL", "denied": "DENIED", "pending": "PENDING"}.get(r.get("outcome", ""), "")
                 parts = ["%s" % _md(r.get("ts", "")[11:19]), "`%s`" % _md(kind)]
+                if isinstance(r.get("clock_regressed"), str):
+                    # clamped record: the time above is the pinned chain timestamp, this is what the clock said
+                    parts.append("(clock %s)" % _md(r["clock_regressed"], 40))
                 if r.get("target"):
                     parts.append(_md(r["target"]))
                 if mark:
@@ -2185,14 +2527,19 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     import gzip
     bot = safe_name(bot)
     redacted = False
-    unscanned = bool(do_redact) and not _is_text(data)
+    # Text with a few invalid bytes (Latin-1, a cut multi-byte character) is still scanned: with
+    # surrogateescape every such byte survives the round trip unchanged. Only content that is not
+    # UTF-8 text and holds a NUL byte counts as binary and is stored unscanned.
+    as_text = _is_text(data)
+    unscanned = bool(do_redact) and not as_text and b"\x00" in data
     if unscanned:
         sys.stderr.write("warning: binary/non-UTF-8 content stored without secret scanning\n")
     if do_redact and not unscanned:
-        text = data.decode("utf-8")
+        codec_errors = "strict" if as_text else "surrogateescape"
+        text = data.decode("utf-8", codec_errors)
         clean = redact(text) or ""
         redacted = clean != text
-        data = clean.encode("utf-8")
+        data = clean.encode("utf-8", codec_errors)
     digest = hashlib.sha256(data).hexdigest()
     if ts:
         ts = parse_ts(ts)  # ValueError before anything is written; the day below becomes a directory name
@@ -2209,7 +2556,7 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     _makedirs(os.path.dirname(full))
     existed = os.path.exists(full)
     if not existed:
-        tmp = full + ".tmp"
+        tmp = _tmp_name(full)
         with _open_private(tmp, "wb") as raw:
             # fixed gzip header (no name, mtime 0): the same content always gives the same bytes
             with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=raw, mtime=0) as gz:
@@ -2264,9 +2611,10 @@ def verify_archives(ledger: "Ledger", records: Iterable[Dict], check: Optional[b
         if not isinstance(rel, str):
             problems.append("%r: invalid archive path" % (rel,))
             continue
-        if rel in seen:
+        seen_key = (rel, str(r.get("sha256")))  # the same path under another sha256 is a different claim: check it too
+        if seen_key in seen:
             continue
-        seen.add(rel)
+        seen.add(seen_key)
         norm = rel.replace("\\", "/")
         if os.path.isabs(rel) or norm.startswith("/") or ".." in norm.split("/") or not norm.startswith("archive/"):
             problems.append("%s: invalid archive path" % rel)
@@ -2307,9 +2655,26 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
         if not _DAY_FILE_RE.match(rel.rsplit("/", 1)[-1]):
             warnings.append("%s: unexpected log file name (not YYYY-MM-DD.jsonl)" % rel)
     mismatched = reformatted = 0
+    mistyped = nonfinite = 0
     for rel, lineno, rec, text in snap_lines:
         if "_corrupt" in rec:
             continue  # unreadable lines are reported by the chain walk
+        # A hash-valid record can still carry a value that readers have to coerce (a list where text is
+        # expected) or that strict JSON cannot express (NaN, Infinity). Warnings; problems with --strict.
+        odd = False
+        for key, value in rec.items():
+            if value is None or isinstance(value, str):
+                continue
+            if key in _TEXT_FIELD_SET:
+                mistyped += 1
+                if mistyped <= _MAX_LAYOUT_FINDINGS:
+                    warnings.append("%s:%d: field '%s' is not a string" % (rel, lineno, key))
+            elif not odd and isinstance(value, (float, dict, list)) and _has_nonfinite(value):
+                odd = True
+        if odd:
+            nonfinite += 1
+            if nonfinite <= _MAX_LAYOUT_FINDINGS:
+                warnings.append("%s:%d: non-finite number (NaN or Infinity) in record" % (rel, lineno))
         if rec.get("bot") != bot:
             mismatched += 1
             if mismatched <= _MAX_LAYOUT_FINDINGS:
@@ -2323,6 +2688,10 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
                 reformatted += 1
                 if reformatted <= _MAX_LAYOUT_FINDINGS:
                     noncanonical.append("%s:%d: non-canonical line (duplicate keys or reformatted)" % (rel, lineno))
+    if mistyped > _MAX_LAYOUT_FINDINGS:
+        warnings.append("%d more text field(s) that are not strings" % (mistyped - _MAX_LAYOUT_FINDINGS))
+    if nonfinite > _MAX_LAYOUT_FINDINGS:
+        warnings.append("%d more record(s) with a non-finite number" % (nonfinite - _MAX_LAYOUT_FINDINGS))
     if mismatched > _MAX_LAYOUT_FINDINGS:
         warnings.append("%d more record(s) whose bot field does not match chain '%s'" % (mismatched - _MAX_LAYOUT_FINDINGS, bot))
     if reformatted > _MAX_LAYOUT_FINDINGS:
@@ -2333,6 +2702,92 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
 # --------------------------------------------------------------------------- remote visibility (backups must be private)
 # Left-anchored on the host so look-alikes (evilgithub.com, github.com.evil.example) are never treated as GitHub.
 _GITHUB_REMOTE_RE = re.compile(r"(?:^|//|@)(?:www\.)?github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.I)
+
+# Decisions use a parsed host, never the pattern above (kept for callers that import it). A pattern is fooled in
+# both directions: github.com:443 and ssh.github.com are GitHub, https://evil.example/x//github.com/o/r is not.
+_GITHUB_HOSTS = ("github.com", "www.github.com", "ssh.github.com")
+_GITHUB_PATH_RE = re.compile(r"/*([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/*\Z")
+_SSH_REMOTE_KINDS = ("scp", "ssh", "git+ssh", "ssh+git")
+
+
+def _remote_host_path(remote: Optional[str]) -> Tuple[Optional[str], Optional[str], str]:
+    """``(host, path, kind)`` of a git remote. The host is lower-case without a trailing dot; the port is ignored.
+
+    ``scheme://`` URLs are parsed with urlsplit (``kind`` is the scheme). ``[user@]host:path`` is scp-like
+    (``kind`` ``scp``) only when no ``/`` precedes the first ``:``, which is git's own rule. A bare
+    ``github.com/owner/repo`` is kept for compatibility. Anything else (a local path) has no host."""
+    u = (remote or "").strip()
+    if "://" in u:
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(u)
+            host = parts.hostname
+        except ValueError:
+            return None, None, ""
+        return ((host or "").lower().rstrip(".") or None), parts.path, (parts.scheme or "").lower()
+    head, sep, tail = u.partition(":")
+    if sep and "/" not in head:
+        return (head.rpartition("@")[2].lower().rstrip(".") or None), tail, "scp"
+    m = re.match(r"((?:www\.)?github\.com)/(.+)\Z", u, re.I)
+    if m:
+        return m.group(1).lower(), m.group(2), "bare"
+    return None, None, ""
+
+
+def _is_github_host(host: Optional[str]) -> bool:
+    return bool(host) and (host == "github.com" or str(host).endswith(".github.com"))
+
+
+def github_remote(remote: Optional[str]) -> Tuple[bool, Optional[str], Optional[str]]:
+    """``(is_github, owner, repo)`` for a git remote URL.
+
+    ``is_github`` is True for github.com and every ``*.github.com`` host, on any port. ``owner`` and ``repo``
+    are None when the URL is on GitHub but cannot be mapped to a repository (gist.github.com, an odd path):
+    its visibility is then unknown and ``sync`` fails closed."""
+    host, path, _kind = _remote_host_path(remote)
+    if not _is_github_host(host):
+        return False, None, None
+    if host in _GITHUB_HOSTS:
+        m = _GITHUB_PATH_RE.match(path or "")
+        if m and not ({m.group(1), m.group(2)} & {".", ".."}):
+            return True, m.group(1), m.group(2)
+    return True, None, None
+
+
+def _ssh_alias_target(url: str) -> str:
+    """The URL whose visibility counts for ``url``.
+
+    An ssh-config alias (``gh:owner/repo.git`` with ``Host gh`` / ``HostName github.com``) pushes to GitHub
+    although the host written in the URL is not github.com. Such a host is resolved locally with ``ssh -G``
+    (no connection is made) and, when it points at GitHub, the URL is checked as the GitHub repository.
+    Every other URL is returned unchanged. Only ``sync`` calls this; ``remote_visibility`` never runs ssh."""
+    host, path, kind = _remote_host_path(url)
+    if kind not in _SSH_REMOTE_KINDS or not host or _is_github_host(host):
+        return url
+    u = url.strip()
+    if kind == "scp":
+        alias = u.partition(":")[0].rpartition("@")[2]
+    else:
+        from urllib.parse import urlsplit
+        try:
+            alias = re.sub(r":[0-9]*\Z", "", urlsplit(u).netloc.rpartition("@")[2])
+        except ValueError:
+            return url
+    if len(alias) < 2 or not re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z", alias):
+        return url  # nothing to hand to ssh: a drive letter, an option, an address in brackets
+    try:
+        res = subprocess.run(["ssh", "-G", alias], text=True, capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return url
+    if res.returncode != 0:
+        return url
+    for line in res.stdout.splitlines():
+        key, _sep, value = line.strip().partition(" ")
+        if key.lower() == "hostname":
+            if _is_github_host(value.strip().lower().rstrip(".")):
+                return "https://github.com/" + (path or "").lstrip("/")
+            break
+    return url
 
 
 def _safe_url(url: str) -> str:
@@ -2345,12 +2800,16 @@ def remote_visibility(remote: str, timeout: float = 6.0) -> Dict:
 
     GitHub remotes are checked with `gh` when available, else with the public
     REST API (a 200 without credentials means the repository is public)."""
-    m = _GITHUB_REMOTE_RE.search(remote or "")
-    if not m:
+    is_github, owner, repo = github_remote(remote)
+    if not is_github:
         return {"public": None, "reason": "not a github.com remote; visibility unknown"}
-    owner, repo = m.group(1), m.group(2)
+    if not owner or not repo:
+        # gist.github.com or an odd path: GitHub, but nothing the API can be asked about. sync fails closed on it.
+        return {"public": None, "reason": "github.com URL that cannot be mapped to a repository"}
     try:
-        res = subprocess.run(["gh", "api", "repos/%s/%s" % (owner, repo), "--jq", ".private"], text=True, capture_output=True, timeout=timeout)
+        # --hostname: GH_HOST in the environment must not redirect the question to another server
+        res = subprocess.run(["gh", "api", "--hostname", "github.com", "repos/%s/%s" % (owner, repo), "--jq", ".private"],
+                             text=True, capture_output=True, timeout=timeout)
         if res.returncode == 0 and res.stdout.strip() in ("true", "false"):
             return {"public": res.stdout.strip() == "false", "reason": "gh api"}
     except (OSError, subprocess.TimeoutExpired):
@@ -2369,15 +2828,155 @@ def remote_visibility(remote: str, timeout: float = 6.0) -> Dict:
         return {"public": None, "reason": "api.github.com HTTP %d" % exc.code}
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return {"public": None, "reason": "network: %s" % exc.__class__.__name__}
+    except Exception as exc:
+        # http.client.HTTPException (IncompleteRead, BadStatusLine), a body that is not a JSON object, ...:
+        # anything unexpected means "unknown", which fails closed for github.com remotes.
+        return {"public": None, "reason": "lookup failed: %s" % exc.__class__.__name__}
 
 
 # --------------------------------------------------------------------------- git sync
 def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", root, *args], check=check, text=True, capture_output=True)
+    # Hooks are never run for the ledger repository (a hook could rewrite or drop what sync commits), and
+    # line-ending conversion is off so that the committed bytes are the bytes on disk.
+    return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.autocrlf=false", "-C", root, *args],
+                          check=check, text=True, capture_output=True)
+
+
+_SYNC_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\Z")  # every file gblog itself writes has such a path
+
+
+def _sync_evidence(ledger: "Ledger") -> Tuple[List[str], Dict[str, Tuple[int, bool]]]:
+    """Files gblog itself writes, as POSIX paths relative to the ledger root: ``(forced, checked)``.
+
+    ``forced`` is staged by name with ``git add -f``, so no ignore rule (a nested .gitignore,
+    .git/info/exclude, core.excludesFile) can keep evidence out of the backup. ``checked`` maps the
+    files whose committed bytes are compared with the disk after the commit to ``(size now, append_only)``.
+    Also writes ``<root>/.gitignore`` when it is missing (ledgers created before 0.6 never got one)."""
+    import stat as _stat
+    root = ledger.root
+    ignore = os.path.join(root, ".gitignore")
+    if not os.path.lexists(ignore):
+        try:
+            with _open_private(ignore, "w", encoding="utf-8") as fh:
+                fh.write("state/*.lock\n*.tmp\nstate/capture-files-*.json\n")
+        except OSError:
+            pass
+    forced: List[str] = []
+    checked: Dict[str, Tuple[int, bool]] = {}
+
+    def names(*parts: str) -> List[str]:
+        try:
+            return sorted(os.listdir(os.path.join(root, *parts)))
+        except OSError:
+            return []
+
+    def take(rel: str, check: bool = False, append_only: bool = False) -> None:
+        if not _SYNC_PATH_RE.match(rel):
+            return
+        try:
+            st = os.lstat(os.path.join(root, *rel.split("/")))
+        except OSError:
+            return
+        if not _stat.S_ISREG(st.st_mode):
+            return
+        forced.append(rel)
+        if check:
+            checked[rel] = (st.st_size, append_only)
+
+    for chain in names("logs"):
+        for name in names("logs", chain):
+            if name.endswith(".jsonl"):
+                take("logs/%s/%s" % (chain, name), True, True)
+    for name in names("anchors"):
+        if name.endswith(".history.jsonl"):
+            take("anchors/" + name, True, True)
+        elif name.endswith(".json"):
+            take("anchors/" + name)
+    for name in names("anchors", "days"):
+        if name.endswith(".json"):
+            take("anchors/days/" + name)
+    for bot in names("archive"):
+        for day in names("archive", bot):
+            for name in names("archive", bot, day):
+                if name.endswith(".gz"):
+                    take("archive/%s/%s/%s" % (bot, day, name), True, False)
+    for name in names("state"):
+        if name.endswith(".json") and not name.startswith("capture-files-"):
+            take("state/" + name)
+    for bot in names("spool"):
+        for name in names("spool", bot):
+            if name.endswith(".json"):
+                take("spool/%s/%s" % (bot, name))
+        for name in names("spool", bot, "replayed"):
+            if name.endswith(".json"):
+                take("spool/%s/replayed/%s" % (bot, name))
+    take(".gitignore")
+    return forced, checked
+
+
+def _git_blob_id(path: str, size: int, hexlen: int) -> Optional[str]:
+    """git object id of the first ``size`` bytes of ``path`` stored as a blob (no filters). None if unreadable."""
+    h = hashlib.sha256() if hexlen == 64 else hashlib.sha1()
+    h.update(("blob %d" % size).encode("ascii") + b"\0")
+    left = size
+    try:
+        with open(path, "rb") as fh:
+            while left > 0:
+                chunk = fh.read(min(1 << 20, left))
+                if not chunk:
+                    return None
+                h.update(chunk)
+                left -= len(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _sync_drift(root: str, checked: Dict[str, Tuple[int, bool]]) -> List[str]:
+    """Evidence files whose bytes in ``HEAD`` are not the bytes on disk (or that are not in ``HEAD`` at all).
+
+    Catches what ``git add`` can be talked out of: ignore rules, assume-unchanged / skip-worktree index
+    flags, clean filters, a chain directory turned into a nested repository or a symlink. Log files and
+    anchor histories are append-only and may grow while sync runs, so for them the committed blob must be
+    a prefix of the file that is at least as long as the file was when it was staged. Archived files must
+    match exactly."""
+    if not checked:
+        return []
+    res = subprocess.run(["git", "-C", root, "ls-tree", "-r", "-l", "-z", "HEAD", "--", "logs", "anchors", "archive"],
+                         capture_output=True)
+    if res.returncode != 0:
+        return ["HEAD (git ls-tree failed)"]
+    tree: Dict[str, Tuple[str, int]] = {}
+    for entry in res.stdout.split(b"\0"):
+        meta, tab, raw = entry.partition(b"\t")
+        fields = meta.split()
+        if not tab or len(fields) != 4 or fields[1] != b"blob":
+            continue
+        try:
+            tree[raw.decode("utf-8")] = (fields[2].decode("ascii"), int(fields[3]))
+        except (UnicodeDecodeError, ValueError):
+            continue
+    drift: List[str] = []
+    for rel in sorted(checked):
+        staged_size, append_only = checked[rel]
+        full = os.path.join(root, *rel.split("/"))
+        try:
+            now_size = os.path.getsize(full)
+        except OSError:
+            continue  # gone since it was staged: nothing to compare
+        blob = tree.get(rel)
+        ok = False
+        if blob is not None:
+            sha, size = blob
+            ok = (staged_size <= size <= now_size) if append_only else (size == now_size)
+            ok = ok and _git_blob_id(full, size, len(sha)) == sha
+        if not ok:
+            drift.append(rel)
+    return drift
 
 
 def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str], push: bool, message: Optional[str],
-         allow_public: bool = False, allow_unknown: bool = False) -> Dict:
+         allow_public: bool = False, allow_unknown: bool = False, replace_remote: bool = False) -> Dict:
     """Commit the ledger and, when ``push`` is set, push it to origin.
 
     Every push URL of origin is checked. A PUBLIC one refuses the push unless ``allow_public``.
@@ -2402,10 +3001,20 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         _git(root, "init", "-q")
     if remote:
         remotes = _git(root, "remote", check=False).stdout.split()
+        # Backups are never silently re-pointed: changing an existing origin needs ``replace_remote``
+        # (--replace-remote), and every change of origin is recorded in the ledger.
+        current = [u.strip() for u in _git(root, "config", "--get-all", "remote.origin.url", check=False).stdout.splitlines()
+                   if u.strip()]
+        if current and remote not in current and not replace_remote:
+            raise _UsageError("origin is already %s; pass --replace-remote to send backups to %s instead"
+                              % (_safe_url(current[0]), _safe_url(remote)))
         if "origin" in remotes:
             _git(root, "remote", "set-url", "origin", remote)
         else:
             _git(root, "remote", "add", "origin", remote)
+        if remote not in current:
+            _bookkeep({"type": "sync", "action": "other", "target": "git remote", "outcome": "ok",
+                       "detail": "origin %s -> %s" % (_safe_url(current[0]) if current else "-", _safe_url(remote))})
     status = _git(root, "status", "--porcelain").stdout
     pending = [l for l in status.splitlines() if l.strip()]
     _bookkeep({"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
@@ -2415,26 +3024,43 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         add_paths.append("README.md")
     if os.path.exists(os.path.join(root, ".gitignore")):
         add_paths.append(".gitignore")
+    forced, checked = _sync_evidence(ledger)
     _git(root, "add", "-A", *add_paths)
+    # Evidence files are also staged by name with -f, so an ignore rule cannot keep them out of the backup.
+    # Failures here are not fatal: what did not reach the commit is found by _sync_drift below.
+    for start in range(0, len(forced), 200):
+        _git(root, "add", "-f", "--", *forced[start:start + 200], check=False)
     # Lock files and file-capture snapshots are local scratch: untrack any that an older version committed.
     _git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "state/*.lock", "state/capture-files-*.json", check=False)
     commit_msg = message or "gblog sync %s" % now_iso()
     env_ok = True
     try:
-        _git(root, "-c", "user.name=gblog", "-c", "user.email=gblog@localhost", "commit", "-q", "-m", commit_msg)
+        _git(root, "-c", "user.name=gblog", "-c", "user.email=gblog@localhost", "commit", "-q", "--no-verify", "-m", commit_msg)
     except subprocess.CalledProcessError as exc:
         if "nothing to commit" not in (exc.stdout + exc.stderr):
             raise
         env_ok = False
     sha = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
     result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None, "visibility": None, "tail_mismatch": refused}
+    # The backup must hold what is on disk. An ignore rule, an index flag or a clean filter can keep new
+    # records out of the commit while git reports success; then nothing is pushed and the caller is told.
+    drift = _sync_drift(root, checked)
+    if drift:
+        result["unverified"] = drift
+        result["error"] = "committed content differs from disk for %s%s (git ignore rule, filter or index flag); not pushed" % (
+            drift[0], " and %d more file(s)" % (len(drift) - 1) if len(drift) > 1 else "")
+        _bookkeep({"type": "sync", "action": "other", "target": "git", "outcome": "fail", "detail": result["error"][:300]})
+        push = False
     if push:
         # Every push URL counts: remote.origin.pushurl may differ from the fetch URL and may list several.
         urls = [u.strip() for u in _git(root, "remote", "get-url", "--push", "--all", "origin", check=False).stdout.splitlines() if u.strip()]
-        checks = [(u, remote_visibility(u)) for u in urls]
+        # GitHub is recognised by parsed host (any port, ssh.github.com, *.github.com); an ssh-config alias
+        # of github.com is checked as the repository it points at.
+        targets = {u: _ssh_alias_target(u) for u in urls}
+        checks = [(u, remote_visibility(targets[u])) for u in urls]
         public = [c for c in checks if c[1].get("public")]
         unknown = [c for c in checks if c[1].get("public") is None]
-        unknown_github = [c for c in unknown if _GITHUB_REMOTE_RE.search(c[0])]
+        unknown_github = [c for c in unknown if github_remote(targets[c[0]])[0]]
         worst = (public or unknown_github or unknown or checks or [("", {"public": None, "reason": "no origin configured"})])[0]
         result["visibility"] = worst[1]
         result["visibilities"] = [{"url": _safe_url(u), "public": v.get("public"), "reason": v.get("reason")} for u, v in checks]
@@ -2460,10 +3086,11 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             result["error"] = "detached HEAD; pass --branch"
         else:
             try:
-                _git(root, "push", "-u", "origin", "HEAD:%s" % cur_branch)
+                _git(root, "push", "--no-verify", "-u", "origin", "HEAD:%s" % cur_branch)
                 result["pushed"] = True
             except subprocess.CalledProcessError as exc:
-                result["error"] = redact((exc.stderr or exc.stdout or "").strip()[-400:])
+                # redact first, then cut: a cut through `https://user:token@` would hide the secret from the rules
+                result["error"] = (redact((exc.stderr or exc.stdout or "").strip()) or "")[-400:]
     stamp = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
     for b in ledger.bots():
         # update_state never writes a genesis state over a chain whose state file is missing (that would brick appends).
@@ -2485,11 +3112,16 @@ __gblog_hook() {
   cmd=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null | sed 's/^ *[0-9]* *//')
   if [ -z "$cmd" ] || [ "$cmd" = "$__gblog_last" ]; then return 0; fi
   __gblog_last="$cmd"
-  case "$cmd" in gblog*|*" gblog "*|__gblog*) return 0;; esac
+  # Only a plain gblog call is skipped. A command that can carry a second one (list, pipe, substitution,
+  # redirection, line break) is logged, so "gblog status; rm -rf x" cannot hide behind the gblog prefix.
+  case "$cmd" in
+    *";"*|*"&"*|*"|"*|*"\$"*|*'`'*|*"<"*|*">"*|*$'\n'*) ;;
+    gblog|gblog\ *|__gblog*) return 0;;
+  esac
   command -v gblog >/dev/null 2>&1 || return 0
   local outcome=ok
   [ "$rc" -eq 0 ] || outcome=fail
-  gblog log --bot "${GBLOG_BOT:-%s}" --task-id "${GBLOG_TASK:-}" --action shell --target "$cmd" \
+  gblog log --bot "${GBLOG_BOT:-%s}" --task-id "${GBLOG_TASK:-}" --action shell --target="$cmd" \
     --outcome "$outcome" --source auto >/dev/null 2>&1 || true
   return 0
 }
@@ -2582,6 +3214,14 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
     cutoff_epoch = time.time() - hours * 3600  # real epoch seconds, independent of the local UTC offset
     added, changed = 0, False
     failed: List[str] = []
+
+    def save_markers(strict: bool = True) -> None:
+        try:
+            ledger.update_state(bot, {"capture_browser_last": {k: v for k, v in markers.items() if k != "*"}})
+        except OSError:
+            if strict:
+                raise
+
     for path in paths:
         firefox = path.endswith("places.sqlite")
         # Chrome: microseconds since 1601; Firefox: microseconds since 1970
@@ -2630,6 +3270,8 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
             if not target or target == last_target:
                 continue
             last_target = target
+            if isinstance(title, str):
+                title = redact(title)  # redact before the 120-character cut, so no token is cut below its pattern's minimum
             observed = _dt.datetime.fromtimestamp(to_epoch(visit_time), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             ledger.append(bot, {"type": "action", "action": "browser", "target": target, "outcome": "ok",
                                 "detail": (title or "")[:120], "source": "auto", "capture": "browser", "observed": observed,
@@ -2639,7 +3281,7 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
             markers[path] = newest
             changed = True
     if changed:
-        ledger.update_state(bot, {"capture_browser_last": {k: v for k, v in markers.items() if k != "*"}})
+        save_markers()
     return {"histories": paths, "added": added, "failed": failed}
 
 
@@ -2650,6 +3292,9 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
         _exit2("capture path %s does not exist or is not a directory; nothing was logged and the snapshot is unchanged" % path)
     skip_names = set(exclude) | {".git", "__pycache__", "node_modules", ".cache", ".venv"}
     snap_path = os.path.join(ledger.state_dir, "capture-files-%s.json" % bot)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        # a zero or negative limit would drop changes and still advance the snapshot
+        _die("capture --limit must be 1 or more; nothing was logged and the snapshot is unchanged")
     current: Dict[str, List[float]] = {}
     for dirpath, dirnames, filenames in os.walk(path):
         if _is_within(dirpath, ledger.root):
@@ -2665,12 +3310,12 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
             except OSError:
                 continue
             current[os.path.relpath(full, path)] = [round(st.st_mtime, 3), st.st_size]
-    def save_snapshot() -> None:
-        # atomic, and only called once every change has been appended
+    def save_snapshot(files: Optional[Dict] = None) -> None:
+        # atomic, and only called once every change it covers has been appended
         ledger.ensure()
-        tmp = snap_path + ".tmp"
+        tmp = _tmp_name(snap_path)
         with _open_private(tmp, "w", keep=snap_path, encoding="utf-8") as fh:
-            json.dump({"path": path, "taken": now_iso(), "files": current}, fh)
+            json.dump({"path": path, "taken": now_iso(), "files": current if files is None else files}, fh)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, snap_path)
@@ -2693,6 +3338,17 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
             else:
                 previous = snap["files"]
     if previous is None:
+        if not os.path.exists(snap_path):
+            # No snapshot although this chain already holds file-capture records: the snapshot was removed,
+            # and whatever changed since the last run goes unreported. Say so instead of re-baselining silently.
+            try:
+                earlier = any(rec.get("capture") == "files" for _p, _n, rec in ledger.iter_records(bot))
+            except OSError:
+                earlier = False
+            if earlier:
+                sys.stderr.write("notice: state/%s is missing although %s already has file-capture records; taking a new "
+                                 "baseline (file changes since the last capture were not logged)\n"
+                                 % (os.path.basename(snap_path), bot))
         save_snapshot()
         return {"baseline": len(current), "changes": 0}
     changes: List[Tuple[str, str]] = []
@@ -2709,10 +3365,22 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
         ledger.append(bot, {"type": "action", "action": "file", "target": rel, "outcome": "ok", "detail": kind,
                             "source": "auto", "capture": "files"})
     if len(changes) > limit:
-        ledger.append(bot, {"type": "note", "detail": "%d more file changes not listed individually" % (len(changes) - limit),
+        ledger.append(bot, {"type": "note",
+                            "detail": "%d more file changes not listed individually; they stay pending for the next run"
+                                      % (len(changes) - limit),
                             "source": "auto", "capture": "files"})
-    save_snapshot()
-    return {"baseline": len(previous), "changes": len(changes)}
+        # The snapshot advances only for what was logged. The rest is found again, and named, by the next
+        # runs, so a burst of noise files cannot make a real change disappear behind the limit.
+        pending = dict(previous)
+        for kind, rel in changes[:limit]:
+            if kind == "deleted":
+                pending.pop(rel, None)
+            else:
+                pending[rel] = current[rel]
+        save_snapshot(pending)
+    else:
+        save_snapshot()
+    return {"baseline": len(previous), "changes": len(changes), "pending": max(0, len(changes) - limit)}
 
 
 # --------------------------------------------------------------------------- coverage (self-report vs. auto)
@@ -2832,7 +3500,7 @@ def _precedes(a: Dict, b: Dict) -> bool:
     if (a.get("chain") or a.get("bot")) == (b.get("chain") or b.get("bot")):
         try:
             return int(a.get("seq")) < int(b.get("seq"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return True
     return True
 
@@ -2887,7 +3555,9 @@ def compute_metric(records: List[Dict], metric: Dict, since: Optional[str] = Non
     if kind == "slow":
         tasks = _tasks_of(recs)
         durations = [(_ts_epoch(t["end"]) - _ts_epoch(t["start"])) / 60 for t in tasks.values() if t["start"] and t["end"]]
-        threshold = metric.get("threshold_min") or 0
+        threshold = metric.get("threshold_min")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            threshold = 0  # absent, or a hand-written tune record with an unusable value
         return float(sum(1 for d in durations if d > threshold))
     if kind == "open_tasks":
         tasks = _tasks_of(recs)
@@ -3083,6 +3753,13 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None) -
         before = p.get("baseline")
         if isinstance(before, bool) or not isinstance(before, (int, float)):
             before = None
+        else:
+            try:
+                before = float(before)  # a huge integer cannot take part in the rate arithmetic below
+            except OverflowError:
+                before = None
+            if before is not None and _has_nonfinite(before):
+                before = None
         win = p.get("window") if isinstance(p.get("window"), dict) else None
         window_days_before = max(1.0, (_ts_epoch(win.get("until")) - _ts_epoch(win.get("since"))) / 86400) if win else float(window_days)
         if metric.get("kind") == "coverage":
@@ -3113,7 +3790,7 @@ def render_tune(analysis: Dict, title: str, labels: Optional[Dict[str, str]] = N
         return "\n".join(lines) + "\n"
     lines += ["## Bots", "", "| Bot | Tasks | Closed | OK | Open | Actions | Failed | Approvals | Denied | Median min |", "|---|---|---|---|---|---|---|---|---|---|"]
     for bot, m in sorted(analysis["metrics"].items()):
-        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (labels.get(bot, bot), m["tasks"], m["closed"], m["succeeded"], m["open"], m["actions"],
+        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (_md(labels.get(bot, bot), 200), m["tasks"], m["closed"], m["succeeded"], m["open"], m["actions"],
                                                                         m["failed_actions"], m["approvals"], m["denied"], m["median_minutes"]))
     if analysis.get("coverage") and analysis["coverage"].get("auto"):
         lines += ["", "Self-report coverage: **%s%%** of %d observed actions (see `gblog coverage`)." % (analysis["coverage"]["pct"], analysis["coverage"]["auto"])]
@@ -3131,7 +3808,7 @@ def render_tune(analysis: Dict, title: str, labels: Optional[Dict[str, str]] = N
         if p["category"] != current:
             current = p["category"]
             lines += ["### %s" % current, ""]
-        lines.append("- **[%s]** %s — %s" % (p["id"], labels.get(p["bot"], p["bot"]), _md(p["title"])))
+        lines.append("- **[%s]** %s — %s" % (p["id"], _md(labels.get(p["bot"], p["bot"]), 200), _md(p["title"])))
         lines.append("  - %s" % _md(p["suggestion"], 2000))
         if p.get("status") == "rejected":
             lines.append("  - Rejected on %s; listed again because %d days have passed or the evidence at least doubled."
@@ -3143,7 +3820,7 @@ def render_tune(analysis: Dict, title: str, labels: Optional[Dict[str, str]] = N
     if applied:
         lines += ["", "### already applied", ""]
         for p in applied:
-            lines.append("- **[%s]** %s — %s (applied %s)" % (p["id"], labels.get(p["bot"], p["bot"]), _md(p["title"]),
+            lines.append("- **[%s]** %s — %s (applied %s)" % (p["id"], _md(labels.get(p["bot"], p["bot"]), 200), _md(p["title"]),
                                                              _md(str(p.get("status_ts") or "")[:10])))
     if hidden:
         lines += ["", "_%d rejected proposal(s) stay hidden for %d days after the decision unless their evidence doubles "
@@ -3183,7 +3860,7 @@ def save_proposals(ledger: "Ledger", analysis: Dict) -> Dict:
             old_list, old_generated = old["proposals"], old.get("generated")
     except OSError:
         pass
-    except ValueError:
+    except (ValueError, RecursionError):
         sys.stderr.write("notice: tuning/proposals.json was unreadable and has been replaced\n")
     cutoff = _ts_epoch(generated) - _PROPOSAL_KEEP_DAYS * 86400
     kept = []
@@ -3197,7 +3874,7 @@ def save_proposals(ledger: "Ledger", analysis: Dict) -> Dict:
         kept.append(dict(p, generated=stamp))
     doc = {"generated": generated, "proposals": fresh + kept}
     _makedirs(ledger.tuning_dir)
-    tmp = path + ".tmp"
+    tmp = _tmp_name(path)
     with _open_private(tmp, "w", keep=path, encoding="utf-8", errors="backslashreplace") as fh:
         json.dump(doc, fh, indent=2, ensure_ascii=False)
         fh.flush()
@@ -3214,7 +3891,7 @@ def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool =
         with open(path, encoding="utf-8") as fh:
             proposals = json.load(fh).get("proposals", [])
         match = [p for p in proposals if p["id"] == pid]
-    except (ValueError, AttributeError, TypeError, KeyError):
+    except (ValueError, AttributeError, TypeError, KeyError, RecursionError):
         raise ValueError("error: %s is corrupt" % os.path.relpath(path, ledger.root).replace(os.sep, "/"))
     if not match:
         raise ValueError("unknown proposal id %s (run `gblog tune` to list current ids)" % pid)
@@ -3317,7 +3994,7 @@ def _orphan_alert_lines(ledger: "Ledger", only: Optional[str] = None) -> List[st
             first = _read_json(ledger.spool_files(chain)[0]) or {}
             a_ts = first.get("ts") if isinstance(first.get("ts"), str) else "unknown"
         if a_ts:
-            lines.append("ALERT %s: tail mismatch since %s (%d spooled)\n" % (chain, a_ts, a_n))
+            lines.append("ALERT %s: tail mismatch since %s (%d spooled)\n" % (_term(chain), _term(a_ts), a_n))
     return lines
 
 
@@ -3335,6 +4012,25 @@ def _record_verify(ledger: "Ledger", out, bot: str, res: Dict, record: Dict) -> 
         return 1
 
 
+def _verify_guarded(ledger: "Ledger", bot: str) -> Dict:
+    """``ledger.verify(bot)``, except that an unexpected exception becomes a FAIL result for that chain.
+
+    A chain the verifier cannot process (an input nobody anticipated, a file it cannot read) must never
+    keep ``verify --all`` or ``anchor`` from checking the chains after it. ``seal`` and ``state rebuild``
+    keep calling ``Ledger.verify`` directly and fail closed."""
+    try:
+        return ledger.verify(bot)
+    except Exception as exc:
+        text = " ".join(str(_clean_text(str(exc))).split())
+        if len(text) > 200:
+            text = text[:200] + "…"
+        problem = "verify aborted: %s%s" % (exc.__class__.__name__, (": " + text) if text else "")
+        return {"bot": bot, "records": 0, "head": None, "ok": False, "problems": [problem], "archives": 0,
+                "approved_breaks": 0, "approved": [], "breaks": [], "segments": [], "jay_approval_id": None,
+                "warnings": [], "fixture_ack": False, "state_problem": None, "archives_checked": False,
+                "aborted": True}
+
+
 def _verify_missing(name: str, problem: str) -> Dict:
     """Result entry for a chain `verify` could not walk at all (unknown name, or its logs directory is gone)."""
     return {"bot": name, "ok": False, "records": 0, "head": None, "problems": [problem], "warnings": [], "missing": True}
@@ -3342,6 +4038,7 @@ def _verify_missing(name: str, problem: str) -> Dict:
 
 def _verify_text(name: str, res: Dict) -> str:
     """The lines `gblog verify` prints for one result entry. `verify --json` dumps the same entries."""
+    name = _term(name)  # names, problems and warnings can carry record text, file names or anchor fields
     arch = ""
     if res.get("archives"):
         arch = "  (archives not checked)" if res.get("archives_checked") is False else "  (%d archived file(s) intact)" % res["archives"]
@@ -3352,8 +4049,8 @@ def _verify_text(name: str, res: Dict) -> str:
         lines = ["OK    %-20s %6d records  head %s%s\n" % (name, res["records"], str(res["head"])[:12], arch)]
     else:
         lines = ["FAIL  %-20s %6d records\n" % (name, res["records"])]
-        lines.extend("      - %s\n" % prob for prob in res["problems"])
-    lines.extend("      ! %s\n" % warn for warn in res.get("warnings") or [])
+        lines.extend("      - %s\n" % _term(prob) for prob in res["problems"])
+    lines.extend("      ! %s\n" % _term(warn) for warn in res.get("warnings") or [])
     return "".join(lines)
 
 
@@ -3445,6 +4142,8 @@ def _build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sync", help="commit (and push) the ledger with git; refuses to push to a PUBLIC GitHub remote")
     s.add_argument("--bot", default="system", help="bot that performs the sync")
     s.add_argument("--remote", help="git remote URL to set as origin")
+    s.add_argument("--replace-remote", action="store_true",
+                   help="allow --remote to change an origin URL that is already set (the change is recorded)")
     s.add_argument("--branch", help="branch to push (default: current)")
     s.add_argument("--no-push", action="store_true")
     s.add_argument("--allow-public", action="store_true", help="push even if the remote repository is public")
@@ -3579,7 +4278,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except TailMismatchError as exc:
         sys.stderr.write("ALERT tail mismatch: %s\nspool: %s\nalert: %s\n" % (exc, exc.spool_path, exc.alert_path))
         return 4
-    except (_UsageError, TimestampError) as exc:
+    except (_UsageError, TimestampError, RecordError) as exc:
         sys.stderr.write("error: %s\n" % exc)
         return 2
     except BrokenPipeError:
@@ -3596,6 +4295,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             detail = "%s: %s" % (detail, exc.filename)
         sys.stderr.write("error: %s\n" % detail)
         return 2
+    except Exception as exc:  # last resort: malformed input must never end in a traceback
+        if os.environ.get("GBLOG_DEBUG"):
+            raise
+        text = " ".join(str(_clean_text(str(exc))).split())[:300]
+        sys.stderr.write("error: internal error (%s%s); set GBLOG_DEBUG=1 for a traceback\n"
+                         % (exc.__class__.__name__, (": " + text) if text else ""))
+        return 1
 
 
 def _main(argv: Optional[List[str]] = None) -> int:
@@ -3695,15 +4401,27 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 return finish(0)
         else:
             bots = ledger.chains_on_disk(args.bot)  # slug, display name or alias -> every chain of that Bot
+            exact = args.bot.strip()
+            # The name as given also counts on its own: when it is a chain whose logs are gone while a witness
+            # survives, the chains an alias resolves it to cannot stand in for it.
+            lost = ledger.missing_witnesses(exact) if exact not in bots else []
             if not bots:
-                emit(args.bot, _verify_missing(args.bot, "no chain on disk for '%s'" % args.bot))
+                entry = _verify_missing(args.bot, "no chain on disk for '%s'" % args.bot)
+                entry["problems"].extend(lost)
+                emit(args.bot, entry)
                 return finish(1)
+            if lost:
+                missing[exact] = lost
         not_found: List[str] = []
         present: set = set()  # hashes of the very snapshots verify() walked; --contains needs no second read
         rc = 0
         for b in bots:
-            res = ledger.verify(b)
-            present |= set(getattr(res, "hashes", ()))
+            res = _verify_guarded(ledger, b)
+            # --contains is chain-exact: a record only counts in the chain its own ``bot`` field names, and
+            # when --bot is itself a chain directory only that chain is searched. A copy of the chain under
+            # another name, reached through an alias, cannot satisfy the rollback check.
+            if wanted and (args.bot.strip() not in bots or b == args.bot.strip()):
+                present |= set(getattr(res, "own_hashes", getattr(res, "hashes", ())))
             if wanted and b == bots[-1]:
                 not_found = [h for h in wanted if h not in present]
             if not_found and b == bots[-1]:
@@ -3755,13 +4473,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 extra = (" " + c["status"]) if c.get("approved_breaks") else ""
                 resumed = c.get("resumed_from") or "-"
                 out.write("ANCHOR %-4s %-20s head %s resumed_from %s%s\n" % (
-                    "PASS" if c.get("approved_breaks") else "OK", c["bot"], str(c.get("head") or "")[:12], str(resumed)[:12], extra))
+                    "PASS" if c.get("approved_breaks") else "OK", c["bot"], str(c.get("head") or "")[:12], _term(str(resumed)[:12]), extra))
             else:
                 br = c.get("break") or {}
                 heads = " ".join(str(h)[:12] for h in (c.get("segment_heads") or []))
                 where = "%s:%s seq %s->%s" % (br.get("file"), br.get("line_after"), br.get("seq_before"), br.get("seq_after")) if br else "-"
                 out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (c["bot"], where, heads))
-        return 0 if all(c["ok"] for c in rollup["chains"]) else 1
+        lost_chains = rollup.get("missing") or []
+        for m in lost_chains:  # logs/<bot> is gone while a witness survives: reported, never skipped
+            out.write("ANCHOR FAIL %-20s break %s heads %s\n" % (m["bot"], "-", ""))
+            out.write("".join("      - %s\n" % p for p in m["problems"]))
+        return 0 if all(c["ok"] for c in rollup["chains"]) and not lost_chains else 1
 
     if args.cmd == "report":
         bot = ledger.canonical(args.bot) if args.bot else None
@@ -3775,8 +4497,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             title = "Activity report %s" % date
             fname = date
         if bot:
-            title += " — %s" % ledger.label(bot)
-            fname += "-" + bot
+            title += " — %s" % _md(ledger.label(bot), 200)
+            fname += "-" + (_chain_key(bot) or "bot")  # never a path separator in the report file name
         recs = ledger.canonicalize(recs)
         labels = {b: ledger.label(b) for b in {r.get("bot", "?") for r in recs}}
         text = render_report(recs, title, labels)
@@ -3810,7 +4532,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
                     open_tasks.add(r.get("task_id"))
                 elif r.get("type") == "task_end":
                     open_tasks.discard(r.get("task_id"))
-            today_n = sum(1 for r in recent if str(r.get("ts") or "").startswith(today()))
+            # A clamped record counts on the day its wall clock showed (clock_regressed), not on the pinned chain day.
+            today_n = sum(1 for r in recent
+                          if str((r.get("clock_regressed") if isinstance(r.get("clock_regressed"), str) else r.get("ts")) or "")
+                          .startswith(today()))
             head = views[key]["head"][:12] if key in views else "-"
             rows.append({"bot": key, "label": ledger.label(key) if not args.chains else key, "chains": chains, "seq": seq, "head": head,
                          "updated": updated or None, "today": today_n, "open_tasks": len(open_tasks), "last_sync": last_sync})
@@ -3835,12 +4560,12 @@ def _main(argv: Optional[List[str]] = None) -> int:
         for r in rows:
             ls = r["last_sync"]
             ls_txt = "%s (%s%s)" % (ls["ts"], ls["commit"], "" if ls.get("pushed") else ", not pushed") if ls else "never"
-            out.write("%-28s %6d %6d %8d %5d %20s  %s\n" % (r["label"], len(r["chains"]), r["seq"], r["today"], r["open_tasks"], r["updated"] or "-", ls_txt))
+            out.write("%-28s %6d %6d %8d %5d %20s  %s\n" % (_term(r["label"]), len(r["chains"]), r["seq"], r["today"], r["open_tasks"], _term(r["updated"] or "-"), _term(ls_txt)))
         for r in rows:
             for c in r["chains"]:
                 a_ts, a_n = ledger.alert_info(c)
                 if a_ts:
-                    out.write("ALERT %s: tail mismatch since %s (%d spooled)\n" % (c, a_ts, a_n))
+                    out.write("ALERT %s: tail mismatch since %s (%d spooled)\n" % (c, _term(a_ts), a_n))
         out.write("".join(orphan_alerts))
         for r in rows:
             for c in r["chains"]:
@@ -3863,7 +4588,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 bits.append("[%s]" % r["outcome"])
             if r.get("detail"):
                 bits.append("- " + r["detail"])
-            out.write(" ".join(str(b) for b in bits) + "\n")
+            out.write(_term(" ".join(str(b) for b in bits)) + "\n")  # one record, one line; no raw escapes
         return 0
 
     if args.cmd == "sync":
@@ -3872,7 +4597,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         args.bot = ledger.canonical(args.bot) if args.bot == "system" else _resolve_bot(ledger, args.bot)
         try:
             res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message, args.allow_public,
-                       allow_unknown=bool(getattr(args, "allow_unknown_visibility", False)))
+                       allow_unknown=bool(getattr(args, "allow_unknown_visibility", False)),
+                       replace_remote=bool(getattr(args, "replace_remote", False)))
         except subprocess.CalledProcessError as exc:
             sys.stderr.write("git failed: %s\n" % redact((exc.stderr or exc.stdout or "").strip()))
             return 2
@@ -3881,7 +4607,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             return 3
         if res.get("tail_mismatch"):
             return 4
-        return 0 if (res["pushed"] or args.no_push) else 1
+        # "unverified": the commit does not hold what is on disk (see _sync_drift); never a success, even with --no-push
+        return 0 if ((res["pushed"] or args.no_push) and not res.get("unverified")) else 1
 
     if args.cmd == "export":
         out_encoding = getattr(out, "encoding", None) or "utf-8"
@@ -3919,7 +4646,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         data = ledger.aliases()
         if args.what == "add":
             entry = ledger.add_alias(args.slug, args.display, args.alias, move=args.move)
-            out.write("%s: display=%s aliases=%s\n" % (safe_name(args.slug).lower(), entry["display"], ", ".join(entry["aliases"]) or "-"))
+            out.write("%s: display=%s aliases=%s\n" % (safe_name(args.slug).lower(), _term(entry["display"]), _term(", ".join(entry["aliases"]) or "-")))
             return 0
         if args.what == "list":
             if not data["bots"]:
@@ -3930,7 +4657,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             for slug, e in sorted(data["bots"].items()):
                 on_disk = [c for c in [slug] + e.get("aliases", []) if c in chains]
                 out.write("%-20s %-16s aliases: %s\n%-20s %-16s chains on disk: %s\n" % (
-                    slug, e.get("display", slug), ", ".join(e.get("aliases", [])) or "-", "", "", ", ".join(on_disk) or "-"))
+                    _term(slug), _term(e.get("display", slug)), _term(", ".join(e.get("aliases", [])) or "-"), "", "",
+                    _term(", ".join(on_disk) or "-")))
             unmapped = [c for c in chains if c not in data["bots"] and ledger.canonical(c) == c]
             if unmapped:
                 out.write("unregistered chains: %s\n" % ", ".join(unmapped))
@@ -3942,7 +4670,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             slug = safe_name(args.slug).lower()
             entry = ledger.remove_alias(slug)
             out.write("removed %s (display=%s); chains on disk untouched; '%s' now resolves to %s\n"
-                      % (slug, entry.get("display", slug), slug, ledger.canonical(slug)))
+                      % (slug, _term(entry.get("display", slug)), slug, ledger.canonical(slug)))
             return 0
         if args.what == "strict":
             data = ledger.set_alias_strict(args.mode == "on")  # read, modify and write under aliases.lock
@@ -3952,7 +4680,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             return 0
         if args.what == "resolve":
             slug, known = ledger.resolve(args.name)
-            out.write("%s%s\n" % (slug, "" if known else "  (unregistered)"))
+            out.write("%s%s\n" % (_term(slug), "" if known else "  (unregistered)"))
             return 0
 
     if args.cmd == "capture":
@@ -4042,8 +4770,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
                     payload = _read_json(path) or {}
                     rec = payload.get("record") if isinstance(payload.get("record"), dict) else {}
                     detail = " ".join(str(rec.get("detail") or rec.get("target") or "").split())[:60]
-                    out.write("%s  %-20s %-10s %s\n" % (payload.get("ts") or "?", chain,
-                                                        rec.get("type") or ("?" if payload else "corrupt"), detail))
+                    out.write("%s  %-20s %-10s %s\n" % (_term(payload.get("ts") or "?"), _term(chain),
+                                                        _term(rec.get("type") or ("?" if payload else "corrupt")), _term(detail)))
                     shown += 1
             if not shown:
                 sys.stderr.write("no spooled events\n")
@@ -4052,16 +4780,19 @@ def _main(argv: Optional[List[str]] = None) -> int:
             chain = ledger.chain_name(args.bot)
             res = ledger.spool_replay(chain)
             for rec in res["replayed"]:
-                out.write("%s #%d %s replayed from spool %s\n" % (rec["hash"][:12], rec["seq"], rec.get("type", ""), rec.get("spool_id")))
+                out.write(_term("%s #%d %s replayed from spool %s" % (rec["hash"][:12], rec["seq"], rec.get("type", ""), rec.get("spool_id"))) + "\n")
             for path in res["skipped"]:
                 sys.stderr.write("spool replay: %s is unreadable; left in place\n" % os.path.relpath(path, ledger.root))
+            for path in res.get("rejected") or []:
+                sys.stderr.write("spool replay: %s holds a break_ack, which only `gblog seal` may write; left in place\n"
+                                 % os.path.relpath(path, ledger.root))
             if res["refused"]:
                 sys.stderr.write("ALERT tail mismatch: %s still does not match state; %d spooled event(s) left in spool/%s\n"
                                  % (chain, res["remaining"], chain))
                 return 4
             out.write("replayed %d spooled event(s) for %s%s\n" % (
                 len(res["replayed"]), chain, "; alert resolved" if res["alert_resolved"] else ""))
-            return 2 if res["skipped"] else 0
+            return 2 if (res["skipped"] or res.get("rejected")) else 0
 
     return 1
 
