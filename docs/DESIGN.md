@@ -79,7 +79,7 @@ for `gblog sync` only, not for `git` used directly.
 | The tail truncated, the chain emptied, or the chain rewritten, **while a witness survives** | state head mismatch (checked even when the walk finds zero records); anchor containment, including the newest day rollup (section 8); `verify --contains` |
 | A whole chain deleted while `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, a day-rollup entry (`anchors/days/*.json`) or `state/<bot>.json` survives | missing-chain check in `verify --all`, and in `verify --bot <name>` for that exact name |
 | A `*.jsonl` entry under `logs/<bot>/` that is not a regular file (FIFO, directory, device) | regular-file check; the entry is never opened |
-| An anchor-history or archive file that is not a regular file (also behind a symlink) | regular-file check; the file is never opened. A non-regular `state/<bot>.json`, `anchors/<bot>.json`, alias registry, alert file or day rollup is never opened either and is treated as unreadable (for state and the anchor file: a warning, not a FAIL) |
+| An anchor-history file, `anchors/<bot>.json` or archive file that is not a regular file (also behind a symlink); a `state/<bot>.lock` that is a FIFO, directory or device; a directory at `state/<bot>.json` | regular-file check; the entry is never opened (section 7 has the table). A FIFO or device at `state/<bot>.json`, and a non-regular alias registry, alert file or day rollup, is never opened either and is treated as unreadable (for the state file: a warning, not a FAIL) |
 | A chain directory that cannot be listed | `logs/<bot>: cannot be listed (<class>)`; it is not taken for an empty chain |
 | A directory under `logs/` whose name is not a valid chain key (`logs/my bot`, `logs/ops.`, `logs/---`) | invalid-directory check in `verify --all`. Its records are not verified, and readers ignore the directory |
 
@@ -104,10 +104,12 @@ This is a warning, not a FAIL. The chain is intact, and refusing to append would
 **One chain cannot hide the others.** `verify --all` and `anchor` treat an unexpected error while
 one chain is checked as a FAIL of that chain and continue with the next one. A poisoned line, file
 or side file never turns into a whole-ledger skip. This covers `anchor`'s own pre-checks and
-writes: a failure there is the FAIL entry `anchor aborted: <class>` for that chain. Not covered
-yet: the witness scan that runs before the first chain (an `anchors/` or `anchors/days/` directory
-that cannot be listed), the write of the day rollup, and a lock file that is not a regular file
-(`SECURITY.md`, "Filesystem assumptions").
+writes: a failure there is the FAIL entry `anchor aborted: <class>` for that chain. The witness
+scan is covered as well: a `state/`, `anchors/` or `anchors/days/` directory that cannot be
+listed, and a day rollup that cannot be written, are FAIL entries of their own (`(witness files)`
+and `(day rollup)`, section 7), printed beside the chains. A lock file that is not a regular
+file is never opened: it is a problem of its chain, and the chain is read without the lock
+(section 5).
 
 **The "state missing" warning survives an append.** An append that adopts the log tail writes a
 fresh state file, which would end the warning above. The record that adopted the tail therefore
@@ -226,12 +228,17 @@ it is a UTF-8 JSON object whose `hash` equals the hash of its body.
 | present | present | anything else (state ahead, state far behind, tail corrupt) | **refuse** |
 
 "Unreadable" includes a state file that parses but is not a JSON object, an object whose `head` is
-not a string, and a path that is not a regular file. In the first column, "present" means the file
-exists and parses to an object with a string `head`.
+not a string, and a FIFO or device at the path (the adopting append replaces it with a regular
+file). In the first column, "present" means the file exists and parses to an object with a string
+`head`.
+
+A directory at `state/<bot>.json` is not "unreadable". It cannot be replaced, so the append is
+**refused** whatever the tail says (spooled, exit 4), before a line is written. `verify` reports
+the directory as a problem (section 7).
 
 A state file that names the right `head` with a wrong `seq` falls under "anything else": `append`
-refuses. `verify` warns `state/<bot>.json: seq <n> does not match the last record (seq <m>);
-appends are refused until gblog state rebuild`, and `state rebuild` repairs it.
+refuses. `verify` warns ``state/<bot>.json: seq <n> does not match the last record (seq <m>);
+appends are refused until `gblog state rebuild` is run``, and `state rebuild` repairs it.
 
 A state file that exists but cannot be read follows exactly the same rule as a missing one, in
 `append` and in `update_state`. When a tail is adopted this way, the command prints one of these
@@ -262,10 +269,18 @@ truncated outside the lock, and it is always refused.
 
 A refusal writes nothing under `logs/` and does not touch `state/<bot>.json`. It:
 
-1. writes the event (already redacted) to `spool/<bot>/<UTC stamp>-<8 hex>.json` with
-   `kind: "tail_mismatch"`, the expected seq and head, and the observed tail;
-2. replaces `state/<bot>.alert.json` with the same payload;
+1. replaces `state/<bot>.alert.json` with the event (already redacted), `kind: "tail_mismatch"`,
+   the expected seq and head, and the observed tail. The alert comes first because `status`
+   reads it;
+2. writes the same payload to `spool/<bot>/<UTC stamp>-<nnnn>-<8 hex>.json`. `<nnnn>` counts the
+   refusals of that second, so file names sort in refusal order (section 3);
 3. raises `TailMismatchError`. The CLI prints `ALERT tail mismatch: …` on stderr and exits 4.
+
+A failure to write either file does not change the outcome: the refusal is still exit 4, and the
+message says `alert not written (<class>)` or `spool not written (<class>)`. Besides a tail
+mismatch, two entries on disk are refused in the same way: a directory at `state/<bot>.json`
+(step 2), and a FIFO, directory or device at the name of the target day file. A symlink at the
+day file is an error (exit 2) and is not spooled.
 
 gblog sends no mail or chat. The exit code and the alert file are the page. `gblog status` repeats
 the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
@@ -445,6 +460,12 @@ Rules:
 5. **Readers other than `verify` do not lock.** `records()`, `report`, `status` and `tail` tolerate
    a half-written last line by treating it as corrupt and skipping it.
 6. Where `fcntl` is unavailable, gblog runs without locks. Concurrent writers are then unsupported.
+7. **Lock files are regular files.** They are opened with `O_NOFOLLOW` and without blocking. A
+   writer whose lock file is a FIFO, directory, device or symlink fails with exit 2. A reader
+   (`verify`, also inside `anchor`) goes on without the lock and reports a FIFO, directory or
+   device there as a problem of the chain (section 7). While `anchor` holds
+   `state/.anchors.lock`, a bot lock that is a hard link of that file is not requested: the
+   request would wait on the lock the process already holds.
 
 ## 6. Record field reference
 
@@ -608,11 +629,30 @@ a directory, a device) is a problem (`<path>: not a regular file`) and is never 
 hang neither `verify` nor an
 `append` that holds the lock.
 
-The side files are never opened either when they are not regular files (also behind a symlink).
-For `anchors/<bot>.history.jsonl` and an archived file that is a problem (`…: not a regular file`).
-For `state/<bot>.json` and `anchors/<bot>.json` it is the "unreadable" warning, and an alias
-registry, alert file or day rollup of that kind is treated as unreadable too. A chain directory
-that cannot be listed is the problem `logs/<bot>: cannot be listed (<class>)`, not an empty chain.
+The side files are never opened either when they are not regular files. What `verify` and `append`
+make of such an entry depends on the file:
+
+| Entry | `verify` | `append` |
+|---|---|---|
+| a FIFO or device at `state/<bot>.json` (also behind a symlink) | `!` warning: `state/<bot>.json missing or unreadable: …` | adopts a self-consistent tail and replaces the entry with a regular state file; the record carries `state_adopted: unreadable` |
+| a directory at `state/<bot>.json` | problem: `state/<bot>.json: not a regular file (a directory; appends are refused)`, beside the `missing or unreadable` warning | refused: spooled, exit 4 (section 4) |
+| an `anchors/<bot>.json` that exists and is not a regular file (FIFO, directory, device, dangling link; also behind a symlink) | problem: `anchors/<bot>.json: not a regular file` | not read |
+| a FIFO, directory or device at `state/<bot>.lock` | problem: `state/<bot>.lock: not a regular file (appends to this chain exit 2)`; the chain is read without the lock | exit 2 |
+| a non-regular `anchors/<bot>.history.jsonl` or archived file (also behind a symlink) | problem: `<path>: not a regular file` | not read (`anchor` reports `anchor aborted: <class>` for such a history file) |
+
+Notes on the table:
+
+- A missing `anchors/<bot>.json` is silent, and a regular one that does not parse is the warning
+  `anchors/<bot>.json is unreadable: …`. Only an entry that exists and is not a regular file is a
+  problem. Deleting the latest anchor is therefore quieter than replacing it with a FIFO; the
+  anchor history and the day rollups still hold its heads (section 8).
+- An alias registry, alert file or day rollup that is not a regular file is treated as
+  unreadable.
+- Tests pin these verdicts. The differences between the rows are known (round-4 audit, Z-10)
+  and are not changed without a maintainer decision.
+
+A chain directory that cannot be listed is the problem `logs/<bot>: cannot be listed (<class>)`,
+not an empty chain.
 
 Problem and warning lines can quote ledger content: a `bot` field, a file name, an anchor `ts`.
 Control characters in them are neutralised before printing, so a crafted value cannot erase or
@@ -636,7 +676,8 @@ Warnings:
 - an `archive` record that names neither a `path` nor a `sha256` (step 7);
 - `anchors/<bot>.json` exists but cannot be read, so its heads cannot be checked;
 - a symlink among the chain's files: `logs/<bot>` and every entry in it, `state/<bot>.json`,
-  `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, `archive/<bot>` and its day directories.
+  `state/<bot>.lock`, `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, `archive/<bot>` and its
+  day directories, and (unless `--skip-archives` is given) an archived file that a record names.
 
 The written form of `ts` is checked with `--strict` only (`ts is not in normalised form`), because
 records written with a free-form `--ts` before 0.6 are valid.
@@ -675,6 +716,7 @@ listed once even when several apply.
 | a day rollup `anchors/days/<date>.json` lists the chain with more than zero records, `logs/<bot>` is gone | `chain was anchored (day rollup <date>) but logs/<bot> is missing` |
 | `state/<bot>.json` holds a non-genesis head, `logs/<bot>` is gone | `state/<bot>.json records seq <n> head <12 hex> but logs/<bot> is missing` |
 | a directory under `logs/` whose name is not in sanitised form (section 10) | `logs/<dir>: directory name is not a valid chain key; its records are not verified` |
+| `state/`, `anchors/` or `anchors/days/` cannot be listed (the block is named `(witness files)`, not after a chain; see "Entries that are not chains") | `<dir> cannot be listed (<class>): deleted chains cannot be reported` |
 
 The state check skips gblog's own side files (`aliases`, `capture-files-*`, `*.alert`,
 `*.alert.resolved-*`). An invalid directory name is never passed to the chain walk.
@@ -687,13 +729,13 @@ a name that has no chain. Exit codes are the same as without `--json`.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `bot` | string | chain directory name. On a synthetic entry: the name that was asked for, or the name of the missing or invalid chain |
+| `bot` | string | chain directory name. On a synthetic entry: the name that was asked for, the name of the missing or invalid chain, or `(witness files)` (see "Entries that are not chains") |
 | `ok` | bool | `false` is FAIL. `true` covers `OK` and `PASS (N approved break(s))`; read `approved_breaks` to tell them apart |
 | `records` | int | records walked |
 | `head` | string or null | hash of the last record of the last segment; `genesis` for an empty chain; `null` on a synthetic entry |
 | `problems` | list of strings | the `-` lines. A `--contains` miss is added to the last chain's entry |
 | `warnings` | list of strings | the `!` lines |
-| `missing` | bool | present and `true` only on a synthetic entry (no chain on disk for the name, logs missing while a witness survives, invalid directory). Treat an absent key as `false` |
+| `missing` | bool | present and `true` only on a synthetic entry (no chain on disk for the name, logs missing while a witness survives, invalid directory, a witness directory that cannot be listed). Treat an absent key as `false` |
 | `archives` | int | number of `archive` records in the chain (0 when the walk already had a problem). A record that names no file is counted too, so the text suffix `(N archived file(s) intact)` can overstate (CHANGELOG, "Known open findings") |
 | `archives_checked` | bool | `false` when `--skip-archives` was given |
 | `approved_breaks` | int | 0 or 1 |
@@ -707,6 +749,23 @@ a name that has no chain. Exit codes are the same as without `--json`.
 
 A synthetic entry has exactly these keys: `bot`, `ok` (`false`), `records` (0), `head` (`null`),
 `problems`, `warnings` (empty) and `missing` (`true`).
+
+**Entries that are not chains.** Two names in parentheses can appear where a chain name is
+expected. A chain name cannot contain a parenthesis (section 10), so they cannot collide with one.
+
+- `(witness files)`: `state/`, `anchors/` or `anchors/days/` could not be listed, so deleted
+  chains cannot be reported. `verify --all` prints `FAIL  (witness files)  0 records` (in
+  `--json`: a synthetic entry with `missing: true`), and `anchor` prints an
+  `ANCHOR FAIL (witness files)` line. The problem line is
+  `<dir> cannot be listed (<class>): deleted chains cannot be reported`. A full `gblog anchor`
+  run also stores the entry in the day rollup under the key `missing`, beside the entries of
+  chains whose logs are gone.
+- `(day rollup)`: `anchor` could not write `anchors/days/<date>.json`. Only `anchor` prints it,
+  after the chain lines: `anchors/days/<date>.json: not written (<class>)`.
+
+Both make the command exit 1, and every chain is still reported. They have no head. A routine
+that builds its "Chain heads" block from `verify --json` or from `ANCHOR` lines must skip names
+in parentheses and report their problem lines instead.
 
 A chain whose verification stopped on an unexpected internal error also gets an entry, with
 `ok: false`, `aborted: true` and one problem that names the error (`verify aborted: <class>[: <text>]`). The other
@@ -911,6 +970,19 @@ Cases added by the deep reviews:
 - Exit 3: a GitHub URL with a bracketed or percent-encoded host or a `<transport>::` prefix, one
   that cannot be parsed, and the wiki of a public repository.
 
+Cases added by the specialist reviews:
+
+- Exit 1: `anchor --bot` for a Bot one of whose chains is gone while a witness survives; a
+  `(witness files)` or `(day rollup)` entry (section 7); in `verify`, a non-regular
+  `anchors/<bot>.json` or `state/<bot>.lock`, or a directory at `state/<bot>.json`; `sync` when a
+  day file, an anchor history or an archived file is a symbolic link (nothing is pushed).
+- Exit 2: a writer whose lock file is not a regular file; a symlink, hard link or FIFO planted at
+  a temporary file name (`<path>.<pid>.tmp`).
+- Exit 4: an append while a directory sits at `state/<bot>.json`, or a FIFO, directory or device
+  at the target day file; a refusal whose spool file could not be written.
+- Exit 0, with a new stderr line: a read command whose `--bot` selects no chain on disk; a
+  logging command whose task id names no open task (section 13 has the cost of that check).
+
 An unexpected internal error is printed as one line,
 `error: internal error (<class>[: <text>]); set GBLOG_DEBUG=1 for a traceback`, and exits 1. It
 shares that code with an integrity FAIL on purpose: for `verify` and `anchor`, exit 1 is the
@@ -969,7 +1041,7 @@ change can be checked against it. The figures follow from the code; they are not
 
 | Command | Reads | Cost |
 |---|---|---|
-| `append` (`task-start`, `log`, `note`, …) | one listing of `logs/<bot>/`; the last line of the newest day file, read backwards in 64 KiB blocks; `state/<bot>.json` | Does not grow with N. One directory listing of D entries per append; older day files are not opened. One fsync each for the day file, the state file and `state/`. `logs/<bot>/` is fsynced as well when the append creates the day file |
+| `append` (`task-start`, `log`, `note`, …) | one listing of `logs/<bot>/`; the last line of the newest day file, read backwards in 64 KiB blocks; `state/<bot>.json`; for a command that names a task id, day files of the Bot's chains | The append itself does not grow with N. One directory listing of D entries per append; older day files are not opened. One fsync each for the day file, the state file and `state/`. `logs/<bot>/` is fsynced as well when the append creates the day file. A logging command that names a task id (`log`, `approval`, `note`, `archive`, `task-end`, `task-start --task-id`) also reads day files of the Bot's chains for that id, newest first: today's file for a task opened today, every day file of the last 30 days for an unknown id. Records with `--source auto` and commands without a task id skip that scan |
 | `verify --bot B` | every line of every day file of the chain, once, under the shared lock; the state file and both anchor files; archived files after the lock is released | O(N) time and memory: each line is parsed and hashed once, and the parsed records and their hashes are kept until the result is returned. The raw text of the lines is kept only with `--strict`. Plus O(A) to decompress and re-hash the archives, unless `--skip-archives` is given. The `ledger` chain is searched for the witness note only when a pinned `break_ack` was honoured |
 | `verify --all`, `anchor` | the above for each chain, one chain at a time | The sum over all chains. `anchor` verifies before it writes; `anchor --skip-archives` saves the O(A) part |
 | `status` | one read of each chain's state file; the day files of the last 30 days; the alert file and the spool directory of each chain | O(records of the last 30 days). Does not grow with older history |
@@ -977,7 +1049,7 @@ change can be checked against it. The figures follow from the code; they are not
 | `report --since`, `export --since`, `coverage` | day files from the start date on | O(records since that date), held in memory and sorted. `coverage` compares an observed action only with the self-reports of the same Bot, action kind and normalised target |
 | `tail -n k` | per chain, day files newest first, until k readable records were found | O(records of the newest day file) per chain: each day file that is looked at is parsed whole. One day file per chain for a small k |
 | `tune --days W` | records from the start of the window or from 90 days ago, whichever is earlier; older day files as raw lines, of which only lines that contain `"tune"` are parsed | O(records in that range), held in memory. Older history costs a raw scan only |
-| `sync` | git's own work; one `stat` of every log, anchor-history and archive file; the bytes of the files that changed since the last run | git cost plus O(number of evidence files) plus O(bytes of the changed files). A file whose committed blob id, size, modification time, change time and inode equal the entry that the last run stored in `.git/gblog-sync-cache.json` is not hashed again. `git add -f` is used only for evidence files that an ignore rule hides |
+| `sync` | git's own work; every byte of every log, anchor-history and archive file | git cost plus O(bytes of all evidence files). Each file is hashed on every run and compared with the committed blob id; there is no cache of verified files. `git add -f` is used only for evidence files that an ignore rule hides |
 | `export` without `--since` | every record of the selected chains | O(N) memory: the records are loaded and sorted before they are printed |
 
 The daily routine (`docs/routine-daily-audit.md`) re-hashes archived files once per run: step 2
@@ -1003,7 +1075,7 @@ number of day rollups under `anchors/days/`.
 
 | Command | Complexity | N = 50 000 | N = 500 000 |
 |---|---|---|---|
-| `append` | O(D) directory entries; 3 fsync calls | 1–3 ms plus fsync | the same |
+| `append` | O(D) directory entries; 3 fsync calls. A command with a task id adds the scan described in the first table | 1–3 ms plus fsync, without the task-id scan | the same |
 | `verify --bot B` | O(N) time and O(N) memory; the shared lock is held for the read and the parse, and appends to the chain wait that long | about 0.5 s, 110 MB, lock held 0.25 s | about 5 s, 1.0–1.2 GB, lock held 2.5 s |
 | `verify --all`, `anchor` | sum over the chains, plus O(A), plus O(Y) rollups | sum of the row above | sum of the row above |
 | daily routine | three walks per chain and run (rollback check, `verify --all --record`, `anchor`) | about 1.5 s per chain | about 15 s per chain, three peaks of about 1 GB |
@@ -1013,7 +1085,7 @@ number of day rollups under `anchors/days/`.
 | `export` | O(N) per selected chain; all selected chains are loaded and sorted before the first line is printed | about 110 MB per chain | about 1.1 GB per chain |
 | `tail -n k` | the newest day file of each chain, parsed whole | small | small |
 | `tune` | additionally one pass over the Bot's loaded records per proposal and per applied change | seconds with the default 90-day load | minutes with `--days 36500` and about 200 proposals |
-| `sync` | git, one `stat` per evidence file, a hash of the changed files | not estimated | not estimated |
+| `sync` | git, plus a hash of every evidence file on every run | not estimated | not estimated |
 | `spool replay` | S × (lines since the refusal day), under the exclusive lock | S = 5 000 over 20 000 lines: about 40 s | S = 5 000 without a usable bound: about 15 minutes |
 | `archive` | the whole file in memory | peak about 4–5 times the file size | the same |
 
@@ -1028,8 +1100,7 @@ The figures are derived, not measured.
 
 | Input | Effect | Id |
 |---|---|---|
-| a last line of length L without a line break | the tail lookup of `append` copies and searches about L² / 64 KiB bytes while it holds the exclusive lock (tens of seconds for 64 MiB). The tail is then refused, so every later append pays again | K4-03 |
-| a log line or side file of any size | it is read whole into memory: no reader has a size bound | K4-03 |
+| a log line of any size | it is read whole into memory: no reader bounds a log line. The tail lookup of `append` is linear in the length of the last line, and a JSON side file above 16 MiB counts as unreadable | K4-03 |
 | text with a long run such as `token_token_…` without an assignment, or `eyJ…-` repeated | two redaction rules take quadratic time (seconds at about 12 KB of such text). `append` redacts while it holds the bot lock; `archive` redacts the content before it takes the lock | K4-04 |
 | an `archive` record without a usable `bytes` value | the file is decompressed to its end (memory stays bounded; time does not) | K4-05 |
 | a growing `archive/` | every `verify` without `--skip-archives` decompresses and hashes all of it | K4-05 |
@@ -1045,6 +1116,5 @@ Kept as they are for now:
 
 - The chain walk of `verify` is not streamed. The parsed records of one chain stay in memory until
   the result is returned. A streamed walk that gives the same result is future work (K4-02).
-- `sync` does not hash a file again when its cache says the file is unchanged. The cache is a
-  local file under `.git/`, which the adversary can write. Whether it stays is an open decision
-  (D3-05, K4-14).
+- `sync` hashes every evidence file on every run. A cache of verified files would have to be a
+  local file under `.git/`, which the adversary can write, so there is none (D3-05, K4-14).

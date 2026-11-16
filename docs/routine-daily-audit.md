@@ -32,6 +32,8 @@ Every day at 23:50 (my time zone), run the ledger audit. gblog days are UTC days
 3. Off-box anchor. After `gblog anchor`, post in this conversation a block titled "Chain heads <UTC date>" with one line per chain:
    the chain name, its status (OK, PASS or FAIL) and the full 64-hex head. Read the heads from `anchors/<chain>.json`
    (`head`; for a FAIL chain, every entry of `segment_heads`). Never shorten a head: tomorrow's rollback check uses these values.
+   A FAIL entry whose name is in parentheses (`(witness files)`, `(day rollup)`) is not a chain and has no head:
+   leave it out of the block and report its lines with the FAIL lines of step 2.
 4. Alerts. If `state/*.alert.json` exists, `gblog status` prints an `ALERT` line, or any command exited 4 with `ALERT tail mismatch`:
    run `gblog spool list` and include its output and the alert file names in the summary. The refused events are under `spool/`.
    Never run `gblog spool replay` or `gblog state rebuild` from this routine; they need the operator's explicit instruction.

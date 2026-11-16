@@ -28,8 +28,9 @@ tree (verify and anchors; append and recovery; sync and remotes; capture, covera
 CLI layer; archive, readers and aliases).
 
 Ids of the form `K1-…` to `K4-…` come from four specialist reviews of the same day (cross-command
-consistency; the filesystem adversary; compatibility and migration; cost on large ledgers). They
-changed documentation only; see "Specialist reviews" below.
+consistency; the filesystem adversary; compatibility and migration; cost on large ledgers). Most
+K1 and K2 findings are fixed in the code; see "Specialist reviews" below. Ids of the form `Z-…`
+come from the round-4 audit of the same day, which compared the documents with the code.
 
 ### Deep subsystem reviews (D1 … D6)
 
@@ -42,9 +43,10 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
 - **Side files that are not regular files are never opened (D1-01, D6-02).** A FIFO, a device or a
   directory (also behind a symlink) at `state/<bot>.json`, `state/aliases.json`, an anchor file, a
   day rollup or an archive address used to hang or exhaust `verify --all`, `anchor`, `status` and
-  `append`. An anchor-history or archive file of that kind is now a `verify` problem. A state file
-  or `anchors/<bot>.json` of that kind counts as unreadable (a `!` warning), like such a file
-  elsewhere. A lock file is not covered yet (K2-02).
+  `append`. An anchor-history file, `anchors/<bot>.json` or an archived file of that kind is now a
+  `verify` problem, and so are a non-regular `state/<bot>.lock` and a directory at
+  `state/<bot>.json` (K2-02, K2-08). A FIFO or device at `state/<bot>.json` counts as unreadable
+  (a `!` warning). `docs/DESIGN.md`, section 7, has the table (Z-10).
 - **A large `seq` gap is described by its size (D1-02).** A break of more than 10 000 records has an
   empty `missing_seqs` and the additive key `missing_count`. `verify` used to build the whole list.
 - **`anchor` isolates each chain completely (D1-03).** A failing pre-check or write for one chain is
@@ -55,8 +57,8 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
   `anchors/days/<date>.json` entry of a chain must still be in the chain, so a truncation is
   detected when only a rollup survives.
 - **A state file with a wrong `seq` or a non-text `head` can be repaired (D1-06).** `verify` warns
-  `state/<bot>.json: seq <n> does not match the last record (seq <m>); appends are refused until
-  gblog state rebuild`. `append` treats a `head` that is not a string like an unreadable state file
+  ``state/<bot>.json: seq <n> does not match the last record (seq <m>); appends are refused until
+  `gblog state rebuild` is run``. `append` treats a `head` that is not a string like an unreadable state file
   (it adopts the tail, with the `state_adopted` marker). `state rebuild` repairs both cases.
 - **Two failed state writes in a row no longer brick a chain (D2-01).** A roll-forward is written
   to state before the new line.
@@ -73,10 +75,10 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
 - **`sync` robustness (D3-04, D3-06, D3-07).** An ignore rule that names a whole ledger directory
   no longer aborts the run; undecodable bytes in git output no longer end in `internal error` after
   a successful push; commits and pushes are never signed.
-- **`sync` content check (D3-05, open).** The cache of already verified files
-  (`.git/gblog-sync-cache.json`) is still in the code: a file whose committed blob id, size, times
-  and inode are unchanged since the last run is not hashed again. Whether the cache is removed is
-  listed under "Known open findings".
+- **`sync` content check (D3-05).** `sync` keeps no cache of verified files. Every log,
+  anchor-history and archive file is hashed on every run and compared with the committed blob, so
+  the check costs the bytes of all evidence, not of the changed files. A cache would have to live
+  under `.git/`, where whoever the check is meant to catch could write it.
 - **A symlinked ledger directory is named, not blamed on git (D3-08).** git stores the link, not
   the files behind it. `sync` now says `<dir> is a symbolic link: …; not pushed` and exits 1. 0.6.0
   pushed such a ledger without the files behind the link. Use a mount instead.
@@ -106,8 +108,89 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
 
 Four reviews of 2026-11-16 read this tree by area: cross-command consistency (K1), the filesystem
 adversary (K2), compatibility and migration (K3) and cost on large ledgers (K4). None of them ran
-the code. This pass changed **documentation only**; every statement below was checked against
-`gblog.py`. What is still open is listed under "Known open findings".
+the code. Most K1 and K2 findings were then fixed in `gblog.py`; `tests/test_specialist.py` covers
+them. K3 and K4 changed documentation only. An earlier text of this section said that the whole
+pass changed documentation only; the round-4 audit (Z-01) corrected that. What is still open is
+listed under "Known open findings".
+
+Fixed in the code:
+
+- **Tasks that cross UTC midnight (K1-01).** `report --date D` asks the neighbouring day files
+  where a task of day D began (up to 30 days back) and where it ended. A task closed on a later
+  day is shown as `outcome **<outcome>** (closed <ts>, after this day)`, not as open, and a task
+  opened on an earlier day gets its start time and title. `status --json` rows list the open
+  tasks in `open_task_list`.
+- **A `--bot` that selects nothing (K1-03).** `report`, `status`, `tail`, `export`, `coverage` and
+  `tune` print ``warning: no chain on disk for '<name>'; nothing to show (see `gblog alias
+  list`)`` on stderr. The exit code is still 0.
+- **`anchor --bot` and deleted chains (K1-04).** `anchor --bot X` reports a chain of that Bot (the
+  name as given, the slug, each registered variant) whose `logs/` directory is gone while a
+  witness survives, and exits 1. The witness files are left as they are.
+- **Spool commands and variant chains (K1-05).** `spool list --bot` lists the pending events of
+  every chain of the Bot, as `status --bot` shows their alerts. `spool replay --bot` still works
+  on one chain; it prints `note: spooled event(s) are pending in chain(s) <chains>; …` when
+  another chain of the Bot has pending events.
+- **Task ids are checked by every logging command (K1-06).** `log`, `approval`, `note` and
+  `archive` warn when their task id has no `task-start` in the last 30 days or names a task that
+  is already closed. `task-start` warns about a `--task-id` that was used before and about a
+  missing `--task`. The record is always written. `task-end` keeps its own two warnings.
+- **Shell hook fallback (K1-07).** When gblog refuses the name in `GBLOG_BOT` (exit 2), the hook
+  logs the command under the Bot it was installed for, with the detail
+  `GBLOG_BOT=<name> was refused`. Under `alias strict on` such events used to be dropped.
+- **`tune --apply` and `--reject` follow the resolver (K1-08).** The `tune` record goes to the
+  chain that the proposal's Bot resolves to now, also when the name was registered as an alias
+  after `gblog tune` ran. `verify --record` is unchanged: it appends to each chain directory it
+  verifies.
+- **Letter case of chain directories (K1-09, K3-03).** On a file system that ignores letter case a
+  write uses the spelling the chain directory already has, so the `bot` field of new records
+  matches the directory. On a case-sensitive file system names that differ only by letter case
+  stay separate chains.
+- **Flag synonyms and smaller gaps (K1-11, K1-13).** `--decision` and `--action` accept synonyms
+  (see "Behaviour changes"). `report --since` and `export --since` accept `today` and
+  `yesterday`. `verify --all --bot X` prints `notice: --all given; --bot X is ignored`.
+  `archive --task` prints `warning: --task is not stored on archive records`. In a hand-edited
+  alias registry only `"strict": true` switches strict mode on.
+- **Witness directories and the day rollup (K2-01).** A `state/`, `anchors/` or `anchors/days/`
+  directory that cannot be listed is the FAIL entry `(witness files)` with the problem
+  `<dir> cannot be listed (<class>): deleted chains cannot be reported`. A day rollup that
+  cannot be written is the entry `(day rollup)` in the `anchor` output
+  (`anchors/days/<date>.json: not written (<class>)`). In both cases every chain is still
+  reported and the exit code is 1.
+- **Lock files (K2-02).** A lock file is opened without blocking and must be a regular file. A
+  FIFO, directory or device at `state/<bot>.lock` is the `verify` problem
+  `state/<bot>.lock: not a regular file (appends to this chain exit 2)`; `verify` and `anchor` read
+  the chain without that lock, and writers of the chain exit 2. While `anchor` holds
+  `state/.anchors.lock`, a bot lock that is a hard link of that file is not requested.
+- **Symlinked evidence files (K2-04).** `sync` treats a symlink in place of a day file, an anchor
+  history or an archived file as a difference between commit and disk:
+  `<file> is a symbolic link: git stores the link, not the file; not pushed`, exit 1. `verify`
+  prints the `symbolic link` warning for an archived file too (a problem with `--strict`).
+- **Hard links and FIFOs at written paths (K2-05).** Temporary files are created exclusively. A
+  symlink, hard link or FIFO planted at `<path>.<pid>.tmp` is removed and that one write fails
+  (exit 2); a regular leftover of a killed process is replaced. Reports and tuning files are
+  written to a temporary file and renamed, so a hard link or FIFO at their path is replaced by a
+  regular file. A symlink there is still exit 2.
+- **Readers (K2-06, K4-03).** The tail lookup of `append` is linear in the length of the last
+  line. Log files and JSON side files are tested for their type on the opened descriptor, so an
+  entry swapped for a FIFO after a check cannot block the reader. A JSON side file larger than
+  16 MiB counts as unreadable. Log lines are still unbounded (see "Known open findings").
+- **Git object permissions (K2-07).** gblog runs git with umask 077 and makes a `.git` directory
+  that it creates `0o700`. An existing `.git` directory keeps its mode.
+- **A directory at `state/<bot>.json` (K2-08).** The append is refused before a line is written
+  (spooled, exit 4), and `verify` reports
+  `state/<bot>.json: not a regular file (a directory; appends are refused)`.
+- **`tuning/proposals.json` (K2-09).** A FIFO or device at that path is never opened.
+  `tune --apply` reports the file as corrupt (exit 2); `tune` replaces it and prints
+  `notice: tuning/proposals.json was unreadable and has been replaced`. The missing lock is
+  still open.
+- **Refusals (K2-10).** A refusal is exit 4 also when its spool file or alert file cannot be
+  written; the alert is written first and the message names what failed. A FIFO, directory or
+  device at the name of the target day file is refused and spooled in the same way.
+- **Browser side files (K2-11).** `capture browser` copies a `-wal` or `-journal` file beside a
+  history database only when it is a regular file.
+- **Hook update (K2-12).** `capture shell-hook --install` replaces an older hook block by writing
+  a temporary file and renaming it over the rc file. A symlinked rc file stays a link and the
+  file keeps its mode.
 
 In the code already (the reviews reported these as missing; nothing had to change):
 
@@ -161,9 +244,10 @@ In the code, but listed under "Known open findings" until now:
 
 Documentation corrected, because the code does something else:
 
-- A state file or `anchors/<bot>.json` that is not a regular file is a warning, not a FAIL (D1-01).
+- Which non-regular side file is a FAIL and which is a warning: the table in `docs/DESIGN.md`,
+  section 7 (D1-01, K2-08, Z-10).
 - `capture browser --hours` is refused when it is negative, not when it is below 1.
-- `sync` still uses its cache of verified files (D3-05).
+- `sync` keeps no cache of verified files; every evidence file is hashed on every run (D3-05).
 - `docs/chain-repair-live-apply.md`: `seal` with a tail mismatch on `kim-biseo` exits 2.
 - `docs/DESIGN.md`: the known limits in sections 4 and 8 that the code has closed, and the cost of
   `tail -n k`.
@@ -182,17 +266,17 @@ New documentation:
 
 ### Known open findings
 
-**Not** in the code yet: the items the deep reviews rated below Medium, and the findings of the
-specialist reviews. 0.6.1 stays "Unreleased" until they are decided.
+**Not** in the code yet: the items the deep reviews rated below Medium, and the specialist-review
+findings that are not listed as fixed under "Specialist reviews" above. The round-4 audit checked
+each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
 
 - **verify / anchor.** After a pre-0.6 tail whose `ts` is not in the normalised form, `append` can
   write a record that fails `verify`, or file it in an earlier day file, after which every append
   to that chain exits 4 (D1-09, K3-01; README, "Upgrading from 0.5"). `(N archived file(s) intact)`
-  counts `archive` records that name no file (D1-13; `tests/PENDING.txt`). A state file or
-  `anchors/<bot>.json` that is not a regular file is a warning, not a FAIL (D1-01, K2-08).
-  `anchor --bot X` exits 0 where `verify --bot X` reports a deleted chain (K1-04). An `anchors/`
-  or `anchors/days/` directory that cannot be listed, or a day rollup that cannot be written, ends
-  `verify --all` or `anchor` with exit 2 (K2-01). `verify` keeps every parsed record in memory and
+  counts `archive` records that name no file (D1-13; `tests/PENDING.txt`). A FIFO or device at
+  `state/<bot>.json` is a `!` warning while a directory there, and any non-regular
+  `anchors/<bot>.json`, is FAIL; a deleted `anchors/<bot>.json` is silent (Z-10; `docs/DESIGN.md`,
+  section 7). `verify` keeps every parsed record in memory and
   parses under the shared lock (K4-02); `problems`, `breaks` and `segments` have no cap (K4-12).
   The `bytes` of an `archive` record is a hard read limit, and a `path` written with backslashes
   is opened as written (K3-06). A directory under `logs/` that is not a chain is FAIL even when it
@@ -201,42 +285,34 @@ specialist reviews. 0.6.1 stays "Unreleased" until they are decided.
 - **append / recovery.** Capture events refused during an alert are imported again after
   recovery (D2-07, D4-17). `verify` reports FAIL, without a hint, while state is one record behind
   (D2-10). Directory fsync (D2-11), `state rebuild` without its note (D2-12), a removed lock file
-  (D2-13). A lock file that is a FIFO hangs `verify` and `anchor`, and one hard-linked to
-  `state/.anchors.lock` makes `anchor` wait on itself (K2-02). In-place and temporary-file writes
-  follow a hard link and block on a FIFO (K2-05). The tail lookup is quadratic in the length of
-  the last line, and no reader bounds the size of a line or side file (K2-06, K4-03). A directory
-  at `state/<bot>.json` makes every append write its line and exit 2 (K2-08). A refusal that
-  cannot be spooled, or a non-regular entry at the target day file, exits 2 and loses the event
-  (K2-10). Two redaction rules are quadratic on crafted text, and `append` redacts under the bot
-  lock (K4-04). `spool replay` scans the chain once per event (K4-07). `spool list --bot` looks at
-  one chain where `status --bot` shows every chain of the Bot (K1-05).
-- **sync.** The cache of already verified files is still used (D3-05). `origin` can change before
-  its record is written (D3-10). Multi-URL origins and `pushurl` (D3-11). `NAME=value` redaction
-  stops at `&` or a quote (D3-14). An evidence file replaced by a symlink is committed as a link
-  and left out of the committed-content check (K2-04). git writes `.git/objects` with the process
-  umask (K2-07). `--remote` with another spelling of the current `origin` exits 2 (K3-04). `sync`
-  has no lock of its own.
+  (D2-13). No reader bounds the size of a log line or a day file (K2-06, K4-03), and some readers
+  still test the file type before they open the file, not on the opened descriptor (Z-14). A hard
+  link at a day file or an anchor history is appended through. When a refusal cannot write its
+  spool file, the event survives only in `state/<bot>.alert.json`, which the next refusal
+  replaces (K2-10). Two redaction rules are quadratic on crafted text, and `append` redacts under
+  the bot lock (K4-04). `spool replay` scans the chain once per event (K4-07).
+- **sync.** `origin` can change before its record is written (D3-10). Multi-URL origins and
+  `pushurl` (D3-11). `NAME=value` redaction stops at `&` or a quote (D3-14). `--remote` with
+  another spelling of the current `origin` exits 2 (K3-04). `sync` has no lock of its own. Every
+  run hashes every evidence file: that is the price of having no cache (D3-05).
 - **capture / tune / archive.** A symlinked `--path` (D4-15), ports dropped from browser targets
   (D4-19), `$?` after the hook and operator commands at a prompt (D4-14, D4-21), proposal caps,
-  decisions after `alias add` and changes older than 90 days (D4-13, D4-20, D4-22). Under
-  `alias strict on` the shell hook drops every event of an unregistered `GBLOG_BOT` (K1-07).
-  `tuning/proposals.json` is read without a type check and updated without a lock (K2-09); the
-  capture snapshot and markers are updated without a lock as well (K2-14). The hook update
-  rewrites the rc file in place (K2-12). The cleanup after a failed `archive` looks at the tail
+  decisions after `alias add` and changes older than 90 days (D4-13, D4-20, D4-22).
+  `tuning/proposals.json` is updated without a lock (K2-09); the capture snapshot and markers are
+  updated without a lock as well (K2-14). The cleanup after a failed `archive` looks at the tail
   record only (K2-13). `archive` holds the whole file in memory, and an archived file whose record
   has no usable `bytes` is read to its end (K4-05). `tune` uses two window starts in one run and
   recomputes each metric with a full pass (K1-10, K4-11).
 - **CLI and readers.** Raw control characters in `error:` usage lines and git error lines
   (D5-08). `archive` argument edges (D6-13). `report --date` with `--since` (D6-15).
-  `report --date` shows a task that crosses UTC midnight as open, and no command lists the ids of
-  open tasks (K1-01). A mistyped `--bot` is exit 0 with empty output on `report`, `status`,
-  `tail`, `export`, `coverage` and `tune` (K1-03). Only `task-end` diagnoses a stale or mistyped
-  task id (K1-06). `verify --record` and `tune --apply` write to a chain directory without the
-  name resolver (K1-08). On a file system that ignores letter case, `Ops` and `ops` share a
-  directory and `--contains` can miss (K1-09, K3-03). One invalid entry disables the whole alias
-  registry (K3-05). `--decision` and `--action` take no synonyms, and smaller format gaps between
-  commands (K1-11 … K1-13). `export`, `status`, `report` and `tail` keep or parse more than they
-  need (K4-08 … K4-10, K4-13).
+  A mistyped `--bot` on a read command is still exit 0; it now prints a warning (K1-03).
+  `verify --record` appends to every chain directory it verifies, variant chains included
+  (K1-08). On a file system that ignores letter case, records that an earlier build wrote under
+  another spelling of the chain directory keep their `bot field` warning, and `--contains` does
+  not count them (K1-09, K3-03). One invalid entry disables the whole alias registry (K3-05).
+  Alias-registry changes (`alias add`, also with `--move`, `alias remove`, `alias strict`) are
+  recorded in no chain (Z-16). Smaller format gaps between commands (K1-12). `export`, `status`,
+  `report` and `tail` keep or parse more than they need (K4-08 … K4-10, K4-13).
 - **Tests and routine.** No test uses a ledger shaped like the output of 0.2 to 0.5 (K3-08). The
   daily routine walks every chain three times, and `examples/routine-daily-audit.sh` re-hashes the
   archived files twice (K4-06).
@@ -246,13 +322,14 @@ Future work (design changes, not planned for 0.6.1):
 - `seal` rerun with the same approval id adds only a missing witness note. This changes the live
   procedure and needs the operator's sign-off.
 - Capture events raise the alert without being spooled.
-- `sync` with a lock of its own (`state/.sync.lock`), and a decision on its cache (D3-05).
+- `sync` with a lock of its own (`state/.sync.lock`).
 - A streamed `verify` with bounded memory that parses outside the shared lock (K4-02).
-- A size limit for log lines and side files. It needs a decision about ledgers that already hold
+- A size limit for log lines. It needs a decision about ledgers that already hold
   a longer line (K2-06, K4-03).
 - One walk per chain in the daily routine, and an opt-in rotation of the archive re-hash (K4-05,
   K4-06). The rotation trades detection latency for run time and needs the operator's sign-off.
-- A shell hook that falls back to the Bot it was installed for when `GBLOG_BOT` is refused (K1-07).
+- Ledger records for alias-registry changes. They change where records land and need the
+  operator's sign-off (Z-16).
 - `verify --record` that writes to the canonical chain only (K1-08). This changes where new
   records land and needs the operator's sign-off.
 
@@ -409,6 +486,46 @@ Read these before upgrading a routine or a script that branches on output or exi
   only reformatted is still silent without `--strict`.
 - An unexpected internal error is printed as one `error:` line with a non-zero exit code. Set
   `GBLOG_DEBUG=1` to see the traceback (A:M-3).
+- **Specialist-review fixes that a script or routine can notice (K1, K2).** The details are under
+  "Specialist reviews" above.
+  - A read command (`report`, `status`, `tail`, `export`, `coverage`, `tune`) whose `--bot`
+    selects no chain on disk prints `warning: no chain on disk for '<name>'; nothing to show …`
+    on stderr. Exit 0 and stdout are unchanged (K1-03).
+  - `log`, `approval`, `note` and `archive` print `warning: task '<id>' has no task-start in the
+    last 30 days of <bot>; recorded anyway (check --task-id / $GBLOG_TASK)` or `warning: task
+    '<id>' is already closed; recorded anyway (unset GBLOG_TASK or open a new task)`.
+    `task-start` warns about a reused `--task-id` and about a missing `--task`. The record is
+    written in every case; stdout and the exit code are unchanged. Records with `--source auto`
+    are not checked (K1-06).
+  - `anchor --bot X` exits 1 and prints an `ANCHOR FAIL` line for a chain of that Bot whose
+    `logs/` directory is gone while a witness survives, as `verify --bot X` does. It used to
+    exit 0 (K1-04).
+  - A directory at `state/<bot>.json` is a `verify` FAIL (`state/<bot>.json: not a regular file
+    (a directory; appends are refused)`), and an append to that chain is refused, spooled and
+    exits 4. The append used to write its line and exit 2 (K2-08).
+  - An `anchors/<bot>.json` that exists and is not a regular file is a `verify` FAIL
+    (`anchors/<bot>.json: not a regular file`). It used to be a `!` warning. A `state/<bot>.lock`
+    that is a FIFO, directory or device is a FAIL as well and is never opened (K2-02).
+  - `verify --all` and `anchor` can print a FAIL entry that is not a chain: `(witness files)`
+    when `state/`, `anchors/` or `anchors/days/` cannot be listed, and (`anchor` only)
+    `(day rollup)` when the rollup cannot be written. Both exit 1 after every chain was
+    reported; they used to end the run with exit 2. Skip names in parentheses when you collect
+    chain heads (K2-01; `docs/DESIGN.md`, section 7).
+  - A refused append exits 4 also when its spool file cannot be written, and when a FIFO,
+    directory or device sits at the target day file. Both used to exit 2 (K2-10).
+  - `sync` exits 1 with `<file> is a symbolic link: git stores the link, not the file; not
+    pushed` when a day file, an anchor history or an archived file is a symlink. It used to
+    commit the link and could print `pushed` (K2-04).
+  - `--decision` accepts `approved`, `approve`, `allow`, `granted`, `yes` (stored as `allowed`),
+    `rejected`, `declined`, `deny`, `refused`, `no` (`denied`), `timeout`, `timed-out`
+    (`expired`) and `automatic` (`auto`). `--action` ignores letter case and reads `-` as `_`
+    (`computer-use`) (K1-11).
+  - `status --json` rows gain `open_task_list`: one object per open task (`task_id`, `task`,
+    `started`, `chain`), oldest first. `open_tasks` is its length (K1-01).
+  - The shell hook logs a command under the Bot it was installed for when gblog refuses the
+    name in `GBLOG_BOT` (exit 2: unregistered under `alias strict on`, reserved). The record's
+    detail is `GBLOG_BOT=<name> was refused`. The hook text changed; the marker is still
+    `# gblog hook v2`. Run `gblog capture shell-hook --bot <slug> --install` again (K1-07).
 
 ### Security
 
@@ -472,6 +589,8 @@ Read these before upgrading a routine or a script that branches on output or exi
 - `sync --replace-remote` (B:H3).
 - `anchor --skip-archives` (W-12), `capture files --record-baseline` (W-07), and the key
   `orphan_alerts` in `status --json` (W-14).
+- `open_task_list` in `status --json` rows (K1-01); synonyms for `--decision` and `--action`
+  (K1-11); `today` and `yesterday` as values of `report --since` and `export --since` (K1-13).
 - Additive keys from the deep reviews: `missing_count` in break descriptors (D1-02), `elsewhere`
   in `coverage --json` (D4-09), and the record fields `observed` / `observed_from` on file-capture
   records (D4-01).
@@ -553,6 +672,12 @@ Read these before upgrading a routine or a script that branches on output or exi
   `SECURITY.md` "Filesystem assumptions", and the estimates in `docs/DESIGN.md` section 13, which
   is now titled "Cost on large ledgers". Corrected: the claims listed under "Specialist reviews"
   above, and the "Known open findings" list.
+- Round-4 documentation pass (Z-01, Z-02, Z-10, Z-11, Z-13, Z-16, Z-20, Z-21). The documents
+  described the tree before the specialist-review fixes. Corrected: the "Specialist reviews" and
+  "Known open findings" sections here; the "Known limits" table and the cache statements in
+  `SECURITY.md`; the side-file rules, the refusal steps, the entries that are not chains and the
+  `sync` cost in `docs/DESIGN.md`; flag synonyms, stderr lines and the spool file name in
+  `docs/agent-integration.md`; the capture commands of the `bot-tune` skill.
 
 ## [0.6.0] - 2026-11-16
 

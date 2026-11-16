@@ -26,8 +26,11 @@ When this runs as the weekly routine, open the run with
 `gblog task-start --bot <your slug> --source routine --task "Weekly tune"` and close it with
 `gblog task-end` (activity-log skill, step 1).
 
-1. **Refresh evidence**: `gblog verify --all` must exit 0. `FAIL` stops the tune. `PASS (N approved break(s))` is a sealed break to report, not a clean chain; do not seal it yourself. Run `gblog capture browser --bot <bot>`
-   and `gblog capture files --bot <bot>` for each Bot that has a computer session, then `gblog coverage`.
+1. **Refresh evidence**: `gblog verify --all` must exit 0. `FAIL` stops the tune. `PASS (N approved break(s))` is a sealed break to report, not a clean chain; do not seal it yourself. Run `gblog capture browser --bot <bot> --hours 168`
+   and `gblog capture files --bot <bot> --path /workspace --exclude transcripts` for each Bot that has a computer session, then `gblog coverage`.
+   These are the commands of the weekly routine (`docs/routine-weekly-tune.md`, step 2): `--hours 168` bounds the
+   first import of a history file to one week, and `--exclude transcripts` keeps the transcripts that the daily
+   routine exports out of the file evidence.
    This weekly run is the one place where browser and file capture run: the daily audit routine does not
    capture, and Bots do not run capture inside ordinary tasks.
    On a shared computer all Bots share one browser profile and one `/workspace`, so browser and file capture

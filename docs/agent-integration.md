@@ -82,7 +82,8 @@ Flag values:
 - `--detail` holds free text. `--summary` is the same flag under a second name, on every command
   that has `--detail`.
 - `--action` is one of `shell`, `browser`, `connector`, `file`, `message`, `computer_use`,
-  `delegation`, `memory`, `routine`, `other`. The default is `other`.
+  `delegation`, `memory`, `routine`, `other`. The default is `other`. Letter case is ignored and
+  `-` is read as `_`, so `computer-use` is stored as `computer_use`.
 - `--outcome` is one of `ok` (default), `fail`, `denied`, `pending`, `skipped`, `n/a`.
   Synonyms are stored canonically:
   - `success`, `succeeded`, `done`, `complete`, `completed`, `pass`, `passed` → `ok`;
@@ -94,11 +95,18 @@ Flag values:
 - `--decision` is one of `allowed`, `denied`, `pending`, `expired`, `auto`. gblog derives the
   record's `outcome` from it: `allowed` and `auto` → `ok`, `denied` → `denied`,
   `pending` → `pending`, `expired` → `skipped`.
+  Synonyms are stored canonically, like those of `--outcome`:
+  - `approved`, `approve`, `allow`, `granted`, `yes` → `allowed`;
+  - `rejected`, `declined`, `deny`, `refused`, `no` → `denied`;
+  - `timeout`, `timed-out` → `expired`;
+  - `automatic` → `auto`.
+
+  Any other value is exit 2.
 - `--source` is one of `self`, `auto`, `routine`. `self` is the default and is not stored.
   - Use `--source routine` on `task-start` in a routine run.
   - Leave `auto` to the capture commands and the shell hook.
   - `archive` accepts the flag but does not store it; it prints a warning. `--task` on `archive`
-    is not stored either, and prints no warning.
+    is not stored either, and prints `warning: --task is not stored on archive records`.
 - `--kind` (archive) is one of `transcript`, `message`, `artifact`, `other`. The default is `other`.
 - `--task-id` on `task-start` lets you choose the id. Without it gblog generates 10 lowercase hex
   characters.
@@ -181,11 +189,16 @@ unset GBLOG_TASK
 - `task-end` for an id that has no `task-start` in the last 30 days of that Bot is recorded with a
   warning. Check the id for a typo.
 - Unset `GBLOG_TASK` after closing. Otherwise later commands, and the shell hook, attach to the
-  closed task.
+  closed task. `log`, `approval`, `note` and `archive` then print
+  `warning: task '<id>' is already closed; recorded anyway (unset GBLOG_TASK or open a new task)`
+  on stderr. Hook records (`--source auto`) are not checked.
 - For the reply footer (`Ledger: N records, task TID, head HASH`):
   - the first field of the `task-end` output is the new head (12 hex);
   - `gblog status --json --bot "$BOT"` has `seq` (the record count over all chains of the Bot) and
     `head`. `head` is `-` when the slug has no chain of its own and only variant chains exist.
+  - The same row lists the tasks that are still open: `open_task_list` holds one object per task
+    opened in the last 30 days and not closed (`task_id`, `task`, `started`, `chain`), oldest
+    first. `open_tasks` is its length.
 
 ### 3.5 Tasks that span several turns or shells
 
@@ -224,6 +237,10 @@ Exit 1 covers these cases:
 
 - `verify` or `anchor` reported a FAIL chain;
 - `verify --bot` or `anchor --bot` named a Bot with no chain on disk;
+- `verify --bot` or `anchor --bot` named a Bot one of whose chains was deleted while a witness
+  survives;
+- `verify --all` or `anchor` printed a FAIL entry named `(witness files)` or `(day rollup)`
+  (section 9);
 - a `--contains` hash was not found;
 - a `verify --record` record was refused;
 - `sync` committed but did not push, or found that the committed content differs from disk;
@@ -260,6 +277,14 @@ Notes:
 | `warning: bot name '<name>' is not registered in state/aliases.json (logging under '<slug>'); …` | A registry exists and your name is not in it. The record was written under the sanitised name. | Use your registered slug, or ask the operator to register the name. |
 | `warning: task-end without --task-id and $GBLOG_TASK unset closes no task` | The record was written, but no task was closed. | Close the task again with the id. |
 | `warning: task-end for task '<id>' has no task-start in the last 30 days of <bot>; recorded anyway` | Probably a wrong id. | Check the id. |
+| `warning: task '<id>' has no task-start in the last 30 days of <bot>; recorded anyway (check --task-id / $GBLOG_TASK)` | `log`, `approval`, `note` or `archive` named a task id that no `task-start` of that Bot carries. The record was written. | Check the id for a typo or a stale `GBLOG_TASK`. |
+| `warning: task '<id>' is already closed; recorded anyway (unset GBLOG_TASK or open a new task)` | `log`, `approval`, `note` or `archive` named a task that a `task-end` already closed. The record was written. | `unset GBLOG_TASK`, or open a new task. |
+| `warning: task id '<id>' was already used by <bot> in the last 30 days; reports will merge both runs` | `task-start --task-id` reused an id. The record was written. | Let gblog generate the id, or choose a new one. |
+| `warning: task-start without --task: the task has no title` | The task was opened without a title. | Pass `--task "TITLE"` next time. |
+| `warning: --task is not stored on archive records` | `archive` was given `--task`. The archive record was written without it. | Attach the archive with `--task-id`. |
+| ``warning: no chain on disk for '<name>'; nothing to show (see `gblog alias list`)`` | A read command (`report`, `status`, `tail`, `export`, `coverage`, `tune`) got a `--bot` that selects no chain. Exit 0, empty output. | The name is wrong: check `gblog alias list`. Do not read the empty output as "no activity". |
+| `notice: --all given; --bot <name> is ignored` | `verify` was given both flags and checked every chain. | Drop one of the two flags. |
+| `note: spooled event(s) are pending in chain(s) <chains>; replay each with gblog spool replay --bot <chain>` | `spool replay` (operator command) finished one chain; other chains of the same Bot still have pending events. | Report it to the operator. |
 | `warning: last record of <bot> is dated <ts> (future); this record is stamped with it` | The chain's last record is dated in the future, so new records take that timestamp and land in that day file. | Report verbatim. |
 | `notice: recovered state/<bot>.json after an interrupted append` | An earlier append was interrupted; state was rolled forward. Your record was written. | Mention it and continue. This is not an alert. |
 | `notice: state/<bot>.json was missing; adopted the log tail (seq <n>)` (or `was unreadable`) | State was re-created from the log tail. Your record was written and carries `state_adopted`. | Report it: truncation before that record cannot be ruled out from state. |
@@ -289,7 +314,8 @@ One Bot has one canonical ASCII **slug**. The slug is the chain key: records go 
 - A name that matches none of these, but whose sanitised form is a registered slug
   (`OPS BOT` → `ops-bot`), resolves to that slug.
 - While the registry is empty, every name is its own chain, there is no warning, and letter case
-  matters (`Ops` and `ops` are two chains).
+  matters (`Ops` and `ops` are two chains). On a file system that ignores letter case the two
+  names are one directory, and gblog writes under the spelling the directory already has.
 - Once at least one Bot is registered, an unregistered name is logged under its sanitised form
   with a warning on stderr. After `gblog alias strict on` it is refused with exit 2 and nothing is
   written.
@@ -297,7 +323,9 @@ One Bot has one canonical ASCII **slug**. The slug is the chain key: records go 
   accept a slug, display name or alias and cover every chain of that Bot.
   `gblog verify --bot <name>` for a name with no chain on disk prints
   `FAIL … no chain on disk for '<name>'` and exits 1. That means the name is wrong, not that the
-  ledger is clean.
+  ledger is clean. `report`, `status`, `tail`, `export`, `coverage` and `tune` exit 0 for such a
+  name, with empty output and a `warning: no chain on disk for '<name>'; nothing to show` line on
+  stderr (section 6).
 - Reserved names cannot start a new chain (exit 2):
   - `aliases`;
   - anything starting with `capture-files-`;
@@ -320,8 +348,10 @@ Before each append, gblog compares the last line of the chain's newest day file 
 is refused:
 
 - nothing is written under `logs/`;
-- the event (already redacted) is saved as `spool/<bot>/<UTC stamp>-<8 hex>.json`;
-- `state/<bot>.alert.json` is replaced with the same payload;
+- `state/<bot>.alert.json` is replaced with the event (already redacted), the expected values
+  and the observed tail;
+- the same payload is saved as `spool/<bot>/<UTC stamp>-<nnnn>-<8 hex>.json`. `<nnnn>` counts the
+  refusals of one second, so the file names sort in the order of the refusals;
 - the command exits 4 and prints `ALERT tail mismatch: …`, `spool: <path>` and `alert: <path>` on
   stderr.
 
@@ -331,6 +361,8 @@ What an agent does:
 gblog spool list --bot "$BOT"    # read-only; one line per pending event: <ts>  <chain>  <type>  <detail>
 gblog status --bot "$BOT"        # prints "ALERT <chain>: tail mismatch since <ts> (<n> spooled)"
 ```
+
+`gblog spool list --bot` covers every chain of the Bot, as `gblog status --bot` does.
 
 Report both outputs and the three stderr lines, then stop writing to that chain. Every further
 append is refused and spooled as well, so nothing is lost, but the chain does not advance.
@@ -369,7 +401,7 @@ Common rules:
 | 0 | `test -d "$GBLOG_ROOT/logs"` | Run this before any gblog command. If it fails, report "ledger missing" and stop. |
 | 1 | `gblog verify --bot <chain> --skip-archives --contains <yesterday's 64-hex head>` | One call per chain posted on the previous run. `expected hash … not found in chain` or `no chain on disk` means a rollback. Archived files are re-hashed in step 2. |
 | 2 | `gblog verify --all --record`, then `gblog anchor --skip-archives` | Run `anchor` even if `verify` exited 1. `anchor` walks every chain again; archived files are re-hashed once, by `verify --all --record`. |
-| 3 | Post a "Chain heads" block | Take the full heads from `anchors/<chain>.json`: `head`, or every entry of `segment_heads` for a FAIL chain. |
+| 3 | Post a "Chain heads" block | Take the full heads from `anchors/<chain>.json`: `head`, or every entry of `segment_heads` for a FAIL chain. A FAIL entry whose name is in parentheses (`(witness files)`, `(day rollup)`) is not a chain and has no head: leave it out of the block and report its lines with the FAIL blocks. |
 | 4 | `gblog status`, `gblog spool list` | Include `ALERT` and `CLOCK` lines and the names of the alert files. |
 | 5 | `gblog archive --bot ledger --kind transcript --file <file> --detail "<slug> transcript"` | One call per exported transcript. |
 | 6 | `gblog report --date yesterday`, `gblog report`, `gblog status` | Both reports are needed because days are UTC days. |
@@ -402,7 +434,9 @@ Common rules:
   into a new name variant.
 - **Shell hook.** One rc file holds one hook, with the `--bot` given at install time as its
   default. The hook logs under `${GBLOG_BOT:-<that default>}`. On a shared computer each Bot runs
-  `export GBLOG_BOT="<its slug>"` in its own interactive shell.
+  `export GBLOG_BOT="<its slug>"` in its own interactive shell. When gblog refuses the name in
+  `GBLOG_BOT` (exit 2: unregistered under `alias strict on`, reserved), the hook logs the command
+  under the default Bot, with the detail `GBLOG_BOT=<name> was refused`.
 - **`GBLOG_TASK` and `GBLOG_BOT` are per shell.** Do not put either in a startup file that several
   Bots share.
 - **Delegation.** The delegating Bot logs `gblog log … --action delegation --target "<who>"`. The

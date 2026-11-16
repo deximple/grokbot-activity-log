@@ -34,6 +34,7 @@ finding. Typical problems:
 | `chain was anchored … but logs/<bot> is missing`, `state/<bot>.json records seq … but logs/<bot> is missing` | A whole chain was deleted while a witness survived. |
 | `logs/<dir>: directory name is not a valid chain key; its records are not verified` | A directory under `logs/` that gblog would never create. |
 | `<path>: not a regular file`, `logs/<bot>: cannot be listed (…)`, `anchor aborted: …` | A FIFO, device or directory where gblog expects a file (it is never opened), or a chain directory gblog cannot read. |
+| `<dir> cannot be listed (…): deleted chains cannot be reported`, under `FAIL  (witness files)` | `state/`, `anchors/` or `anchors/days/` could not be listed. `(witness files)` is not a chain and has no head. |
 
 Report the lines verbatim. Do not edit log files, and do not describe the ledger as verified.
 
@@ -60,8 +61,8 @@ Warnings. They do not change the exit code. Examples:
 - `<file>:<line>: appended while state/<bot>.json was missing; …`
 - `witness note missing on ledger chain`
 - `bot field '<x>' does not match chain '<y>'`
-- `state/<bot>.json: seq <n> does not match the last record (seq <m>); …` (appends are refused
-  until the operator runs `gblog state rebuild`)
+- ``state/<bot>.json: seq <n> does not match the last record (seq <m>); appends are refused until
+  `gblog state rebuild` is run`` (the operator runs that command, not the Bot)
 
 A warning usually means a witness was lost, so report it verbatim even when the chain says `OK`.
 
@@ -305,7 +306,9 @@ of a commit while git reports success. In that case `sync` pushes nothing and ex
 the git configuration of the ledger repository.
 
 A ledger directory that is a symbolic link gives a message of its own (`… is a symbolic link …;
-not pushed`): git stores the link, not the files behind it. Use a mount instead.
+not pushed`): git stores the link, not the files behind it. Use a mount instead. A symlink in
+place of a single day file, anchor history or archived file is reported in the same way
+(`<file> is a symbolic link: git stores the link, not the file; not pushed`).
 
 ### 26. `sync` says `(not pushed)` and exits 1. What are the usual causes?
 
@@ -324,7 +327,9 @@ A rejected non-fast-forward push can be a sign of a rollback. Never fix it by re
 `~/.bashrc`), once. Without `--install` it prints the hook. After each command typed at an
 interactive bash prompt, the hook runs
 `gblog log --action shell --target=<command> --outcome ok|fail --source auto`, with
-`$GBLOG_TASK` as the task id and `${GBLOG_BOT:-B}` as the Bot.
+`$GBLOG_TASK` as the task id and `${GBLOG_BOT:-B}` as the Bot. When gblog refuses the name in
+`GBLOG_BOT` (exit 2: unregistered under `alias strict on`, reserved), the hook logs the command
+under B, with the detail `GBLOG_BOT=<name> was refused`.
 
 Not captured:
 
@@ -434,14 +439,14 @@ Partly, and it is untested there: CI runs on Linux and macOS only.
 
 | Operation | Cost |
 |---|---|
-| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file and the state file, and the chain directory when it creates a day file. |
+| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file and the state file, and the chain directory when it creates a day file. A command that names a task id also reads day files of the Bot for that id, newest first: today's file for a task opened today, up to 30 days of files for an unknown id. |
 | `verify`, `anchor` | Linear in the chain. Every record is read into memory and re-hashed, and every archived file is decompressed and re-hashed. `--skip-archives` skips that last part. |
 | `report --date D` | Reads the day file for D. It also scans later day files for records whose real wall-clock day was D (`clock_regressed`). |
 | `status` | Reads the last 30 days of each chain. |
 | `tail` | Reads the newest day files of each chain until it has enough records. Use `--bot` to narrow it. |
 | `tune` | Reads from the start of the `--days` window or from 90 days ago, whichever is earlier, plus the `tune` records of any age. Use `--bot` to narrow it. |
 | `coverage`, `export` | Read from `--days` or `--since` onward. |
-| `sync` | git cost, plus a comparison of the log, anchor-history and archive files with the commit. A file that is unchanged since the last run is not hashed again. |
+| `sync` | git cost, plus a comparison of the log, anchor-history and archive files with the commit. Every such file is hashed on every run; there is no cache of verified files. |
 
 Logs are split into one file per UTC day, so there is nothing to rotate. Do not delete old day
 files: the chain walk starts at the first record, and a missing prefix is a FAIL.

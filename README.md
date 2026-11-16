@@ -54,9 +54,10 @@ Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integr
     reported by `gblog verify --all`, and so is a directory under `logs/` whose name is not a valid
     chain key. A day-rollup entry under `anchors/days/` counts as such a witness too, for a deleted
     chain and for a truncated or rewritten one. A `*.jsonl` entry that is not a regular file (a
-    FIFO, a directory) is FAIL and is never opened; the same holds for an anchor-history or
-    archive file, also behind a symlink. A state file or `anchors/<bot>.json` of that kind is
-    never opened either and counts as unreadable (a `!` warning). A chain directory that cannot
+    FIFO, a directory) is FAIL and is never opened; the same holds for an anchor-history file,
+    `anchors/<bot>.json` or an archive file, also behind a symlink, for a lock file, and for a
+    directory at `state/<bot>.json`. A FIFO or device at `state/<bot>.json` is never opened
+    either and counts as unreadable (a `!` warning). A chain directory that cannot
     be listed is FAIL. One damaged chain never stops `verify --all` or `anchor` from reporting
     the others (known exceptions: [`SECURITY.md`](SECURITY.md), "Filesystem assumptions").
   - **Warned (`!` lines, exit code unchanged):** `state/<bot>.json` is missing, unreadable or reset to
@@ -123,7 +124,7 @@ Writing an agent or a Bot prompt against `gblog`? Start with [`docs/agent-integr
   repository itself. `sync --remote` sets the first
   `origin`; changing an existing one needs `--replace-remote` and is recorded in the ledger. `sync` commits
   gblog's files even when a git ignore rule would hide them, runs no git hooks, and refuses to push when the
-  committed bytes differ from the files on disk, or when a ledger directory is a symbolic link (git would
+  committed bytes differ from the files on disk, or when a ledger directory or an evidence file is a symbolic link (git would
   store the link, not the files) (see [`SECURITY.md`](SECURITY.md)).
 - **Zero dependencies.** Grok Bot's docs warn that manually installed packages are replaceable;
   `gblog` is a single stdlib script and `install.sh` reinstalls it in seconds.
@@ -316,6 +317,12 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 - `approval`, `note`, `task-end`, `log` and `archive` use `$GBLOG_TASK` when `--task-id` is not given.
 - `--outcome` accepts synonyms: `success`/`done`/`completed`/`passed` → `ok`, `failed`/`error` → `fail`,
   `cancelled`/`skip` → `skipped`, `blocked` → `denied`.
+- `--decision` accepts synonyms too: `approved`/`granted`/`yes` → `allowed`, `rejected`/`declined`/`no` → `denied`,
+  `timeout` → `expired`, `automatic` → `auto`. `--action computer-use` is read as `computer_use`.
+- A read command (`report`, `status`, `tail`, `export`, `coverage`, `tune`) whose `--bot` selects no chain on disk
+  prints `warning: no chain on disk for '<name>'; nothing to show …` on stderr and still exits 0.
+- The logging commands warn on stderr when their task id has no `task-start` in the last 30 days or names a
+  task that is already closed. The record is written either way.
 - Routine runs pass `--source routine` to `task-start`, so they are not counted as manual repeats.
 - `report --date` accepts `today` and `yesterday`. Days are **UTC** days.
 - `--root` works before or after the subcommand. `status --bot NAME` filters.
@@ -339,7 +346,7 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 | 1 | Integrity FAIL (`verify`, `anchor`, unknown `--bot` on those, `--contains` miss, a `verify --record` record that was refused); `capture browser` found no readable history; `sync` committed but did not push (also: no `origin` in the ledger repository, a symlinked ledger directory), or found committed content that differs from the files on disk (nothing is pushed then); or an unexpected internal error (`error: internal error …`). |
 | 2 | Usage or environment error. A **usage error** wrote nothing: an argparse message, or `error: --…` and similar lines for a bad flag or value, an invalid `--ts` or date, an unregistered name in strict mode, a reserved name, a `seal` or `state rebuild` refusal. An **environment error** (`error: <system message>`, for example `error: No space left on device: <path>`, or `git failed: …` from `sync`) may already have written the record, so check `gblog tail --bot <bot> -n 1` before you retry. `spool replay` exits 2 when it had to skip an unreadable spool file; it lists the events it did replay. |
 | 3 | Policy refusal: `sync` will not push to a public or unconfirmed-visibility GitHub remote. |
-| 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. |
+| 4 | Tail mismatch: the append was refused and the event is in `spool/<bot>/`. Stop and report; see `gblog spool list`. Also returned when a directory sits at `state/<bot>.json`, or a FIFO, directory or device at the target day file: the append is refused in the same way. |
 
 Ctrl-C exits 130. A closed output pipe does not change the exit code of a command that had finished
 (a `verify` FAIL stays 1). Details and the append state machine are in [`docs/DESIGN.md`](docs/DESIGN.md).
@@ -442,6 +449,7 @@ expected for such records.
 | a head recorded by `gblog anchor` that is no longer in the chain | not checked | FAIL |
 | a directory under `logs/` whose name is not a chain key (`logs/my bot`, but also `lost+found` or `.stfolder`) | read by reports, not verified | FAIL in `verify --all`, even when it holds no log file; readers skip it with a warning. Move such a directory out of `logs/` |
 | a `*.jsonl` entry that is not a regular file (a FIFO, a directory) | could hang `verify` and `append` | FAIL, never opened |
+| an `anchors/<bot>.json` or `state/<bot>.lock` that is not a regular file, or a directory at `state/<bot>.json` | could hang or crash `verify`, or went unnoticed | FAIL, never opened. A FIFO or device at `state/<bot>.json` is a `!` warning: the next append replaces it with a regular file |
 | an `archive` record whose path is outside `archive/` or is not named `<sha256>.gz`, or that has only one of `path` and `sha256` | accepted | FAIL |
 | an archived file whose content is longer than the `bytes` of its record | `OK` when the hash matched | FAIL (`content hash mismatch`): `bytes` is now a read limit |
 
@@ -490,6 +498,14 @@ The abbreviated flags that became ambiguous (exit 2) are in item 1 below.
 - `verify --record` (the daily routine) appends its record to every chain directory it verifies,
   variant chains included. The logging commands never write to a variant chain.
 - The shell hook and the Auto-review rule need a manual step (item 6 below).
+- A read command (`report`, `status`, `tail`, `export`, `coverage`, `tune`) whose `--bot` selects
+  no chain on disk now says so on stderr. The exit code is still 0.
+- The logging commands warn on stderr when a task id has no `task-start` in the last 30 days or
+  names a closed task. The record is written either way.
+- `gblog anchor --bot X` exits 1 when one of X's chains was deleted while a witness remains, as
+  `gblog verify --bot X` does.
+- `gblog verify --all` and `gblog anchor` can print a FAIL entry named `(witness files)` or
+  `(day rollup)`. It is not a chain and has no head ([`docs/DESIGN.md`](docs/DESIGN.md), section 7).
 
 **Known limits of this upgrade.** These are open (CHANGELOG, "Known open findings"); fixes are
 future work.
@@ -504,10 +520,12 @@ future work.
   the UTC time has passed the time written in it (at most the UTC offset, 9 hours for `+09:00`).
   (D1-09, K3-01)
 - *File systems that ignore letter case (macOS and Windows defaults).* `alias add` lower-cases
-  the slug. If the chain directory on disk is `logs/Ops` and you register the slug `ops`, new
-  records carry `bot: "ops"` inside the directory `Ops`: `verify` warns for each of them, and
-  `verify --contains` reports their heads as missing. Do not register a slug that differs from an
-  existing chain directory only by letter case. (K1-09, K3-03)
+  the slug. If the chain directory on disk is `logs/Ops` and you register the slug `ops`, gblog
+  writes under the spelling the directory has: new records carry `bot: "Ops"` and verify without
+  a warning. What stays: records that an earlier 0.6 build already wrote there as `bot: "ops"`
+  keep their `bot field 'ops' does not match chain 'Ops'` warning, and `verify --contains` does
+  not count their hashes. On a case-sensitive file system `Ops` and `ops` remain two chains.
+  (K1-09, K3-03)
 - *Another spelling of the backup URL.* `sync --remote` compares the URL as text (item 5 below).
   (K3-04)
 - *A hand-edited alias registry.* One invalid entry (for example `"aliases": null`, or a slug key
@@ -612,7 +630,10 @@ with the allow-list in setup step 6. An upgrade does not update the shell hook i
 run `gblog capture shell-hook --bot <slug> --install` again; it replaces an older hook block (the
 lines between `# >>> gblog shell hook >>>` and `# <<< gblog shell hook <<<`) in place and prints
 `updated hook in <rc file>`. If the block still has no `# gblog hook v2` line afterwards, remove it
-by hand and run the command again.
+by hand and run the command again. Run the command also when the block already says
+`# gblog hook v2`: the hook text changed once more before the release (when gblog refuses the name
+in `GBLOG_BOT`, the hook logs the command under the Bot it was installed for), and the command
+replaces any block that differs from the current text.
 
 **7. Symlinked ledger directories.** If `logs/`, `archive/` or another ledger directory is a symbolic
 link (for example `archive/` on another disk), git stores the link, not the files behind it. 0.6.0
