@@ -16,10 +16,11 @@ $ gblog task-start --bot ops --task "Reconcile invoices"
 $ gblog log --bot ops --task-id 1a5248e239 --action browser --target https://mail.google.com/inbox --detail "opened inbox"
 3866d105a1d7 #2 action
 $ gblog approval --bot ops --task-id 1a5248e239 --target "send email to vendor" --decision denied
-7853cc548280 #4 approval denied
+7853cc548280 #3 approval denied
 $ gblog task-end --bot ops --task-id 1a5248e239 --outcome ok
+3c4241c25eb5 #4 task_end ok
 $ gblog verify --all
-OK    ops                       5 records  head 3c4241c25eb5
+OK    ops                       4 records  head 3c4241c25eb5
 ```
 
 ## What you get
@@ -156,7 +157,7 @@ What capture does **not** see:
   nothing: what history shows then was typed in an earlier session.
 - Browser capture stores **scheme://host/path and the page title** (first 120 characters, in `detail`).
   It stores no query string or fragment. After a missed run it resumes from its per-history marker.
-  The first import of a history file is bounded by `--hours` (default 24; a negative value exits 2). A marker
+  The first import of a history file is bounded by `--hours` (default 24; a value below 1 exits 2). A marker
   dated in the future is ignored with a notice.
   History files it could not read are reported as `, N unreadable`.
 - File capture compares size and modification time against a snapshot in `state/capture-files-<bot>.json`.
@@ -212,7 +213,8 @@ to store verbatim; the record then carries `scanned: false`). Text with stray in
 warning on stderr), so do not archive binaries or UTF-16 exports that may hold credentials. Identical content
 is stored once per Bot and day. `gblog verify` re-hashes every archived file: a modified or missing archive
 fails verification exactly like an edited log line. Use `gblog verify --skip-archives` for a quick chain-only
-check; it prints `(archives not checked)`.
+check; a chain that has archive records then prints `(archives not checked)` in place of
+`(N archived file(s) intact)`.
 Grok Bot on an individual plan can read the other Bots' conversations on the same account, so the daily
 routine can archive each Bot's transcript and make the ledger a real record, not a diary.
 
@@ -305,7 +307,7 @@ not run `state rebuild` or `spool replay` on its own; the operator decides.
 |---|---|
 | `--contains HASH` | Repeatable, needs `--bot`, full 64-hex. Exit 1 with `expected hash … not found in chain`. Pass yesterday's head to detect a rollback. Chain-exact: only a record stored in the named chain and carrying its name counts, so a copy of the chain under another name does not satisfy the check. |
 | `--strict` | Also FAIL on a record whose `bot` differs from its chain, on a stray `*.jsonl` file name, on a record stored in a day file of another date, on a symlink among the chain's files, on a non-string text field, on a `ts` that is not in the normalised form, and on any line that is not the canonical serialisation (duplicate keys, reformatted; surrounding white space is ignored). |
-| `--skip-archives` | Do not re-hash archived files; prints `(archives not checked)`. |
+| `--skip-archives` | Do not re-hash archived files; a chain that has archive records prints `(archives not checked)`. |
 | `--json` | Print the result objects (with `warnings`) as a JSON list. Exit codes are unchanged. |
 
 `verify --bot` accepts a slug, display name or alias and checks every chain of that Bot. A name with
@@ -361,7 +363,7 @@ Full field reference per record type: [`docs/DESIGN.md`](docs/DESIGN.md).
  "prev":"851cc7d8…","hash":"3866d105…"}
 ```
 
-`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune | archive` (`break_ack` is written only by `seal`) · optional `source` ∈ `self | auto | routine` ·
+`type` ∈ `task_start | action | approval | task_end | note | sync | verify | tune | archive` (`break_ack` is written only by `seal`) · optional `source` ∈ `auto | routine` (absent means self-reported; `--source self` stores nothing) ·
 `action` ∈ `shell | browser | connector | file | message | computer_use | delegation | memory | routine | other` ·
 `outcome` ∈ `ok | fail | denied | pending | skipped | n/a`. Timestamps are UTC.
 
@@ -466,7 +468,7 @@ verbatim. On a ledger from 0.5 expect these, where they apply:
 7. `anchors/<bot>.json is unreadable …`.
 
 `--strict` turns the lines of items 3 to 6 into problems. The full list is in
-[`docs/DESIGN.md`](docs/DESIGN.md), section 7. The new `notice:` and `warning:` lines on stderr are
+[`docs/DESIGN.md`](docs/DESIGN.md), section 7. The stderr lines an agent must act on are
 listed in [`docs/agent-integration.md`](docs/agent-integration.md), section 6.
 
 **Exit codes.** Scripts and routines that branch on exit codes need these changes:
@@ -507,27 +509,25 @@ The abbreviated flags that became ambiguous (exit 2) are in item 1 below.
 - `gblog verify --all` and `gblog anchor` can print a FAIL entry named `(witness files)` or
   `(day rollup)`. It is not a chain and has no head ([`docs/DESIGN.md`](docs/DESIGN.md), section 7).
 
-**Known limits of this upgrade.** These are open (CHANGELOG, "Known open findings"); fixes are
-future work.
+**Known limits of this upgrade.** The first two items were limits of earlier 0.6 builds and are
+handled by the code now. The last two still apply (the alias-registry item is in the CHANGELOG
+under "Known open findings").
 
-- *A last record with a local-time `--ts`.* Before 0.6 `--ts` was stored as written. If the last
-  record of a chain carries a `ts` that is not of the form `YYYY-MM-DDTHH:MM:SSZ` (for example
-  `2026-11-17T08:00:00+09:00`), the first append after the upgrade is not checked against it.
-  While the UTC clock still reads earlier than the time written there, the new record can fail
-  `verify` for good (`timestamp goes backwards`), or land in an earlier day file, after which
-  every append to that chain exits 4. Check each chain with `gblog tail --bot <chain> -n 1` right
-  after installing. If the timestamp shown is not in that form, do not write to the chain until
-  the UTC time has passed the time written in it (at most the UTC offset, 9 hours for `+09:00`).
-  (D1-09, K3-01)
+- *A last record with a local-time `--ts`.* Before 0.6 `--ts` was stored as written (for example
+  `2026-11-17T08:00:00+09:00`). The first append after the upgrade is bound by that text and by
+  the day file it is stored in: a new record never sorts below the tail's `ts` as written and is
+  never filed in an earlier day file. While the UTC clock still reads earlier, the new record is
+  stamped with the smallest timestamp that satisfies both and carries the real time in
+  `clock_regressed`; an explicit earlier `--ts` exits 2. The chain keeps verifying, and there is
+  nothing to wait for. `verify --strict` still reports the old record
+  (`ts is not in normalised form`). (D1-09, K3-01)
 - *File systems that ignore letter case (macOS and Windows defaults).* `alias add` lower-cases
   the slug. If the chain directory on disk is `logs/Ops` and you register the slug `ops`, gblog
   writes under the spelling the directory has: new records carry `bot: "Ops"` and verify without
-  a warning. What stays: records that an earlier 0.6 build already wrote there as `bot: "ops"`
-  keep their `bot field 'ops' does not match chain 'Ops'` warning, and `verify --contains` does
-  not count their hashes. On a case-sensitive file system `Ops` and `ops` remain two chains.
+  a warning. Records that an earlier 0.6 build already wrote there as `bot: "ops"` count as the
+  chain's own too: no `bot field` warning, and `verify --contains` counts their hashes. On a
+  case-sensitive file system `Ops` and `ops` remain two chains.
   (K1-09, K3-03)
-- *Another spelling of the backup URL.* `sync --remote` compares the URL as text (item 5 below).
-  (K3-04)
 - *A hand-edited alias registry.* One invalid entry (for example `"aliases": null`, or a slug key
   with a space) makes the whole registry count as unreadable: gblog warns on stderr, resolves no
   names, and strict mode is off, so a display name starts a new chain. Fix the entry. (K3-05)
@@ -542,7 +542,7 @@ Check these things once. The operator does items 3 to 6; a Bot must not.
 **1. Abbreviated flags.** New flags made some prefix abbreviations ambiguous, and argparse then exits 2.
 Spell the flag out in routines and scripts.
 
-| Command | No longer accepted | Now ambiguous between | Shortest form that still works |
+| Command | No longer accepted | Now ambiguous between | A form that still works (spell the flag out in scripts) |
 |---|---|---|---|
 | `verify` | `--r` | `--record`, `--root` | `--rec` |
 | `sync` | `--r` | `--remote`, `--replace-remote`, `--root` | `--rem` |
@@ -616,10 +616,12 @@ Removing witnesses is also exactly what someone hiding a deletion would do; the 
 daily routine and the git history of the backup remote are what let you tell the two apart.
 
 **5. Backup remote.** `gblog sync --remote <url>` no longer replaces an existing `origin`. A routine
-that passes the same `--remote` on every run keeps working, as long as the URL is written exactly
-as `origin` has it. Another spelling of the same repository (`…/r` for `…/r.git`, https for ssh)
-also exits 2, before the local commit: use the stored spelling
-(`git -C <root> remote get-url origin`). To move the backup, the operator runs
+that passes the same repository on every run keeps working. The URL may be spelled differently
+from the stored one when it names the same repository: for GitHub, the same owner and repository
+over https or ssh, with or without `.git`; for another host, the same text apart from a trailing
+`/` or `.git`; for a local path, the same directory. `origin` keeps the spelling it has, and
+nothing is recorded. With `--replace-remote` the new spelling is stored and recorded as a change.
+Any other URL exits 2, before the local commit. To move the backup, the operator runs
 `gblog sync --remote <new url> --replace-remote` once; the change is recorded in the ledger. If the
 remote is a GitHub repository written with a port, as `ssh.github.com` or through an ssh host alias,
 0.6.1 checks its visibility: a public or unconfirmed repository that 0.6.0 pushed to with a warning
@@ -644,7 +646,7 @@ and exits 1. Use a mount instead of a link.
 
 ```bash
 python -m unittest discover -s tests -v
-GBLOG_ROOT=/tmp/x ./bin/gblog init && ./bin/gblog status
+export GBLOG_ROOT="$(mktemp -d)"; ./bin/gblog init && ./bin/gblog status
 ```
 
 ## License

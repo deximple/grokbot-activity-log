@@ -32,8 +32,11 @@ Steps, in order:
    before running any `gblog` command. `gblog` would otherwise create an empty ledger.
 2. **`gblog verify --all --record`.** A FAIL does not stop the run, because anchors, spool and alert
    files still need a backup.
-3. **`gblog anchor`**, then a `Chain heads <UTC date>` block with one line per chain:
+3. **`gblog anchor --skip-archives`** (step 2 has just re-hashed every archived file), then a
+   `Chain heads <UTC date>` block with one line per chain:
    `<chain> <OK|PASS|FAIL> <full 64-hex head>`. A FAIL chain gets one line per segment head.
+   The status in that block is the anchor's: a chain whose only problem is a damaged archived
+   file is `FAIL` in step 2 and `OK` here. The script's exit status follows step 2.
 4. **`gblog report --date yesterday`.** Days are UTC days. The Markdown is written to
    `reports/<date>.md`; it is not printed.
 5. **`gblog sync --remote=<url> -m "daily ledger sync"`**, only when `GBLOG_AUDIT_REMOTE` is set.
@@ -70,8 +73,8 @@ The summary lists each step's own exit code, so the two meanings of 1 can be tol
 ### What it deliberately does not do
 
 - It never passes `--allow-public`, `--allow-unknown-visibility` or `--replace-remote`. If `origin`
-  already points somewhere other than `GBLOG_AUDIT_REMOTE`, `sync` exits 2 and `origin` stays as it
-  is. Moving the backup is a manual, one-time `gblog sync --remote <url> --replace-remote`.
+  already points somewhere other than `GBLOG_AUDIT_REMOTE` (another spelling of the same
+  repository is accepted), `sync` exits 2 and `origin` stays as it is. Moving the backup is a manual, one-time `gblog sync --remote <url> --replace-remote`.
 - It never runs `gblog seal`, `gblog spool replay` or `gblog state rebuild`, and it never edits a
   file under the ledger.
 - It does not export or archive Bot transcripts. Only a Bot can do that; see

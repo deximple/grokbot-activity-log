@@ -182,6 +182,7 @@ earlier bytes.
 ```
            +--------------------------------------------------------------+
            | 0. name check (safe_name, reserved names), ensure() the tree |
+           | 0b. redact the string fields, before the lock is taken       |
            +--------------------------------------------------------------+
                                        |
                          1. LOCK_EX on state/<bot>.lock
@@ -201,7 +202,7 @@ earlier bytes.
                                                |
                          4. timestamp rule (normalise, monotonic)
                                                |
-                         5. build record: seq+1, prev=head, redact, hash
+                         5. build record: seq+1, prev=head, hash
                                                |
                          6. LINE: O_APPEND write, fsync file, fsync directory
                                                |
@@ -300,11 +301,14 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
   stderr. The clamp and the exit code are the same in both cases.
 - `archive` checks an explicit `ts` against the tail before it stores the file, so a refused
   timestamp leaves no `.gz` behind.
-- Known limit (D1-09, K3-01): the tail is used as a bound only when its `ts` is in the normalised
-  form. After a record written with a free-form `--ts` before 0.6 (`…+09:00`, a space in place of
-  `T`), neither the refusal nor the clamp applies, and the day file is chosen from the new `ts`
-  alone. `verify` compares `ts` as text and walks day files in name order, so such an append can
-  fail `verify` for good or land in an earlier day file (README, "Upgrading from 0.5").
+- The bound is what `verify` will read (D1-09, K3-01): the tail's `ts` as text, and the tail's day
+  file. When the tail's `ts` is not in the normalised form (a free-form `--ts` written before
+  0.6: `…+09:00`, a space in place of `T`), the bound is the smallest normalised timestamp of
+  that date that does not sort below it (or the next midnight). A record is also never stamped
+  earlier than `00:00:00Z` of the day file that holds the tail, so it cannot land in an earlier
+  day file. The refusal and the clamp both use this bound. Only a tail whose `ts` names no date,
+  in a file that is not a day file, gives no bound; `append` then warns on stderr that the record
+  may not verify.
 - The CLI additionally rejects a `--ts` more than 300 s in the future. The library does not, because
   tests use fixed dates.
 
@@ -312,7 +316,8 @@ the alert as `ALERT <bot>: tail mismatch since <ts> (<n> spooled)`.
 
 - Reserved keys (`v`, `seq`, `bot`, `prev`, `hash`) supplied by the caller are ignored. `None` and
   `""` values are dropped.
-- Top-level string values pass through `redact()`. Text that cannot be encoded as UTF-8 is replaced
+- Top-level string values pass through `redact()`. This happens before the bot lock is taken
+  (step 0b), so a slow value does not stall the chain's writers. Text that cannot be encoded as UTF-8 is replaced
   with backslash escapes instead of failing the append. The generated `path` and `sha256` of an
   `archive` record are stored as written: a Bot name shaped like a key prefix (`xai-…`, `sk-…`)
   used to turn the path into `archive/[REDACTED]/…`, a permanent FAIL. `verify` resolves such an
@@ -424,7 +429,7 @@ whether the tail was cut just before. What to do with one:
 | Lock file | Mode | Held by |
 |---|---|---|
 | `state/<bot>.lock` | exclusive (`LOCK_EX`) | `append`, `update_state`, `state rebuild` |
-| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it snapshots the log lines (parsed record and raw text), `state/<bot>.json`, `anchors/<bot>.json`, the lines of `anchors/<bot>.history.jsonl` and the newest day-rollup entry that names the chain |
+| `state/<bot>.lock` | shared (`LOCK_SH`) | `verify`, while it lists the chain's files and records the size of every log file, and reads `state/<bot>.json`, `anchors/<bot>.json`, the lines of `anchors/<bot>.history.jsonl` and the newest day-rollup entry that names the chain |
 | `state/aliases.lock` | exclusive | `alias add`, `alias remove`, `alias strict`: the read, the change and the write of `state/aliases.json` happen in one hold |
 | `state/.anchors.lock` | exclusive | `anchor`, for its whole run: the verify of every chain, the anchor files and the read-merge-write of `anchors/days/<date>.json` |
 
@@ -435,13 +440,17 @@ Rules:
    `seal` verifies `kim-biseo`, preflights the `ledger` tail, appends the ack to `kim-biseo`, then
    appends the witness to `ledger`. `sync` stamps `last_sync` on every chain the same way.
 2. **Readers release before slow work and before returning.** `verify` drops its shared lock before
-   it re-hashes archives and before it returns. Callers such as `seal_break` and
+   it parses, before it re-hashes archives and before it returns. Callers such as `seal_break` and
    `verify --record` call `append` right after `verify`, so `verify` must never return holding the
-   lock. Everything `verify` judges is computed from the one snapshot taken under the lock: the
-   chain walk, the state check, anchor containment, the layout findings (`bot` field, file names,
-   non-canonical lines) and `--contains`. No file of the chain is read again after the lock is
-   released; only archived files are. A concurrent `append` followed by `anchor` therefore cannot
-   make a running `verify` report a head that is "no longer in the chain".
+   lock. The snapshot taken under the lock is: the list of regular log files with the size each
+   had, the state file and the anchor files. Log files are append-only and writers hold the
+   exclusive lock, so the first *size* bytes of each file are that snapshot. They are read line by
+   line after the lock is released; bytes appended later are not read. A file that was replaced
+   or shortened in between (gblog never does that) is the problem
+   `<file>: log file was replaced or shortened while it was being verified`. The chain walk, the
+   state check, anchor containment, the layout findings (`bot` field, file names, non-canonical
+   lines) and `--contains` all use this one snapshot. A concurrent `append` followed by `anchor`
+   therefore still cannot make a running `verify` report a head that is "no longer in the chain".
 3. **No re-entry.** `flock` is per open file description. Code that already holds a bot lock must
    not call the public `append` for the same bot, because the second acquisition would deadlock.
    `_Lock` keeps no re-entrancy state (the 0.6.0 table `_held` is gone). No code path nests a lock
@@ -499,7 +508,7 @@ Rules:
 |---|---|
 | `clock_regressed` | the wall clock was earlier than the tail and `ts` was clamped; holds the actual wall-clock time |
 | `spooled_at` | the record was replayed from the spool; time of the original refusal |
-| `spool_id` | name of the spool file it was replayed from |
+| `spool_id` | name of the spool file it was replayed from, without `.json` |
 | `original_ts` | the `ts` the refused record carried, if any |
 | `state_adopted` | `missing` or `unreadable` (`unknown` when a marker moved from the state file had no usable `how`): this append adopted the log tail because `state/<bot>.json` was absent or could not be read, or `update_state` had done so before it and left the marker in the state file (section 4). Written since 0.6.1. `verify` warns about such records: the first few one by one, then a count |
 
@@ -596,9 +605,11 @@ The state file is not a record, but `append`, `verify` and `status` read it.
 
 ## 7. Verification
 
-`verify` takes one snapshot under the shared bot lock (section 5): every log line with its raw
-text, the state file, `anchors/<bot>.json` and the lines of `anchors/<bot>.history.jsonl`. All
-checks below, including the layout findings and `--contains`, use that snapshot and one parser.
+`verify` takes one snapshot under the shared bot lock (section 5): the list of the chain's regular
+log files with the size each has, the state file, `anchors/<bot>.json`, the lines of
+`anchors/<bot>.history.jsonl` and the newest day-rollup entry that names the chain. The log lines
+are read after the lock is released, up to those sizes, one line at a time. All checks below,
+including the layout findings and `--contains`, use that snapshot and one parser.
 
 `verify` walks one chain in file-name order:
 
@@ -654,6 +665,19 @@ Notes on the table:
 A chain directory that cannot be listed is the problem `logs/<bot>: cannot be listed (<class>)`,
 not an empty chain.
 
+Other problem lines:
+
+- `<file>: log file was replaced or shortened while it was being verified`: a log file changed
+  after the snapshot was taken (section 5). gblog never does that.
+- `logs/<bot>: listing stopped early (<class>)`: the listing of the chain directory failed
+  part-way.
+- `anchors/<bot>.history.jsonl: unreadable (<class>)`, and
+  `anchors/<bot>.history.jsonl:<n>: corrupt anchor history line` (section 8).
+- For a `break_ack` (section 9): `<file>:<line>: malformed break_ack`;
+  `multiple break_ack records; only one approved discontinuity is allowed`;
+  `break_ack does not match the discontinuity at the pinned coordinates`;
+  `break_ack is outside a verified segment`.
+
 Problem and warning lines can quote ledger content: a `bot` field, a file name, an anchor `ts`.
 Control characters in them are neutralised before printing, so a crafted value cannot erase or
 forge a line on a terminal. `tail`, `status`, `spool list` and `alias list` follow the same rule.
@@ -697,7 +721,8 @@ Flags:
   copy of the chain placed under another name and reached through an alias does not satisfy the
   check. Together with `--all` it is a usage error
   (exit 2, `verify --contains cannot be combined with --all`).
-- `--skip-archives` skips step 7 and prints `(archives not checked)`.
+- `--skip-archives` skips step 7. A chain that has archive records then prints
+  `(archives not checked)` in place of `(N archived file(s) intact)`.
 - `--json` prints the result objects as one JSON list (schema below).
 
 `verify --bot` accepts a slug, display name or alias and verifies every chain of that Bot. A name
@@ -736,7 +761,7 @@ a name that has no chain. Exit codes are the same as without `--json`.
 | `problems` | list of strings | the `-` lines. A `--contains` miss is added to the last chain's entry |
 | `warnings` | list of strings | the `!` lines |
 | `missing` | bool | present and `true` only on a synthetic entry (no chain on disk for the name, logs missing while a witness survives, invalid directory, a witness directory that cannot be listed). Treat an absent key as `false` |
-| `archives` | int | number of `archive` records in the chain (0 when the walk already had a problem). A record that names no file is counted too, so the text suffix `(N archived file(s) intact)` can overstate (CHANGELOG, "Known open findings") |
+| `archives` | int | number of `archive` records that name a `path` or a `sha256` (0 when the walk already had a problem). A record that names neither is not counted; it is the warning of step 7 |
 | `archives_checked` | bool | `false` when `--skip-archives` was given |
 | `approved_breaks` | int | 0 or 1 |
 | `approved` | list | descriptor of the approved break, if any |
@@ -745,7 +770,7 @@ a name that has no chain. Exit codes are the same as without `--json`.
 | `breaks` | list | descriptors of unapproved breaks: the keys of the `break` object in section 6, plus `file_before` when the break spans two day files. A gap of more than 10 000 records has an empty `missing_seqs` and the key `missing_count` |
 | `segments` | list | one object per contiguous segment: `seq_start`, `seq_end`, `head`, `line_start`, `line_end`, `file_start`, `file_end`, `records`, `index_start`, `index_end` |
 | `state_problem` | string or null | the state-head mismatch text when that problem is in `problems`, otherwise `null`. `state rebuild` uses it to tell this one repairable problem from every other |
-| `record_error` | string | only with `--record`, and only when the `verify` record itself could not be appended (tail mismatch). `ok` is not changed by it, but the exit code is 1 |
+| `record_error` | string | only with `--record`, and only when the `verify` record itself could not be appended: a tail mismatch (`tail mismatch: verify record not written (spool: <path>)`) or an environment error (`verify record not written (<system message>)`). `ok` is not changed by it, but the exit code is 1 |
 
 A synthetic entry has exactly these keys: `bot`, `ok` (`false`), `records` (0), `head` (`null`),
 `problems`, `warnings` (empty) and `missing` (`true`).
@@ -965,7 +990,7 @@ Cases added by the deep reviews:
 - Exit 1: `sync` with no `origin` in the ledger repository, or with a ledger directory that is a
   symbolic link (nothing is pushed); an `anchor aborted: <class>` entry; a chain directory that
   cannot be listed; an anchor-history or archive file that is not a regular file.
-- Exit 2: a negative `capture browser --hours`; a reserved bot name on `capture`, `archive` or
+- Exit 2: `capture browser --hours` below 1; a reserved bot name on `capture`, `archive` or
   `sync --bot`, before anything is written.
 - Exit 3: a GitHub URL with a bracketed or percent-encoded host or a `<transport>::` prefix, one
   that cannot be parsed, and the wiki of a public repository.
@@ -1041,11 +1066,11 @@ change can be checked against it. The figures follow from the code; they are not
 
 | Command | Reads | Cost |
 |---|---|---|
-| `append` (`task-start`, `log`, `note`, …) | one listing of `logs/<bot>/`; the last line of the newest day file, read backwards in 64 KiB blocks; `state/<bot>.json`; for a command that names a task id, day files of the Bot's chains | The append itself does not grow with N. One directory listing of D entries per append; older day files are not opened. One fsync each for the day file, the state file and `state/`. `logs/<bot>/` is fsynced as well when the append creates the day file. A logging command that names a task id (`log`, `approval`, `note`, `archive`, `task-end`, `task-start --task-id`) also reads day files of the Bot's chains for that id, newest first: today's file for a task opened today, every day file of the last 30 days for an unknown id. Records with `--source auto` and commands without a task id skip that scan |
-| `verify --bot B` | every line of every day file of the chain, once, under the shared lock; the state file and both anchor files; archived files after the lock is released | O(N) time and memory: each line is parsed and hashed once, and the parsed records and their hashes are kept until the result is returned. The raw text of the lines is kept only with `--strict`. Plus O(A) to decompress and re-hash the archives, unless `--skip-archives` is given. The `ledger` chain is searched for the witness note only when a pinned `break_ack` was honoured |
+| `append` (`task-start`, `log`, `note`, …) | one listing of `logs/<bot>/`; the last line of the newest day file, read backwards in 64 KiB blocks; `state/<bot>.json`; for a command that names a task id, day files of the Bot's chains | The append itself does not grow with N. One directory listing of D entries per append; older day files are not opened. One fsync each for the day file, the state file and `state/`. `logs/<bot>/` is fsynced as well when the append creates the day file. A logging command that names a task id (`log`, `approval`, `note`, `archive`, `task-end`, `task-start --task-id`) also reads day files of the Bot's chains for that id, newest first: today's file for a task opened today; for an unknown id every day file of the last 30 days, up to 8 MiB of log lines (after that the scan stops and no warning is printed). Records with `--source auto` and commands without a task id skip that scan |
+| `verify --bot B` | under the shared lock: one listing of the chain directory, the size of every day file, the state file and both anchor files. After the lock is released: every line of every day file, once, up to the recorded size; then the archived files | O(N) time: each line is parsed and hashed once, and no parsed record is kept. Memory does not grow with N for the CLI: one small entry per `archive` record, the segments and breaks, and the `--contains` hashes and anchored heads. A library call that leaves `verify_want_hashes` unset keeps one hash per record. Plus O(A) to decompress and re-hash the archives, unless `--skip-archives` is given. The `ledger` chain is searched for the witness note only when a pinned `break_ack` was honoured |
 | `verify --all`, `anchor` | the above for each chain, one chain at a time | The sum over all chains. `anchor` verifies before it writes; `anchor --skip-archives` saves the O(A) part |
 | `status` | one read of each chain's state file; the day files of the last 30 days; the alert file and the spool directory of each chain | O(records of the last 30 days). Does not grow with older history |
-| `report --date D` | the day-D file of each chain; every later day file as raw lines | O(records of day D) parsed. Later files are scanned for `clock_regressed`, and only a line that contains that key is parsed |
+| `report --date D` | the day-D file of each chain; every later day file as raw lines; for tasks that cross midnight, up to 30 earlier day files as raw lines | O(records of day D) parsed. Later files are scanned for `clock_regressed`, and only a line that contains that key is parsed. When a task of day D has no `task_start` or no `task_end` on that day, up to 30 earlier day files are scanned for `task_start` and the later day files for `task_end`, again as raw lines |
 | `report --since`, `export --since`, `coverage` | day files from the start date on | O(records since that date), held in memory and sorted. `coverage` compares an observed action only with the self-reports of the same Bot, action kind and normalised target |
 | `tail -n k` | per chain, day files newest first, until k readable records were found | O(records of the newest day file) per chain: each day file that is looked at is parsed whole. One day file per chain for a small k |
 | `tune --days W` | records from the start of the window or from 90 days ago, whichever is earlier; older day files as raw lines, of which only lines that contain `"tune"` are parsed | O(records in that range), held in memory. Older history costs a raw scan only |
@@ -1066,7 +1091,7 @@ The figures below come from specialist review K4 (2026-11-16). They were derived
 were **not measured**. Assumptions: CPython 3.8–3.12 on 64-bit Linux, one core of about 3 GHz, a
 warm page cache, about 300 bytes per log line and 12 keys per record. A parsed record then takes
 2.0–2.4 KB of memory (its key strings are not shared between records), and `verify` spends about
-10 µs per record, 40–50 % of it while the shared lock is held. To measure on your own host, run
+10 µs per record (none of it under the shared lock since K4-02). To measure on your own host, run
 `python tests/bench_large_ledger.py --records 500000 --keep` and time the commands on the ledger
 it keeps.
 
@@ -1076,9 +1101,9 @@ number of day rollups under `anchors/days/`.
 | Command | Complexity | N = 50 000 | N = 500 000 |
 |---|---|---|---|
 | `append` | O(D) directory entries; 3 fsync calls. A command with a task id adds the scan described in the first table | 1–3 ms plus fsync, without the task-id scan | the same |
-| `verify --bot B` | O(N) time and O(N) memory; the shared lock is held for the read and the parse, and appends to the chain wait that long | about 0.5 s, 110 MB, lock held 0.25 s | about 5 s, 1.0–1.2 GB, lock held 2.5 s |
+| `verify --bot B` | O(N) time; memory does not grow with N for the CLI; the shared lock is held only for one directory scan, one `stat` per day file and the side-file reads | about 0.5 s | about 5 s |
 | `verify --all`, `anchor` | sum over the chains, plus O(A), plus O(Y) rollups | sum of the row above | sum of the row above |
-| daily routine | three walks per chain and run (rollback check, `verify --all --record`, `anchor`) | about 1.5 s per chain | about 15 s per chain, three peaks of about 1 GB |
+| daily routine | three walks per chain and run (rollback check, `verify --all --record`, `anchor`) | about 1.5 s per chain | about 15 s per chain |
 | `status` | O(M30) records parsed, kept and sorted | M30 = 50 000: about 0.4 s, 110 MB | does not grow with older history |
 | `report --date D` | O(records of day D), plus a raw scan of the later day files | small | small for yesterday; a raw scan of O(N) for an old D |
 | `report --since`, `coverage`, `tune` | O(records since the date), kept and sorted | about 2.2 KB per record | about 2.2 KB per record |
@@ -1086,12 +1111,11 @@ number of day rollups under `anchors/days/`.
 | `tail -n k` | the newest day file of each chain, parsed whole | small | small |
 | `tune` | additionally one pass over the Bot's loaded records per proposal and per applied change | seconds with the default 90-day load | minutes with `--days 36500` and about 200 proposals |
 | `sync` | git, plus a hash of every evidence file on every run | not estimated | not estimated |
-| `spool replay` | S × (lines since the refusal day), under the exclusive lock | S = 5 000 over 20 000 lines: about 40 s | S = 5 000 without a usable bound: about 15 minutes |
+| `spool replay` | O(lines appended since the oldest pending refusal) once per run, plus one tail read and one append per event | not estimated | not estimated |
 | `archive` | the whole file in memory | peak about 4–5 times the file size | the same |
 
-The scheduler script `examples/routine-daily-audit.sh` calls `gblog anchor` without
-`--skip-archives`, so it re-hashes the archived files twice per run; the routine prompt does it
-once.
+The scheduler script `examples/routine-daily-audit.sh` calls `gblog anchor --skip-archives` as
+well, so it re-hashes the archived files once per run, like the routine prompt.
 
 ### Inputs that cost more than their size
 
@@ -1101,11 +1125,9 @@ The figures are derived, not measured.
 | Input | Effect | Id |
 |---|---|---|
 | a log line of any size | it is read whole into memory: no reader bounds a log line. The tail lookup of `append` is linear in the length of the last line, and a JSON side file above 16 MiB counts as unreadable | K4-03 |
-| text with a long run such as `token_token_…` without an assignment, or `eyJ…-` repeated | two redaction rules take quadratic time (seconds at about 12 KB of such text). `append` redacts while it holds the bot lock; `archive` redacts the content before it takes the lock | K4-04 |
 | an `archive` record without a usable `bytes` value | the file is decompressed to its end (memory stays bounded; time does not) | K4-05 |
 | a growing `archive/` | every `verify` without `--skip-archives` decompresses and hashes all of it | K4-05 |
-| thousands of spooled events | `spool replay` scans the chain since the refusal day once per event, and each refusal lists the whole spool directory | K4-07 |
-| many open tasks in one report | `report` compares every open task with every task of the Bot (minutes for 20 000 open tasks) | K4-08 |
+| thousands of spooled events | each refusal lists the whole spool directory (`spool replay` itself reads the chain once per run) | K4-07 |
 | a chain with many breaks | `problems`, `breaks` and `segments` have no cap and are written into `anchors/<bot>.json` and the day rollup | K4-12 |
 
 A jump in `seq` is bounded: a gap of more than 10 000 records is described by `missing_count`
@@ -1114,7 +1136,5 @@ rejected before a range is built.
 
 Kept as they are for now:
 
-- The chain walk of `verify` is not streamed. The parsed records of one chain stay in memory until
-  the result is returned. A streamed walk that gives the same result is future work (K4-02).
 - `sync` hashes every evidence file on every run. A cache of verified files would have to be a
   local file under `.git/`, which the adversary can write, so there is none (D3-05, K4-14).

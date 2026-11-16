@@ -38,7 +38,7 @@ The round-3 items that this section used to list as open are in the code: the ve
 `--strict` check of the `ts` form, `capture files --record-baseline`, hook v2, `sync` and invalid
 chain directories, `alias list` / `anchor` output, clamped records in one daily report, and the
 dead-code removal. Every deep-review finding rated Medium or higher is fixed in this branch, with
-the corrections that the specialist reviews made to D1-01, D3-05 and the `--hours` bound:
+the corrections that the specialist reviews made to D1-01 and D3-05:
 
 - **Side files that are not regular files are never opened (D1-01, D6-02).** A FIFO, a device or a
   directory (also behind a symlink) at `state/<bot>.json`, `state/aliases.json`, an anchor file, a
@@ -87,8 +87,8 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
     coverage works with a weekly capture run;
   - the shell hook logs nothing at the first prompt of a new interactive shell. Run
     `gblog capture shell-hook --bot <slug> --install` again to get the new hook text;
-  - a negative `capture browser --hours` exits 2 (`--hours 0` imports nothing on a first run), and
-    a marker dated more than a day ahead is ignored with a notice;
+  - `capture browser --hours` below 1 exits 2 (the library function clamps a negative value to
+    0), and a marker dated more than a day ahead is ignored with a notice;
   - `capture files` keeps one snapshot per `--path` (`state/capture-files-<bot>.<tag>.json` for an
     additional path), and changes left over behind `--limit` are logged first on the next run.
 - **Coverage and tune (D4-06 … D4-10).** Failures and the `fail` metric count the Bot's own reports
@@ -109,7 +109,9 @@ the corrections that the specialist reviews made to D1-01, D3-05 and the `--hour
 Four reviews of 2026-11-16 read this tree by area: cross-command consistency (K1), the filesystem
 adversary (K2), compatibility and migration (K3) and cost on large ledgers (K4). None of them ran
 the code. Most K1 and K2 findings were then fixed in `gblog.py`; `tests/test_specialist.py` covers
-them. K3 and K4 changed documentation only. An earlier text of this section said that the whole
+them. D1-09/K3-01, K3-03, K3-04, K4-02, K4-04, K4-07 and K4-08 were then fixed in `gblog.py` as
+well; `tests/test_k3_k4.py` covers them. The other K3 and K4 findings changed documentation
+only. An earlier text of this section said that the whole
 pass changed documentation only; the round-4 audit (Z-01) corrected that. What is still open is
 listed under "Known open findings".
 
@@ -191,6 +193,29 @@ Fixed in the code:
 - **Hook update (K2-12).** `capture shell-hook --install` replaces an older hook block by writing
   a temporary file and renaming it over the rc file. A symlinked rc file stays a link and the
   file keeps its mode.
+- **Pre-0.6 tail with a free-form `ts` (D1-09, K3-01).** The next record is bound by the tail's
+  `ts` as text and by the tail's day file. An explicit earlier `--ts` exits 2; an implicit time
+  is clamped and the record carries `clock_regressed`. `archive --ts` uses the same bound. The
+  chain keeps verifying and no record lands in an earlier day file.
+- **Case variants on a case-insensitive file system (K3-03).** A record whose `bot` field is
+  another letter-case spelling of the same directory is the chain's own: no `bot field` warning,
+  and `--contains` counts it.
+- **Another spelling of `origin` (K3-04).** `sync --remote` accepts a URL that names the same
+  repository as `origin`: for GitHub the same owner and repository over https or ssh, with or
+  without `.git`; for another host the same text apart from a trailing `/` or `.git`; for a
+  local path the same directory. `origin` keeps its spelling and nothing is recorded. With
+  `--replace-remote` the new spelling is stored and recorded. Any other URL still exits 2.
+- **Streamed `verify` (K4-02).** Under the shared lock `verify` lists the chain's files, records
+  the size of every log file and reads the state and anchor files. The lines are read and parsed
+  after the lock is released, up to those sizes, and no parsed record is kept. Results are
+  unchanged. A log file that changed in between is the new problem
+  `<file>: log file was replaced or shortened while it was being verified`.
+- **Linear redaction (K4-04).** The env-style and JWT rules run in one pass with unchanged
+  output; `append` redacts before it takes the bot lock.
+- **`spool replay` index (K4-07).** One index of the spool ids in the chain per run; the chain is
+  no longer scanned once per event.
+- **Report twin lookup (K4-08).** Closed tasks are indexed by title, so an open task is compared
+  only with its possible twins.
 
 In the code already (the reviews reported these as missing; nothing had to change):
 
@@ -210,6 +235,8 @@ In the code already (the reviews reported these as missing; nothing had to chang
 
 In the code, but listed under "Known open findings" until now:
 
+- `(N archived file(s) intact)` and the `archives` key of `verify --json` count only `archive`
+  records that name a file (D1-13).
 - `verify --bot <Bot>` also reports a deleted chain that is the slug or a registered variant of
   that Bot while a witness survives (D1-07).
 - A record stored in a day file of another date is a `!` warning, and a problem with `--strict`:
@@ -246,13 +273,12 @@ Documentation corrected, because the code does something else:
 
 - Which non-regular side file is a FAIL and which is a warning: the table in `docs/DESIGN.md`,
   section 7 (D1-01, K2-08, Z-10).
-- `capture browser --hours` is refused when it is negative, not when it is below 1.
 - `sync` keeps no cache of verified files; every evidence file is hashed on every run (D3-05).
 - `docs/chain-repair-live-apply.md`: `seal` with a tail mismatch on `kim-biseo` exits 2.
 - `docs/DESIGN.md`: the known limits in sections 4 and 8 that the code has closed, and the cost of
   `tail -n k`.
 - README: `verify --record`, `state rebuild` and `spool replay` do append to a variant chain
-  (K1-08); `sync --remote` compares the URL as text (K3-04).
+  (K1-08).
 
 New documentation:
 
@@ -270,14 +296,10 @@ New documentation:
 findings that are not listed as fixed under "Specialist reviews" above. The round-4 audit checked
 each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
 
-- **verify / anchor.** After a pre-0.6 tail whose `ts` is not in the normalised form, `append` can
-  write a record that fails `verify`, or file it in an earlier day file, after which every append
-  to that chain exits 4 (D1-09, K3-01; README, "Upgrading from 0.5"). `(N archived file(s) intact)`
-  counts `archive` records that name no file (D1-13; `tests/PENDING.txt`). A FIFO or device at
+- **verify / anchor.** A FIFO or device at
   `state/<bot>.json` is a `!` warning while a directory there, and any non-regular
   `anchors/<bot>.json`, is FAIL; a deleted `anchors/<bot>.json` is silent (Z-10; `docs/DESIGN.md`,
-  section 7). `verify` keeps every parsed record in memory and
-  parses under the shared lock (K4-02); `problems`, `breaks` and `segments` have no cap (K4-12).
+  section 7). `problems`, `breaks` and `segments` have no cap (K4-12).
   The `bytes` of an `archive` record is a hard read limit, and a `path` written with backslashes
   is opened as written (K3-06). A directory under `logs/` that is not a chain is FAIL even when it
   holds no log file (K3-07).
@@ -289,11 +311,9 @@ each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
   still test the file type before they open the file, not on the opened descriptor (Z-14). A hard
   link at a day file or an anchor history is appended through. When a refusal cannot write its
   spool file, the event survives only in `state/<bot>.alert.json`, which the next refusal
-  replaces (K2-10). Two redaction rules are quadratic on crafted text, and `append` redacts under
-  the bot lock (K4-04). `spool replay` scans the chain once per event (K4-07).
+  replaces (K2-10).
 - **sync.** `origin` can change before its record is written (D3-10). Multi-URL origins and
-  `pushurl` (D3-11). `NAME=value` redaction stops at `&` or a quote (D3-14). `--remote` with
-  another spelling of the current `origin` exits 2 (K3-04). `sync` has no lock of its own. Every
+  `pushurl` (D3-11). `NAME=value` redaction stops at `&` or a quote (D3-14). `sync` has no lock of its own. Every
   run hashes every evidence file: that is the price of having no cache (D3-05).
 - **capture / tune / archive.** A symlinked `--path` (D4-15), ports dropped from browser targets
   (D4-19), `$?` after the hook and operator commands at a prompt (D4-14, D4-21), proposal caps,
@@ -307,15 +327,12 @@ each line against `gblog.py`. 0.6.1 stays "Unreleased" until they are decided.
   (D5-08). `archive` argument edges (D6-13). `report --date` with `--since` (D6-15).
   A mistyped `--bot` on a read command is still exit 0; it now prints a warning (K1-03).
   `verify --record` appends to every chain directory it verifies, variant chains included
-  (K1-08). On a file system that ignores letter case, records that an earlier build wrote under
-  another spelling of the chain directory keep their `bot field` warning, and `--contains` does
-  not count them (K1-09, K3-03). One invalid entry disables the whole alias registry (K3-05).
+  (K1-08). One invalid entry disables the whole alias registry (K3-05).
   Alias-registry changes (`alias add`, also with `--move`, `alias remove`, `alias strict`) are
   recorded in no chain (Z-16). Smaller format gaps between commands (K1-12). `export`, `status`,
-  `report` and `tail` keep or parse more than they need (K4-08 … K4-10, K4-13).
+  `report` and `tail` keep or parse more than they need (K4-09, K4-10, K4-13).
 - **Tests and routine.** No test uses a ledger shaped like the output of 0.2 to 0.5 (K3-08). The
-  daily routine walks every chain three times, and `examples/routine-daily-audit.sh` re-hashes the
-  archived files twice (K4-06).
+  daily routine prompt walks every chain three times (K4-06).
 
 Future work (design changes, not planned for 0.6.1):
 
@@ -323,7 +340,6 @@ Future work (design changes, not planned for 0.6.1):
   procedure and needs the operator's sign-off.
 - Capture events raise the alert without being spooled.
 - `sync` with a lock of its own (`state/.sync.lock`).
-- A streamed `verify` with bounded memory that parses outside the shared lock (K4-02).
 - A size limit for log lines. It needs a decision about ledgers that already hold
   a longer line (K2-06, K4-03).
 - One walk per chain in the daily routine, and an opt-in rotation of the archive re-hash (K4-05,
@@ -391,8 +407,8 @@ Read these before upgrading a routine or a script that branches on output or exi
   only changes applied since that start (the last 90 days with the default `--days 28`) (W-11).
 - **`sync --remote` no longer replaces an existing `origin` (B:H3).** When `origin` already points
   somewhere else, `gblog sync --remote <url>` exits 2 and changes nothing. Pass `--replace-remote`
-  to move the backup on purpose. Setting the first `origin`, or repeating the current URL, works as
-  before. Every change of `origin` is written to the ledger as a `sync` record with the old and the
+  to move the backup on purpose. Setting the first `origin`, or repeating the current URL (also in
+  another spelling of the same repository, K3-04), works as before. Every change of `origin` is written to the ledger as a `sync` record with the old and the
   new URL (credentials removed). In 0.6.0 any `gblog` caller could silently and permanently re-point
   the backup to another host.
 - **`sync --re` is ambiguous and exits 2.** The new flag `--replace-remote` shares that prefix with
@@ -605,7 +621,9 @@ Read these before upgrading a routine or a script that branches on output or exi
 ### Changed
 
 - `verify` takes one snapshot of the log, state and anchor files under the shared lock and uses one
-  parser for every check, including `--strict` and `--contains` (R-05).
+  parser for every check, including `--strict` and `--contains` (R-05). Since K4-02 the snapshot
+  holds the size of every log file, not the lines: they are read after the lock is released, up
+  to those sizes (see "Specialist reviews").
 - `verify --json` is rendered from the same result list as the text output (R-08).
 - `alias add`, `alias remove` and `alias strict` read, modify and write the registry in one hold of
   `aliases.lock` (R-10).
@@ -678,6 +696,19 @@ Read these before upgrading a routine or a script that branches on output or exi
   `SECURITY.md`; the side-file rules, the refusal steps, the entries that are not chains and the
   `sync` cost in `docs/DESIGN.md`; flag synonyms, stderr lines and the spool file name in
   `docs/agent-integration.md`; the capture commands of the `bot-tune` skill.
+- Documentation-accuracy pass (K5-01 … K5-18). Corrected:
+  - the `capture browser --hours` bound (below 1 exits 2);
+  - the state of the K3 and K4 findings that are fixed in the code;
+  - `sync --remote` with another spelling of `origin`;
+  - the streamed `verify` in `docs/DESIGN.md` sections 4, 5, 7 and 13 and in FAQ 35;
+  - the `archives` count and `record_error`, and when `(archives not checked)` is printed;
+  - the steps of `examples/routine-daily-audit.sh` (`anchor --skip-archives`);
+  - the `task-start` / `task-end` commands of both routine prompts (`--bot`, `--task-id "$TID"`);
+  - the README transcript, the "Development" command and the abbreviation table header;
+  - FAQ 28 (`--history` replaces auto-detection).
+
+  Added: a list of further `verify` problem lines in `docs/DESIGN.md` section 7, and a note in
+  `SECURITY.md` that `verify` creates lock files in an audited clone.
 
 ## [0.6.0] - 2026-11-16
 

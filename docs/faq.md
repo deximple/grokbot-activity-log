@@ -71,7 +71,7 @@ A warning usually means a witness was lost, so report it verbatim even when the 
 | Flag | Use |
 |---|---|
 | `--strict` | Auditing. Also FAILs on a `bot` field that differs from the chain, a `*.jsonl` file that is not named `YYYY-MM-DD.jsonl`, a non-string text field, a non-finite number, a symlink among the chain's files, a `ts` that is not in the normalised form, and any line that is not what gblog writes (surrounding white space is ignored). |
-| `--skip-archives` | A quick chain-only check. Archived files are not re-hashed, and the line says `(archives not checked)`. |
+| `--skip-archives` | A quick chain-only check. Archived files are not re-hashed, and the line of a chain that has archive records says `(archives not checked)`. |
 | `--json` | Scripts. Prints one JSON list with an entry per chain block; the exit codes are unchanged. |
 | `--record` | Appends a `verify` record with the result to each verified chain. |
 | `--contains HASH` | Rollback check. Repeatable, needs `--bot`, needs a full 64-hex hash, and cannot be combined with `--all`. |
@@ -347,9 +347,10 @@ only in `gblog status`.
 ### 28. What does `capture browser` read and store?
 
 It copies each history database it finds (Chromium-family `History` files and Firefox
-`places.sqlite`; add more with `--history PATH` or `GBLOG_BROWSER_HISTORY`) and imports visits
+`places.sqlite`; `GBLOG_BROWSER_HISTORY` adds colon-separated glob patterns to that search, and
+`--history PATH`, repeatable, reads only the files you name) and imports visits
 newer than its per-history marker. The first import of a history file is bounded by `--hours`
-(default 24; a negative value exits 2). A marker dated more than a day in the future is ignored
+(default 24; a value below 1 exits 2). A marker dated more than a day in the future is ignored
 with a notice.
 
 Each record stores `scheme://host/path` without query string or fragment, the page title (first
@@ -439,9 +440,9 @@ Partly, and it is untested there: CI runs on Linux and macOS only.
 
 | Operation | Cost |
 |---|---|
-| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file and the state file, and the chain directory when it creates a day file. A command that names a task id also reads day files of the Bot for that id, newest first: today's file for a task opened today, up to 30 days of files for an unknown id. |
-| `verify`, `anchor` | Linear in the chain. Every record is read into memory and re-hashed, and every archived file is decompressed and re-hashed. `--skip-archives` skips that last part. |
-| `report --date D` | Reads the day file for D. It also scans later day files for records whose real wall-clock day was D (`clock_regressed`). |
+| Append (`log`, `note`, …) | Does not grow with the ledger. The tail is found by reading the newest day file backwards in 64 KiB blocks. Each append fsyncs the day file and the state file, and the chain directory when it creates a day file. A command that names a task id also reads day files of the Bot for that id, newest first: today's file for a task opened today, up to 30 days of files for an unknown id (at most 8 MiB of log lines). |
+| `verify`, `anchor` | Linear in the chain. Every record is read and re-hashed once; records are not kept in memory. Every archived file is decompressed and re-hashed. `--skip-archives` skips that last part. |
+| `report --date D` | Reads the day file for D. It also scans later day files for records whose real wall-clock day was D (`clock_regressed`) and, for tasks that cross midnight, makes raw scans of up to 30 earlier day files (`task_start`) and of the later day files (`task_end`). |
 | `status` | Reads the last 30 days of each chain. |
 | `tail` | Reads the newest day files of each chain until it has enough records. Use `--bot` to narrow it. |
 | `tune` | Reads from the start of the `--days` window or from 90 days ago, whichever is earlier, plus the `tune` records of any age. Use `--bot` to narrow it. |

@@ -179,8 +179,7 @@ derived by reading the code, not by running it, and they are recorded in the CHA
 - *Case-sensitive names.* On a file system that ignores letter case (the macOS and Windows
   defaults) `logs/Ops` and `logs/ops` are one directory. A write uses the spelling the directory
   already has, so new records carry the directory's name. Records that an earlier build wrote
-  under the other spelling keep the `bot field … does not match chain` warning, and
-  `verify --contains` does not count their hashes (K1-09, K3-03).
+  under the other spelling count as the chain's own (K1-09, K3-03).
 - *Only chains under `logs/`.* Every directory there must be a chain. A `lost+found` (when `logs/`
   is a mount point), `.stfolder` or similar directory is FAIL in `verify --all` (K3-07).
 - *git stores the files byte for byte.* A clean filter or Git LFS on `logs/`, `anchors/` or
@@ -354,8 +353,8 @@ Notes:
 - `--remote` decides where backups go, so a Bot must not choose it: keep it out of routine
   prompts and Auto-review rules as well. A scheduler entry that the operator wrote and that
   passes the same fixed URL on every run is acceptable (`examples/routine-daily-audit.sh` does
-  this with `GBLOG_AUDIT_REMOTE`). Repeating the current `origin` changes nothing, and any other
-  URL exits 2 without `--replace-remote`.
+  this with `GBLOG_AUDIT_REMOTE`). Repeating the current `origin`, also in another spelling of
+  the same repository, changes nothing; any other URL exits 2 without `--replace-remote`.
 - Use a fine-grained token scoped to the one backup repository, entered through the secure secret
   request and never in chat.
 
@@ -410,6 +409,9 @@ input.
 - Run read-only checks: `gblog --root <clone> verify --all --strict`, and
   `gblog --root <clone> verify --bot <chain> --contains <head>` with heads you kept elsewhere.
   `--strict` also fails on a symlink among a chain's files and on the other layout warnings.
+- `verify` creates `state/<bot>.lock` for each chain it reads (an empty file, never through a
+  symlink). Mount or `chmod` the clone read-only if nothing at all may be written; `verify` then
+  runs without the lock.
 - Do not run write commands on the clone: no logging command, no `anchor`, no `verify --record`,
   no `sync`, and `report` or `tune` only with `--stdout`.
 - gblog does not follow a symlink at the path it writes. The command exits 2 (day files, anchor

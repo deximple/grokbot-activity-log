@@ -38,7 +38,7 @@ Contents:
 
 ## 2. Finding gblog and the ledger
 
-- `install.sh` installs the launcher as `$GBLOG_PREFIX/gblog` (default `~/.local/bin/gblog`).
+- `install.sh` installs `gblog.py` as `$GBLOG_PREFIX/gblog` (default `~/.local/bin/gblog`).
   Non-interactive shells do not read rc files, so call the absolute path there. From a checkout,
   use `./bin/gblog`.
 - The ledger root is chosen in this order:
@@ -406,7 +406,7 @@ Common rules:
 | 5 | `gblog archive --bot ledger --kind transcript --file <file> --detail "<slug> transcript"` | One call per exported transcript. |
 | 6 | `gblog report --date yesterday`, `gblog report`, `gblog status` | Both reports are needed because days are UTC days. |
 | 7 | `gblog sync -m "daily ledger sync"` | Exit 3: report the refusal. Exit 4: report it as in step 4. Exit 1: say "not pushed" and give the error. |
-| 8 | `gblog task-end --outcome ok` or `--outcome fail` | Post the summary. |
+| 8 | `gblog task-end --bot <slug> --task-id "$TID" --outcome ok` or `--outcome fail` | Post the summary. |
 
 **Weekly tune:**
 
