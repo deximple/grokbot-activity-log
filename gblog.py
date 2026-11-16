@@ -126,9 +126,27 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[REDACTED]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "[REDACTED]"),  # JWT
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer [REDACTED]"),
+    # Audit I-08: names that merely contain a secret word, delimited by start/`_`/`-` (DB_PASSWORD=, AWS_SECRET_ACCESS_KEY=,
+    # client-secret: ...), and quoted values with spaces. It sits before the older keyword rule on the next line because
+    # that rule stops at the first space of a quoted value. The name prefix is bounded ({0,8}) only to keep matching linear
+    # on long base64url blobs: a match may start after any `_`/`-` and the name is kept verbatim, so the output is the
+    # same as with an unbounded prefix.
+    (re.compile(r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_-]){0,8}(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key)(?:[_-][A-Za-z0-9]+)*)\s*[:=]\s*(?:\"[^\"\n]{1,}\"|'[^'\n]{1,}'|[^\s'\"&]{6,})"), r"\1=[REDACTED]"),
     (re.compile(r"(?i)\b(token|api[_-]?key|secret|password|passwd|pwd)\b\s*[:=]\s*['\"]?[^\s'\"&]{6,}"), r"\1=[REDACTED]"),
     (re.compile(r"(?i)([?&](?:token|access_token|refresh_token|api[_-]?key|apikey|key|secret|password|pwd|sig|signature|auth|code)=)[^&\s]+"), r"\1[REDACTED]"),
     (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://[REDACTED]@"),  # userinfo in URLs
+    # Audit I-08 (additive): JSON keys ending in a secret word, the same inside a JSON string (escaped quotes),
+    # CLI flags, Basic auth, and more vendor key shapes.
+    (re.compile(r'(?i)("[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"'), r'\1"[REDACTED]"'),
+    (re.compile(r'(?i)(\\"[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key)\\"\s*:\s*)\\"[^"\n]*?\\"'), r'\1\\"[REDACTED]\\"'),
+    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api[_-]?key)[ =]+)(?:\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(authorization\s*[:=]\s*basic\s+)[A-Za-z0-9+/=]{8,}"), r"\1[REDACTED]"),
+    (re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"), "[REDACTED]"),  # Stripe secret / restricted keys
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{12,}"), "[REDACTED]"),  # GitLab personal access token
+    (re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"), "[REDACTED]"),  # npm token (npm_config_* env names have underscores and stay)
+    (re.compile(r"\bya29\.[A-Za-z0-9._-]{12,}"), "[REDACTED]"),  # Google OAuth access token
+    (re.compile(r"\bxapp-[A-Za-z0-9-]{8,}"), "[REDACTED]"),  # Slack app-level token
+    (re.compile(r"(?i)(https?://hooks\.slack\.com/services/)[A-Za-z0-9/_-]+"), r"\1[REDACTED]"),  # Slack incoming webhook
 ]
 
 
@@ -448,25 +466,119 @@ class Ledger:
         _fsync_dir(self.state_dir)
 
     class _Lock:
-        def __init__(self, path: str):
+        """flock() on state/<bot>.lock: exclusive for writers, shared (``shared=True``) for readers.
+
+        flock() is per open file, so a second request from the thread that already holds the
+        exclusive lock would wait on itself. Such requests are no-ops (re-entrant) instead.
+        """
+
+        _held: Dict[Tuple[str, int, int], int] = {}  # (path, pid, thread id) -> depth of exclusive holds
+
+        def __init__(self, path: str, shared: bool = False, create: bool = True):
             self.path = path
+            self.shared = shared
+            self.create = create
             self.fh = None
+            self._key = None
 
         def __enter__(self):
-            self.fh = open(self.path, "a+")
+            import threading
+            key = (os.path.abspath(self.path), os.getpid(), threading.get_ident())
+            held = Ledger._Lock._held
+            if held.get(key):
+                if not self.shared:
+                    held[key] += 1
+                    self._key = key
+                return self
+            if not self.shared:
+                self.fh = open(self.path, "a+")
+            else:
+                # A reader must work on a read-only tree and must not create a lock file for a chain that is not on disk.
+                for mode in (("a+", "r") if self.create else ("r",)):
+                    try:
+                        self.fh = open(self.path, mode)
+                        break
+                    except OSError:
+                        continue
+                if self.fh is None:
+                    return self
             if fcntl is not None:
-                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX)
+            if not self.shared:
+                held[key] = 1
+                self._key = key
             return self
 
         def __exit__(self, *exc):
+            if self._key is not None:
+                held = Ledger._Lock._held
+                held[self._key] = held.get(self._key, 1) - 1
+                if held[self._key] <= 0:
+                    del held[self._key]
+                self._key = None
             if self.fh is not None:
                 if fcntl is not None:
                     fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
                 self.fh.close()
+                self.fh = None
 
-    def lock(self, bot: str) -> "Ledger._Lock":
-        os.makedirs(self.state_dir, exist_ok=True)
-        return Ledger._Lock(os.path.join(self.state_dir, bot + ".lock"))
+    def lock(self, bot: str, shared: bool = False) -> "Ledger._Lock":
+        """Exclusive bot lock for writers; ``shared=True`` for readers (verify).
+
+        A shared lock never creates ``state/`` or a lock file for a chain that is not on disk, and
+        degrades to no lock when the tree is read-only.
+        """
+        path = os.path.join(self.state_dir, bot + ".lock")
+        if not shared:
+            os.makedirs(self.state_dir, exist_ok=True)
+            return Ledger._Lock(path)
+        on_disk = os.path.isdir(os.path.join(self.logs_dir, bot)) or os.path.exists(self._state_path(bot))
+        if on_disk:
+            try:
+                os.makedirs(self.state_dir, exist_ok=True)
+            except OSError:
+                pass
+        return Ledger._Lock(path, shared=True, create=on_disk)
+
+    def update_state(self, bot: str, fields: Dict) -> bool:
+        """Merge ``fields`` into state/<bot>.json under the bot lock. Returns True when state was written.
+
+        Never writes a genesis state over a non-empty chain. When the state file is missing or
+        unreadable and the chain has records, ``seq``/``head`` are seeded from the log tail if that
+        tail is self-consistent. Otherwise nothing is written and a warning goes to stderr: append
+        can still self-heal from the log, and a genesis state would turn that into a tail mismatch.
+        """
+        with self.lock(bot):
+            try:
+                with open(self._state_path(bot), encoding="utf-8") as fh:
+                    state = json.load(fh)
+            except (OSError, ValueError):
+                state = None
+            if not isinstance(state, dict):
+                state = {"seq": 0, "head": GENESIS}
+                if self.log_files(bot):
+                    try:
+                        _path, rec = self._tail_record(bot)
+                    except (OSError, ValueError):
+                        rec = {"_corrupt": True}
+                    if rec is not None:
+                        seeded = None
+                        try:
+                            if isinstance(rec, dict) and "_corrupt" not in rec and isinstance(rec.get("hash"), str) \
+                                    and rec["hash"] == compute_hash(rec):
+                                seeded = {"seq": int(rec["seq"]), "head": rec["hash"]}
+                        except (KeyError, TypeError, ValueError):
+                            seeded = None
+                        if seeded is None:
+                            sys.stderr.write("warning: state/%s.json is missing or unreadable and the log tail is not "
+                                             "self-consistent; state not written\n" % bot)
+                            return False
+                        if isinstance(rec.get("ts"), str):
+                            seeded["updated"] = rec["ts"]
+                        state = seeded
+            state.update(fields)
+            self.write_state(bot, state)
+            return True
 
     # -- iteration
     # -- aliases (one canonical ASCII slug per Bot; display name + historical variants)
@@ -844,7 +956,11 @@ class Ledger:
         ``PASS (N approved break(s))`` and must not treat that as a chain with no gap.
         """
         bot = safe_name(bot)
-        items = self._chain_items(bot)
+        # Shared lock: a concurrent append is never seen half-written or with state ahead of the items.
+        # It is released before the walk, the archive re-hash and the return (seal_break appends right after verify).
+        with self.lock(bot, shared=True):
+            items = self._chain_items(bot)
+            raw_state_snapshot = self._load_state(bot)
         problems: List[str] = []
         warnings: List[str] = []
         acks = []
@@ -971,7 +1087,7 @@ class Ledger:
             problems.append("break_ack is outside a verified segment")
 
         final_head = segments[-1]["head"] if segments else GENESIS
-        raw_state = self._load_state(bot)
+        raw_state = raw_state_snapshot
         state = raw_state if raw_state is not None else {"seq": 0, "head": GENESIS}
         state_problem = None
         if not problems and count and state.get("head") not in (GENESIS, final_head):
@@ -1343,6 +1459,31 @@ class Ledger:
         return rollup
 
     # -- query
+    def chain_records(self, chain: str, since: Optional[str] = None) -> List[Dict]:
+        """Records of exactly one chain directory (no alias merging), oldest first. ``since`` is YYYY-MM-DD."""
+        files = self.log_files(chain)
+        if since:
+            files = [f for f in files if os.path.basename(f)[:10] >= since]
+        out: List[Dict] = []
+        if not files:  # never hand iter_records an empty list: it would fall back to every file
+            return out
+        for _path, _lineno, rec in self.iter_records(chain, files):
+            if not isinstance(rec, dict) or "_corrupt" in rec:
+                continue
+            if since and str(rec.get("ts") or "") < since:
+                continue
+            out.append(rec)
+
+        def _key(r: Dict) -> Tuple[str, int]:
+            try:
+                seq = int(r.get("seq", 0))
+            except (TypeError, ValueError):
+                seq = 0
+            return str(r.get("ts") or ""), seq
+
+        out.sort(key=_key)
+        return out
+
     def records(self, bot: Optional[str] = None, date: Optional[str] = None, since: Optional[str] = None) -> List[Dict]:
         out: List[Dict] = []
         for b in (self.chains_for(bot) if bot else self.bots()):
@@ -1536,7 +1677,13 @@ def verify_archives(ledger: "Ledger", records: Iterable[Dict]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- remote visibility (backups must be private)
-_GITHUB_REMOTE_RE = re.compile(r"(?:github\.com[/:])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+# Left-anchored on the host so look-alikes (evilgithub.com, github.com.evil.example) are never treated as GitHub.
+_GITHUB_REMOTE_RE = re.compile(r"(?:^|//|@)(?:www\.)?github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.I)
+
+
+def _safe_url(url: str) -> str:
+    """A remote URL fit for messages and records: http(s) userinfo dropped, then the usual secret scrub."""
+    return redact(re.sub(r"(?i)\b(https?://)[^/@\s]+@", r"\1[REDACTED]@", url or "")) or ""
 
 
 def remote_visibility(remote: str, timeout: float = 6.0) -> Dict:
@@ -1576,8 +1723,27 @@ def _git(root: str, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str], push: bool, message: Optional[str],
-         allow_public: bool = False) -> Dict:
+         allow_public: bool = False, allow_unknown: Optional[bool] = None) -> Dict:
+    """Commit the ledger and, when ``push`` is set, push it to origin.
+
+    Every push URL of origin is checked. A PUBLIC one refuses the push unless ``allow_public``.
+    A github.com URL whose visibility cannot be confirmed also refuses (fail closed) unless
+    ``allow_public`` or ``allow_unknown``. Other hosts only warn. A tail mismatch on the sync
+    bot's own chain does not stop the commit or push; it is listed in ``result["tail_mismatch"]``.
+    """
     root = ledger.root
+    if allow_unknown is None:  # the CLI sets this attribute from --allow-unknown-visibility
+        allow_unknown = bool(getattr(ledger, "allow_unknown_visibility", False))
+    refused: List[str] = []
+
+    def _bookkeep(record: Dict) -> None:
+        # The spool and alert files written by a refusal are exactly what the backup has to carry, so keep going.
+        try:
+            ledger.append(bot, record)
+        except TailMismatchError as exc:
+            if bot not in refused:
+                refused.append(bot)
+            sys.stderr.write("ALERT tail mismatch on %s: %s\nspool: %s\nalert: %s\n" % (bot, exc, exc.spool_path, exc.alert_path))
     ledger.ensure()
     if not os.path.isdir(os.path.join(root, ".git")):
         _git(root, "init", "-q")
@@ -1589,8 +1755,12 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             _git(root, "remote", "add", "origin", remote)
     status = _git(root, "status", "--porcelain").stdout
     pending = [l for l in status.splitlines() if l.strip()]
-    ledger.append(bot, {"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
-    _git(root, "add", "-A", "logs", "reports", "state", "tuning", "archive", "anchors", "spool", "README.md")
+    _bookkeep({"type": "sync", "action": "other", "target": "git", "outcome": "pending", "detail": "%d changed path(s) before commit" % len(pending)})
+    add_paths = ["logs", "reports", "state", "tuning", "archive", "anchors", "spool"]
+    # A pathspec that matches nothing makes `git add` fail, so README.md is listed only when present or tracked.
+    if os.path.exists(os.path.join(root, "README.md")) or _git(root, "ls-files", "--", "README.md", check=False).stdout.strip():
+        add_paths.append("README.md")
+    _git(root, "add", "-A", *add_paths)
     commit_msg = message or "gblog sync %s" % now_iso()
     env_ok = True
     try:
@@ -1600,29 +1770,47 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             raise
         env_ok = False
     sha = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
-    result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None, "visibility": None}
+    result = {"commit": sha, "committed": env_ok, "pushed": False, "error": None, "visibility": None, "tail_mismatch": refused}
     if push:
-        origin = _git(root, "remote", "get-url", "origin", check=False).stdout.strip()
-        vis = remote_visibility(origin) if origin else {"public": None, "reason": "no origin configured"}
-        result["visibility"] = vis
-        if vis["public"] and not allow_public:
-            result["error"] = "refused: remote %s is PUBLIC (%s); backups must be private. Use --allow-public to override." % (origin, vis["reason"])
-            ledger.append(bot, {"type": "sync", "action": "other", "target": "git push", "outcome": "denied", "detail": result["error"][:300]})
+        # Every push URL counts: remote.origin.pushurl may differ from the fetch URL and may list several.
+        urls = [u.strip() for u in _git(root, "remote", "get-url", "--push", "--all", "origin", check=False).stdout.splitlines() if u.strip()]
+        checks = [(u, remote_visibility(u)) for u in urls]
+        public = [c for c in checks if c[1].get("public")]
+        unknown = [c for c in checks if c[1].get("public") is None]
+        unknown_github = [c for c in unknown if _GITHUB_REMOTE_RE.search(c[0])]
+        worst = (public or unknown_github or unknown or checks or [("", {"public": None, "reason": "no origin configured"})])[0]
+        result["visibility"] = worst[1]
+        result["visibilities"] = [{"url": _safe_url(u), "public": v.get("public"), "reason": v.get("reason")} for u, v in checks]
+        refusal = None
+        if public and not allow_public:
+            refusal = "refused: remote %s is PUBLIC (%s); backups must be private. Use --allow-public to override." % (
+                _safe_url(public[0][0]), public[0][1].get("reason"))
+        elif unknown_github and not (allow_public or allow_unknown):
+            refusal = "refused: could not confirm %s is private (%s)" % (_safe_url(unknown_github[0][0]), unknown_github[0][1].get("reason"))
+            sys.stderr.write("hint: retry later, or pass --allow-unknown-visibility if you know the repository is private\n")
+        if refusal:
+            result["error"] = redact(refusal)
+            _bookkeep({"type": "sync", "action": "other", "target": "git push", "outcome": "denied", "detail": result["error"][:300]})
             push = False
-        elif vis["public"] is None:
-            sys.stderr.write("warning: could not confirm the remote is private (%s)\n" % vis["reason"])
+        elif not checks:
+            sys.stderr.write("warning: could not confirm the remote is private (no origin configured)\n")
+        else:
+            for _url, vis in unknown:
+                sys.stderr.write("warning: could not confirm the remote is private (%s)\n" % vis.get("reason"))
     if push:
         cur_branch = branch or _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
-        try:
-            _git(root, "push", "-u", "origin", "HEAD:%s" % cur_branch)
-            result["pushed"] = True
-        except subprocess.CalledProcessError as exc:
-            result["error"] = (exc.stderr or exc.stdout).strip()[-400:]
+        if cur_branch == "HEAD":
+            result["error"] = "detached HEAD; pass --branch"
+        else:
+            try:
+                _git(root, "push", "-u", "origin", "HEAD:%s" % cur_branch)
+                result["pushed"] = True
+            except subprocess.CalledProcessError as exc:
+                result["error"] = redact((exc.stderr or exc.stdout or "").strip()[-400:])
+    stamp = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
     for b in ledger.bots():
-        with ledger.lock(b):
-            st = ledger.read_state(b)
-            st["last_sync"] = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
-            ledger.write_state(b, st)
+        # update_state never writes a genesis state over a chain whose state file is missing (that would brick appends).
+        ledger.update_state(b, {"last_sync": dict(stamp)})
     return result
 
 
@@ -1774,10 +1962,7 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
             markers[path] = newest
             changed = True
     if changed:
-        with ledger.lock(bot):
-            state = ledger.read_state(bot)
-            state["capture_browser_last"] = {k: v for k, v in markers.items() if k != "*"}
-            ledger.write_state(bot, state)
+        ledger.update_state(bot, {"capture_browser_last": {k: v for k, v in markers.items() if k != "*"}})
     return {"histories": paths, "added": added}
 
 
@@ -2237,11 +2422,105 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bot", required=True, help="Bot name (one chain per bot)")
     p.add_argument("--task-id", help="task id from `task-start`")
     p.add_argument("--task", help="task title")
-    p.add_argument("--detail", help="free text (secrets are redacted)")
+    p.add_argument("--source", choices=SOURCES, help="self (default), auto (captured without the Bot), routine")
+    p.add_argument("--detail", "--summary", dest="detail", help="free text (secrets are redacted); --summary is an alias")
     p.add_argument("--ts", help="override timestamp (ISO 8601 UTC); default now")
 
 
+_OUTCOME_SYNONYMS = {
+    "success": "ok", "succeeded": "ok", "done": "ok", "complete": "ok", "completed": "ok", "pass": "ok", "passed": "ok",
+    "failed": "fail", "failure": "fail", "error": "fail",
+    "cancelled": "skipped", "canceled": "skipped", "skip": "skipped",
+    "blocked": "denied",
+}
+
+
+def _norm_outcome(value: str) -> str:
+    """argparse ``type=`` for --outcome. It runs before ``choices``, so common synonyms are accepted and stored canonically."""
+    v = str(value).strip().lower()
+    return _OUTCOME_SYNONYMS.get(v, v)
+
+
+def _source_field(args: argparse.Namespace) -> Optional[str]:
+    """--source as stored in a record: ``self`` is the default and is not written."""
+    source = getattr(args, "source", None)
+    return source if source and source != "self" else None
+
+
+def _task_start_seen(ledger: "Ledger", bot: str, task_id: str, ts: Optional[str] = None, days: int = 30) -> bool:
+    """True if the Bot's chains hold a task_start for ``task_id`` within ``days`` before ``ts`` (default: now)."""
+    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    try:
+        base = min(now, _dt.datetime.strptime(str(ts or "")[:10], "%Y-%m-%d"))
+    except ValueError:
+        base = now
+    since = (base - _dt.timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        return any(r.get("type") == "task_start" and r.get("task_id") == task_id for r in ledger.records(bot, since=since))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True  # unreadable history: stay quiet rather than warn wrongly
+
+
+def _record_verify(ledger: "Ledger", out, bot: str, res: Dict, record: Dict) -> int:
+    """`verify --record` bookkeeping. A refused append must not stop the other chains: report it and return 1."""
+    try:
+        ledger.append(bot, record)
+        return 0
+    except TailMismatchError as exc:
+        spool = os.path.relpath(exc.spool_path, ledger.root).replace(os.sep, "/")
+        res["record_error"] = "tail mismatch: verify record not written (spool: %s)" % spool
+        out.write("      - ALERT tail mismatch: verify record not written (spool: %s)\n" % spool)
+        sys.stderr.write("ALERT tail mismatch: %s\nspool: %s\nalert: %s\n" % (exc, exc.spool_path, exc.alert_path))
+        return 1
+
+
+class _VerifyJsonSink:
+    """Stand-in for stdout during `verify --json`: drops the text lines and keeps every verify() result."""
+
+    def __init__(self) -> None:
+        self.results: List[Dict] = []
+
+    def attach(self, ledger: "Ledger") -> "_VerifyJsonSink":
+        inner = ledger.verify
+
+        def collecting(*a, **kw):
+            res = inner(*a, **kw)
+            self.results.append(res)
+            return res
+
+        ledger.verify = collecting  # type: ignore
+        return self
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def _add_root_everywhere(parser: argparse.ArgumentParser) -> None:
+    """Let --root follow the subcommand too (`gblog status --root X`). SUPPRESS keeps the global value when it is absent."""
+    for action in list(parser._actions):
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        seen = set()
+        for child in action.choices.values():
+            if id(child) in seen:
+                continue
+            seen.add(id(child))
+            if "--root" not in child._option_string_actions:
+                child.add_argument("--root", default=argparse.SUPPRESS, help="ledger root (same as the global --root)")
+            _add_root_everywhere(child)
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """The full CLI parser. Every subcommand, at any depth, also accepts --root."""
+    p = _build_parser()
+    _add_root_everywhere(p)
+    return p
+
+
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gblog", description=__doc__.split("\n\n")[0])
     p.add_argument("--root", help="ledger root (default: $GBLOG_ROOT, /workspace/activity-log, or ~/activity-log)")
     p.add_argument("--version", action="version", version="gblog " + __version__)
@@ -2257,8 +2536,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", default="action", choices=RECORD_TYPES)
     s.add_argument("--action", default="other", choices=ACTION_KINDS, help="kind of action")
     s.add_argument("--target", help="what was acted on: host/path, command, connector.tool, file, recipient")
-    s.add_argument("--outcome", default="ok", choices=OUTCOMES)
-    s.add_argument("--source", choices=SOURCES, help="self (default), auto (captured without the Bot), routine")
+    s.add_argument("--outcome", default="ok", type=_norm_outcome, choices=OUTCOMES)
 
     s = sub.add_parser("approval", help="record an approval request and its decision")
     _add_common(s)
@@ -2267,13 +2545,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("task-end", help="close a task")
     _add_common(s)
-    s.add_argument("--outcome", default="ok", choices=OUTCOMES)
+    s.add_argument("--outcome", default="ok", type=_norm_outcome, choices=OUTCOMES)
 
     s = sub.add_parser("note", help="free-form note (why/decision context)")
     _add_common(s)
 
     s = sub.add_parser("verify", help="check hash chains")
     s.add_argument("--bot")
+    s.add_argument("--json", action="store_true", help="print the verify results as a JSON list (same exit codes)")
     s.add_argument("--all", action="store_true")
     s.add_argument("--record", action="store_true", help="append a verify record with the result")
     s.add_argument("--contains", action="append", default=[], metavar="HASH",
@@ -2295,6 +2574,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="per-bot summary (chains merged by alias; --chains for the raw per-chain view)")
     s.add_argument("--json", action="store_true")
     s.add_argument("--chains", action="store_true")
+    s.add_argument("--bot", help="only this Bot (slug, display name or alias)")
 
     s = sub.add_parser("tail", help="show recent records")
     s.add_argument("--bot")
@@ -2306,6 +2586,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--branch", help="branch to push (default: current)")
     s.add_argument("--no-push", action="store_true")
     s.add_argument("--allow-public", action="store_true", help="push even if the remote repository is public")
+    s.add_argument("--allow-unknown-visibility", action="store_true",
+                   help="push to a github.com remote even when its visibility could not be confirmed")
     s.add_argument("-m", "--message")
 
     s = sub.add_parser("archive", help="store a file (transcript, message body, artifact) content-addressed and chain its sha256")
@@ -2361,8 +2643,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--days", type=int, default=28)
     s.add_argument("--json", action="store_true")
     s.add_argument("--stdout", action="store_true", help="print only, do not write tuning/")
-    s.add_argument("--apply", metavar="ID", help="record that proposal ID was applied")
-    s.add_argument("--reject", metavar="ID", help="record that proposal ID was rejected")
+    decision = s.add_mutually_exclusive_group()
+    decision.add_argument("--apply", metavar="ID", help="record that proposal ID was applied")
+    decision.add_argument("--reject", metavar="ID", help="record that proposal ID was rejected")
+    s.add_argument("--summary", dest="detail", help="alias of --detail")
     s.add_argument("--detail", help="what was changed / why rejected")
     st = sub.add_parser("state", help="repair state/<bot>.json from the log (never rewrites a log line)")
     sts = st.add_subparsers(dest="what", required=True)
@@ -2449,13 +2733,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
 
-def _main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None, _sink: Optional["_VerifyJsonSink"] = None) -> int:
     args = build_parser().parse_args(argv)
     _validate_args(args)
     ledger = Ledger(args.root)
     out = sys.stdout
     if getattr(args, "bot", None) and args.cmd in ("task-start", "log", "approval", "task-end", "note", "archive", "capture"):
         args.bot = _resolve_bot(ledger, args.bot)
+
+    if args.cmd in ("approval", "note", "task-end") and not getattr(args, "task_id", None):
+        args.task_id = os.environ.get("GBLOG_TASK") or None  # same fallback `log` and `archive` already had
+    if args.cmd == "archive" and _source_field(args):
+        sys.stderr.write("warning: --source is not stored on archive records\n")
+    if args.cmd == "verify" and getattr(args, "json", False):
+        if _sink is None:
+            # Run the normal verify path once more with a sink as `out`, so text and JSON modes cannot drift apart.
+            sink = _VerifyJsonSink()
+            rc = _main(argv, _sink=sink)
+            out.write(json.dumps(sink.results, indent=2, ensure_ascii=False, default=str) + "\n")
+            return rc
+        out = _sink.attach(ledger)
 
     if args.cmd == "init":
         ledger.init()
@@ -2464,7 +2761,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "task-start":
         tid = args.task_id or uuid.uuid4().hex[:10]
-        ledger.append(args.bot, {"type": "task_start", "task_id": tid, "task": args.task, "detail": args.detail, "ts": args.ts})
+        ledger.append(args.bot, {"type": "task_start", "task_id": tid, "task": args.task, "detail": args.detail, "source": _source_field(args), "ts": args.ts})
         out.write(tid + "\n")
         return 0
 
@@ -2477,19 +2774,24 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "approval":
         outcome = {"allowed": "ok", "auto": "ok", "denied": "denied", "pending": "pending", "expired": "skipped"}[args.decision]
-        rec = ledger.append(args.bot, {"type": "approval", "task_id": args.task_id, "task": args.task, "target": args.target,
+        rec = ledger.append(args.bot, {"type": "approval", "task_id": args.task_id, "task": args.task, "target": args.target, "source": _source_field(args),
                                        "outcome": outcome, "decision": args.decision, "detail": args.detail, "ts": args.ts})
         out.write("%s #%d approval %s\n" % (rec["hash"][:12], rec["seq"], args.decision))
         return 0
 
     if args.cmd == "task-end":
-        rec = ledger.append(args.bot, {"type": "task_end", "task_id": args.task_id, "task": args.task, "outcome": args.outcome,
+        rec = ledger.append(args.bot, {"type": "task_end", "task_id": args.task_id, "task": args.task, "outcome": args.outcome, "source": _source_field(args),
                                        "detail": args.detail, "ts": args.ts})
         out.write("%s #%d task_end %s\n" % (rec["hash"][:12], rec["seq"], args.outcome))
+        if not args.task_id:
+            sys.stderr.write("warning: task-end without --task-id and $GBLOG_TASK unset closes no task\n")
+        elif not _task_start_seen(ledger, args.bot, args.task_id, args.ts):
+            sys.stderr.write("warning: task-end for task '%s' has no task-start in the last 30 days of %s; recorded anyway\n"
+                             % (args.task_id, args.bot))
         return 0
 
     if args.cmd == "note":
-        rec = ledger.append(args.bot, {"type": "note", "task_id": args.task_id, "task": args.task, "detail": args.detail, "ts": args.ts})
+        rec = ledger.append(args.bot, {"type": "note", "task_id": args.task_id, "task": args.task, "detail": args.detail, "source": _source_field(args), "ts": args.ts})
         out.write("%s #%d note\n" % (rec["hash"][:12], rec["seq"]))
         return 0
 
@@ -2541,7 +2843,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 detail = "; ".join(res["problems"]) or "%d records verified" % res["records"]
                 if res["ok"] and res.get("approved_breaks"):
                     detail = "%s; %s" % (pass_label(res["approved_breaks"]), detail)
-                ledger.append(b, {"type": "verify", "action": "other", "target": "chain", "outcome": "ok" if res["ok"] else "fail",
+                rc |= _record_verify(ledger, out, b, res, {"type": "verify", "action": "other", "target": "chain", "outcome": "ok" if res["ok"] else "fail",
                                   "detail": detail})
         for name, anchored_ts in gone:
             rc = 1
@@ -2613,20 +2915,24 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "status":
         rows = []
         groups = {c: [c] for c in ledger.bots()} if args.chains else ledger.groups()
-        week = (_dt.date.today() - _dt.timedelta(days=7)).isoformat()
+        if getattr(args, "bot", None):
+            want = ledger.canonical(args.bot)
+            groups = {k: v for k, v in groups.items() if (ledger.canonical(k) if args.chains else k) == want}
+        month = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
         for key, chains in groups.items():
             seq = sum(ledger.read_state(c).get("seq", 0) for c in chains)
             updated = max((ledger.read_state(c).get("updated") or "" for c in chains), default="")
             syncs = [ledger.read_state(c).get("last_sync") for c in chains if ledger.read_state(c).get("last_sync")]
             last_sync = max(syncs, key=lambda s: s.get("ts", "")) if syncs else None
-            recent = [r for c in chains for r in ledger.records(c, since=week)]
+            # chain_records reads exactly one chain directory; records(c) would merge every alias chain once per chain.
+            recent = [r for c in chains for r in ledger.chain_records(c, since=month)]
             open_tasks = set()
-            for r in sorted(recent, key=lambda r: r.get("ts", "")):
+            for r in sorted(recent, key=lambda r: str(r.get("ts") or "")):
                 if r.get("type") == "task_start":
                     open_tasks.add(r.get("task_id"))
                 elif r.get("type") == "task_end":
                     open_tasks.discard(r.get("task_id"))
-            today_n = sum(1 for r in recent if r.get("ts", "").startswith(today()))
+            today_n = sum(1 for r in recent if str(r.get("ts") or "").startswith(today()))
             head = ledger.read_state(key).get("head", GENESIS)[:12] if key in chains else "-"
             rows.append({"bot": key, "label": ledger.label(key) if not args.chains else key, "chains": chains, "seq": seq, "head": head,
                          "updated": updated or None, "today": today_n, "open_tasks": len(open_tasks), "last_sync": last_sync})
@@ -2655,6 +2961,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "tail":
+        if args.n <= 0:
+            return 0
         recs = ledger.records(ledger.canonical(args.bot) if args.bot else None)[-args.n:]
         for r in recs:
             bits = [r.get("ts", ""), ledger.label(r.get("bot", "")), "#%s" % r.get("seq"), r.get("type", "")]
@@ -2670,17 +2978,20 @@ def _main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "sync":
+        ledger.allow_unknown_visibility = bool(getattr(args, "allow_unknown_visibility", False))
         # Same resolver as the write commands. The default housekeeping chain "system" resolves quietly,
         # so strict alias mode cannot block backups.
         args.bot = ledger.canonical(args.bot) if args.bot == "system" else _resolve_bot(ledger, args.bot)
         try:
             res = sync(ledger, safe_name(args.bot), args.remote, args.branch, not args.no_push, args.message, args.allow_public)
         except subprocess.CalledProcessError as exc:
-            sys.stderr.write("git failed: %s\n" % (exc.stderr or exc.stdout).strip())
+            sys.stderr.write("git failed: %s\n" % redact((exc.stderr or exc.stdout or "").strip()))
             return 2
         out.write("commit %s%s%s\n" % (res["commit"], " pushed" if res["pushed"] else " (not pushed)", "" if not res["error"] else "\n  push error: " + res["error"]))
         if res["error"] and res["error"].startswith("refused:"):
             return 3
+        if res.get("tail_mismatch"):
+            return 4
         return 0 if (res["pushed"] or args.no_push) else 1
 
     if args.cmd == "export":
