@@ -59,6 +59,20 @@ jobs:
           PYTHONIOENCODING: ascii
         # --durations (Python 3.12+) lists the 15 slowest tests, so a slow test shows up in the log.
         run: python -m unittest discover -s tests --durations 15
+      - name: Benchmark script still runs (small ledger)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        # docs/DESIGN.md section 13 points readers at this script. unittest does not collect it,
+        # so it is run here on a small ledger. The timings it prints are not checked.
+        run: |
+          out="$(python tests/bench_large_ledger.py --records 500 --appends 5)"
+          printf '%s\n' "$out"
+          # Every timed gblog command reports its exit code; on the generated ledger all of them are 0.
+          bad="$(printf '%s\n' "$out" | grep ' exit ' | grep -v ' exit 0,' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::a benchmarked gblog command did not exit 0"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
       - name: CHANGELOG has a section for the reported version
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         run: |
@@ -67,7 +81,9 @@ jobs:
             echo "::error::could not read a version from ./bin/gblog --version"
             exit 1
           fi
-          if ! grep -q "^## \[${ver}\]" CHANGELOG.md; then
+          # The version is matched as fixed text at the start of a line: in a regular expression
+          # the dots of a version such as 0.6.1 would match any character.
+          if ! awk -v want="## [${ver}]" 'index($0, want) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
             newest="$(grep -m 1 -o '^## \[[^]]*\]' CHANGELOG.md || true)"
             echo "::error::gblog --version reports ${ver}, but CHANGELOG.md has no '## [${ver}]' section (its newest section is '${newest:-none}')"
             exit 1
@@ -139,10 +155,10 @@ jobs:
       GBLOG_ROOT: ${{ runner.temp }}/gblog-scripts
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck install.sh and bin/gblog
+      - name: shellcheck install.sh, bin/gblog and the example scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck install.sh bin/gblog
+          shellcheck install.sh bin/gblog examples/*.sh
       - name: Lint the embedded shell hook
         run: |
           # SC1007 is excluded on purpose: the hook's `HISTTIMEFORMAT= builtin history 1`

@@ -3,8 +3,8 @@
 #
 # It is not interactive and never asks a question. Steps, in this order:
 #
-#   1. gblog verify --all --record
-#   2. gblog anchor                    (also after a FAIL: anchoring is per chain)
+#   1. gblog verify --all --record     (the one step that re-hashes archived files)
+#   2. gblog anchor --skip-archives    (also after a FAIL: anchoring is per chain)
 #      then a "Chain heads <UTC date>" block with every full 64-hex head
 #   3. gblog report --date yesterday   (UTC day; written to reports/<date>.md)
 #   4. gblog sync --remote=<url>       (only when GBLOG_AUDIT_REMOTE is set)
@@ -180,8 +180,11 @@ run verify verify --all --record
 warnings="$(grep -c '^      ! ' "$tmp/verify.out")"
 sealed="$(grep -c '^PASS (' "$tmp/verify.out")"
 
-# -- 2. anchor (per chain; one FAIL chain never drops the others)
-run anchor anchor
+# -- 2. anchor (per chain; one FAIL chain never drops the others). Step 1 has just re-hashed
+#    every archived file, so anchor walks the chains without doing that a second time. A chain
+#    whose only problem is a damaged archived file is therefore FAIL in step 1 and OK here;
+#    the exit status of this script follows step 1.
+run anchor anchor --skip-archives
 print_heads
 
 # -- 3. report for yesterday (UTC). The Markdown goes to reports/, not to this output.
