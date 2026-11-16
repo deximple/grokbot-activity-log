@@ -70,6 +70,15 @@ def _writer(root, tag, count):
         ledger.append("ops", {"type": "note", "detail": "%s-%03d" % (tag, i)})
 
 
+def _anchorer(root, stop_path):
+    """Child process body: anchor the chain over and over while the writers run (importable for spawn)."""
+    ledger = gblog.Ledger(root)
+    deadline = time.time() + 240
+    while not os.path.exists(stop_path) and time.time() < deadline:
+        ledger.anchor(["ops"])
+        time.sleep(0.005)
+
+
 class SafetyBase(unittest.TestCase):
     def setUp(self):
         self.base = tempfile.mkdtemp(prefix="gblog-append-")
@@ -406,6 +415,8 @@ class RecoveryTest(SafetyBase):
         self.assertTrue(note["detail"].startswith("state rebuilt from log tail"), note["detail"])
         st = self.raw_state()
         self.assertEqual((st["seq"], st["head"]), (4, note["hash"]))
+        # the printed seq and head are what state holds after the note (R-13)
+        self.assertIn("rebuilt ops seq %d head %s" % (st["seq"], st["head"][:12]), out)
         rc, out, err = run(["verify", "--bot", "ops"], self.root)
         self.assertEqual(rc, 0, out + err)
         self.assertNotIn("      ! ", out)
@@ -417,13 +428,16 @@ class RecoveryTest(SafetyBase):
         self.assertEqual(rc, 0, out + err)
         st = self.raw_state()
         self.assertEqual(st["seq"], 5)
+        self.assertIn("rebuilt ops seq %d head %s" % (st["seq"], st["head"][:12]), out)
         self.assertEqual(st.get("last_sync"), last_sync)
 
         # state behind, pointing at a record that exists
         self.ledger.write_state("ops", {"seq": 2, "head": recs[1]["hash"]})
         rc, out, err = run(["state", "rebuild", "--bot", "ops"], self.root)
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.raw_state()["seq"], 6)
+        st = self.raw_state()
+        self.assertEqual(st["seq"], 6)
+        self.assertIn("rebuilt ops seq %d head %s" % (st["seq"], st["head"][:12]), out)
         res = self.ledger.verify("ops")
         self.assertTrue(res["ok"], res["problems"])
         rec = self.ledger.append("ops", {"type": "note", "detail": "after rebuild"})
@@ -645,6 +659,53 @@ class LockingTest(SafetyBase):
         details = sorted(rec["detail"] for _p, _n, rec in self.ledger.iter_records("ops"))
         self.assertEqual(details, sorted("w%d-%03d" % (n, i) for n in range(4) for i in range(50)))
 
+    def test_parallel_appends_anchor_and_verify(self):
+        """Writers, a process that anchors in a loop, and a verifier: no spurious 'anchored head' FAIL (R-05)."""
+        self.ledger.init()
+        self.ledger.append("ops", {"type": "note", "detail": "seed"})
+        stop = os.path.join(self.base, "stop-anchoring")
+        ctx = multiprocessing.get_context("spawn")
+        writers = [ctx.Process(target=_writer, args=(self.root, "a%d" % n, 40)) for n in range(3)]
+        anchorer = ctx.Process(target=_anchorer, args=(self.root, stop))
+        procs = writers + [anchorer]
+        for p in procs:
+            p.start()
+        failures = []
+        rounds = 0
+        deadline = time.time() + 300
+        try:
+            while any(p.is_alive() for p in writers) and time.time() < deadline:
+                res = self.ledger.verify("ops")
+                rounds += 1
+                if not res["ok"]:
+                    failures.append(res["problems"])
+                time.sleep(0.01)
+            for p in writers:
+                p.join(timeout=60)
+        finally:
+            with open(stop, "w", encoding="utf-8"):
+                pass
+            anchorer.join(timeout=60)
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=10)
+        self.assertEqual([p.exitcode for p in procs], [0, 0, 0, 0])
+        self.assertGreater(rounds, 0)
+        self.assertEqual(failures, [])
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["records"], 121)
+        hashes = {rec.get("hash") for _p, _n, rec in self.ledger.iter_records("ops")}
+        hist = os.path.join(self.root, "anchors", "ops.history.jsonl")
+        self.assertTrue(os.path.isfile(hist))
+        with open(hist, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh if line.strip()]
+        self.assertTrue(entries)
+        for entry in entries:
+            for head in entry["heads"]:
+                self.assertIn(head, hashes)
+
     def _assert_lock_free(self, bot="ops"):
         path = os.path.join(self.root, "state", bot + ".lock")
         with open(path, "a+") as fh:
@@ -760,6 +821,45 @@ class HygieneTest(SafetyBase):
         self.assertEqual(mode(bot_dir), 0o755)
         self.assertTrue(self.ledger.verify("ops")["ok"])
 
+        # R-14: lock files, anchors, spool and alert files are private as well
+        self.ledger.anchor(["ops"])
+        self.seed(2, "spooly")
+        self.break_state("spooly")
+        with self.assertRaises(gblog.TailMismatchError):
+            self.ledger.append("spooly", {"type": "note", "detail": "refused", "ts": stamp(5)})
+        pending = self.pending_spool("spooly")
+        self.assertEqual(len(pending), 1)
+        state_dir = os.path.join(self.root, "state")
+        anchors = os.path.join(self.root, "anchors")
+        days = os.path.join(anchors, "days")
+        spool = os.path.join(self.root, "spool", "spooly")
+        private = [
+            os.path.join(state_dir, "ops.lock"),
+            os.path.join(state_dir, "spooly.lock"),
+            os.path.join(state_dir, "spooly.alert.json"),
+            anchors,
+            days,
+            os.path.join(anchors, "ops.json"),
+            os.path.join(anchors, "ops.history.jsonl"),
+            os.path.join(self.root, "spool"),
+            spool,
+            os.path.join(spool, pending[0]),
+        ] + [os.path.join(days, name) for name in os.listdir(days)]
+        for path in private:
+            self.assertTrue(os.path.exists(path), path)
+            self.assertEqual(mode(path) & 0o077, 0, "%s is %o" % (path, mode(path)))
+        # ... and so is what a replay leaves behind
+        seq, head = self.ledger._tail_head("spooly")
+        self.ledger.write_state("spooly", {"seq": seq, "head": head})
+        res = self.ledger.spool_replay("spooly")
+        self.assertEqual(len(res["replayed"]), 1)
+        replayed = os.path.join(spool, "replayed")
+        resolved = [os.path.join(state_dir, f) for f in os.listdir(state_dir) if f.startswith("spooly.alert.resolved-")]
+        self.assertTrue(resolved)
+        for path in [replayed, os.path.join(replayed, pending[0])] + resolved:
+            self.assertTrue(os.path.exists(path), path)
+            self.assertEqual(mode(path) & 0o077, 0, "%s is %o" % (path, mode(path)))
+
     def test_implicit_init_notice(self):
         rc, out, err = run(["note", "--bot", "ops", "--detail", "x"], self.root)
         self.assertEqual(rc, 0, out + err)
@@ -796,6 +896,214 @@ class HygieneTest(SafetyBase):
         self.assertEqual(rc, 0, out + err)
         with open(path, "rb") as fh:
             self.assertEqual(fh.read(), before)
+
+
+# --------------------------------------------------------------------------- round 2 (R-03, R-07, R-13)
+FUTURE = "2099-01-01T00:00:00Z"
+
+
+class FutureTailTest(SafetyBase):
+    def test_future_tail_warns_in_verify_and_status(self):
+        self.seed(2, "calm")
+        self.ledger.append("skew", {"type": "note", "detail": "one minute ahead", "ts": "2024-06-01T12:01:00Z"})
+        self.ledger.append("ops", {"type": "note", "detail": "written while the clock said 2099", "ts": FUTURE})
+        warning = "last record is dated %s, in the future: new records are stamped with that time (see clock_regressed)" % FUTURE
+        with mock.patch.object(gblog, "now_iso", return_value="2024-06-01T12:00:00Z"):
+            res = self.ledger.verify("ops")
+            self.assertTrue(res["ok"], res["problems"])  # a warning, never a FAIL
+            self.assertIn(warning, res["warnings"])
+            for bot in ("calm", "skew"):  # the past, and a skew inside the 300 s tolerance
+                self.assertFalse([w for w in self.ledger.verify(bot)["warnings"] if "in the future" in w], bot)
+            rc, out, err = run(["verify", "--all"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("      ! " + warning, out)
+            self.assertEqual(out.count("in the future"), 1, out)
+
+            rc, out, err = run(["status", "--json"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            rows = {r["bot"]: r for r in json.loads(out)["bots"]}
+            self.assertEqual(rows["ops"]["future_tail"], FUTURE)
+            self.assertIsNone(rows["calm"]["future_tail"])
+            self.assertIsNone(rows["skew"]["future_tail"])
+            rc, out, err = run(["status"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("CLOCK ops: last record dated %s (future)" % FUTURE, out)
+            self.assertNotIn("CLOCK calm", out)
+            self.assertNotIn("CLOCK skew", out)
+
+    def test_clamp_warns_when_tail_is_future(self):
+        self.ledger.append("ops", {"type": "note", "detail": "future-dated", "ts": FUTURE})
+        warning = "warning: last record of ops is dated %s (future); this record is stamped with it" % FUTURE
+        err = io.StringIO()
+        with mock.patch.object(gblog, "now_iso", return_value="2026-03-01T09:00:00Z"), redirect_stderr(err):
+            rec = self.ledger.append("ops", {"type": "note", "detail": "after the future record"})
+        self.assertEqual(rec["ts"], FUTURE)  # the clamp rule itself is unchanged
+        self.assertEqual(rec["clock_regressed"], "2026-03-01T09:00:00Z")
+        self.assertIn(warning, err.getvalue())
+        # the same through the CLI; the exit code does not change
+        with mock.patch.object(gblog, "now_iso", return_value="2026-03-01T09:00:05Z"):
+            rc, out, cli_err = run(["note", "--bot", "ops", "--detail", "cli after the future record"], self.root)
+        self.assertEqual(rc, 0, out + cli_err)
+        self.assertIn(warning, cli_err)
+        self.assertEqual([os.path.basename(p) for p in self.ledger.log_files("ops")], ["2099-01-01.jsonl"])
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["records"], 3)
+
+        # a small step back (inside the 300 s tolerance) is clamped quietly
+        self.ledger.append("small", {"type": "note", "detail": "before the step", "ts": "2026-03-01T10:00:00Z"})
+        err = io.StringIO()
+        with mock.patch.object(gblog, "now_iso", return_value="2026-03-01T09:58:00Z"), redirect_stderr(err):
+            rec = self.ledger.append("small", {"type": "note", "detail": "two minutes back"})
+        self.assertEqual(rec["ts"], "2026-03-01T10:00:00Z")
+        self.assertEqual(rec["clock_regressed"], "2026-03-01T09:58:00Z")
+        self.assertNotIn("warning: last record of small", err.getvalue())
+
+
+class UnreadableStateTest(SafetyBase):
+    def test_unreadable_state_adopts_tail_like_missing(self):
+        recs = self.seed(2)
+        last, n = recs[-1], 2
+        cases = (("missing", None, "missing"), ("unparsable", "{not json", "unreadable"), ("not an object", "[1, 2]", "unreadable"))
+        for label, content, word in cases:
+            with self.subTest(state=label):
+                if content is None:
+                    os.remove(self.state_path())
+                else:
+                    with open(self.state_path(), "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rec = self.ledger.append("ops", {"type": "note", "detail": "after %s state" % label, "ts": stamp(n)})
+                self.assertEqual((rec["seq"], rec["prev"]), (n + 1, last["hash"]))
+                self.assertIn("notice: state/ops.json was %s; adopted the log tail (seq %d)" % (word, n), err.getvalue())
+                st = self.raw_state()
+                self.assertEqual((st["seq"], st["head"]), (n + 1, rec["hash"]))
+                last, n = rec, n + 1
+
+        # the CLI: exit 0 with the notice, never exit 4
+        with open(self.state_path(), "w", encoding="utf-8") as fh:
+            fh.write('"x"')
+        rc, out, err = run(["note", "--bot", "ops", "--detail", "cli after unreadable state"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("notice: state/ops.json was unreadable; adopted the log tail (seq %d)" % n, err)
+        self.assertEqual(self.pending_spool(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "state", "ops.alert.json")))
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["records"], n + 1)
+
+        # sync / capture go through update_state: same rule, same notice
+        synced = self.seed(2, "synced")
+        with open(self.state_path("synced"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        last_sync = {"ts": "2024-06-01T11:00:00Z", "commit": "abc1234", "pushed": False}
+        err = io.StringIO()
+        with redirect_stderr(err):
+            wrote = self.ledger.update_state("synced", {"last_sync": last_sync})
+        self.assertTrue(wrote)
+        st = self.raw_state("synced")
+        self.assertEqual((st["seq"], st["head"]), (2, synced[1]["hash"]))
+        self.assertEqual(st["last_sync"], last_sync)
+        self.assertIn("notice: state/synced.json was unreadable; adopted the log tail (seq 2)", err.getvalue())
+
+        # an unreadable state over a corrupt tail is still refused
+        self.seed(2, "torn")
+        with open(self.ledger.log_files("torn")[-1], "ab") as fh:
+            fh.write(b'{"torn": \n')
+        with open(self.state_path("torn"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        before = self.log_bytes("torn")
+        with self.assertRaises(gblog.TailMismatchError):
+            self.ledger.append("torn", {"type": "note", "detail": "must be spooled", "ts": stamp(9)})
+        self.assertEqual(self.log_bytes("torn"), before)
+
+
+class RecoveryPolishTest(SafetyBase):
+    def _archive_files(self):
+        found = []
+        for dirpath, _dirs, files in os.walk(os.path.join(self.root, "archive")):
+            found.extend(os.path.join(dirpath, f) for f in files)
+        return sorted(found)
+
+    def test_archive_past_ts_leaves_no_file(self):
+        self.ledger.append("ops", {"type": "note", "detail": "first", "ts": "2024-06-02T10:00:00Z"})
+        before = self.log_bytes()
+        with self.assertRaises(gblog.TimestampError):
+            gblog.archive_file(self.ledger, "ops", b"late evidence\n", "late.txt", ts="2024-06-01T10:00:00Z")
+        self.assertEqual(self._archive_files(), [])
+        self.assertEqual(self.log_bytes(), before)
+
+        src = os.path.join(self.work, "late.txt")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write("late evidence from the CLI\n")
+        rc, out, err = run(["archive", "--bot", "ops", "--file", src, "--ts", "2024-06-01T10:00:00Z"], self.root)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("earlier than the last record", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self._archive_files(), [])
+        self.assertEqual(self.log_bytes(), before)
+
+        # an append that fails for another reason does not leave an unreferenced file behind either
+        boom = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        with mock.patch.object(gblog.Ledger, "append", side_effect=boom):
+            with self.assertRaises(OSError):
+                gblog.archive_file(self.ledger, "ops", b"never chained\n", "x.txt", ts="2024-06-02T10:00:01Z")
+        self.assertEqual(self._archive_files(), [])
+
+        # a tail mismatch keeps the file: the spooled event still refers to it
+        self.seed(2, "held")
+        self.break_state("held")
+        with self.assertRaises(gblog.TailMismatchError):
+            gblog.archive_file(self.ledger, "held", b"spooled evidence\n", "held.txt")
+        kept = self._archive_files()
+        self.assertEqual(len(kept), 1, kept)
+        self.assertTrue(kept[0].endswith(".gz"), kept)
+
+        # a timestamp that is not earlier than the tail still archives normally
+        rec = gblog.archive_file(self.ledger, "ops", b"on time\n", "ok.txt", ts="2024-06-02T10:00:00Z")
+        self.assertTrue(os.path.isfile(os.path.join(self.root, rec["path"])))
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["archives"], 1)
+
+    def test_state_rebuild_noop_on_healthy_chain(self):
+        self.seed(3)
+        with open(self.state_path(), "rb") as fh:
+            state_before = fh.read()
+        log_before = self.log_bytes()
+        rc, out, err = run(["state", "rebuild", "--bot", "ops"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("state/ops.json already matches the log tail; nothing to do", out + err)
+        self.assertNotIn("rebuilt", out)
+        self.assertEqual(self.log_bytes(), log_before)  # no note appended
+        with open(self.state_path(), "rb") as fh:
+            self.assertEqual(fh.read(), state_before)
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["records"], 3)
+
+    def test_status_alert_without_logs_dir(self):
+        self.seed(2)
+        self.seed(1, "keeper")
+        self.break_state()
+        rc, _out, _err = run(["note", "--bot", "ops", "--detail", "refused"], self.root)
+        self.assertEqual(rc, 4)
+        shutil.rmtree(os.path.join(self.root, "logs", "ops"))
+
+        def check(spooled):
+            rc, out, err = run(["status"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("ALERT ops: tail mismatch since", out)
+            self.assertIn("(%d spooled)" % spooled, out)
+            self.assertIn("keeper", out)
+
+        check(1)  # the chain directory is gone; alert, spool and state remain
+        os.remove(self.state_path())
+        check(1)  # known only from the alert file and the spool
+        shutil.rmtree(os.path.join(self.root, "spool", "ops"))
+        check(0)  # known only from the alert file
 
 
 if __name__ == "__main__":

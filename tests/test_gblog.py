@@ -20,6 +20,25 @@ def run(argv, root):
     return rc, out.getvalue(), err.getvalue()
 
 
+# Same git isolation as tests/test_capture_sync.py: no credential prompt, no user or system git config.
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _isolate_git(test):
+    """Call from setUp: apply _GIT_ENV for this test and restore the previous environment afterwards."""
+    saved = {key: os.environ.get(key) for key in _GIT_ENV}
+    os.environ.update(_GIT_ENV)
+
+    def restore():
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    test.addCleanup(restore)
+
+
 class LedgerTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="gblog-test-")
@@ -133,6 +152,7 @@ class LedgerTest(unittest.TestCase):
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="gblog-cli-")
+        _isolate_git(self)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -305,6 +325,7 @@ class CaptureCoverageTuneTest(unittest.TestCase):
 class AliasArchiveSyncTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="gblog-v03-")
+        _isolate_git(self)
         self.ledger = gblog.Ledger(self.root)
 
     def tearDown(self):

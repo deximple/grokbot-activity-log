@@ -165,6 +165,33 @@ class SyncTest(_Base):
         self.assertEqual(self._commits(self.root), 1)
         self.assertEqual(self.vis_calls, [])  # --no-push never asks about visibility
 
+    def test_sync_commits_gitignore_and_untracks_locks(self):
+        # an older backup repository that already tracks a lock file and a capture snapshot (R-14)
+        lock = os.path.join(self.root, "state", "ops.lock")
+        snap = os.path.join(self.root, "state", "capture-files-ops.json")
+        self.assertTrue(os.path.exists(lock))
+        _write(snap, json.dumps({"path": "/workspace", "taken": "2026-01-01T10:00:00Z", "files": {}}))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".gitignore")))
+        self._git("init", "-q", self.root)
+        self._git("-C", self.root, "add", "-f", "--", "state/ops.lock", "state/capture-files-ops.json")
+        self._git("-C", self.root, "-c", "user.name=old", "-c", "user.email=old@localhost", "commit", "-q", "-m", "0.5 backup")
+        tracked = self._git("-C", self.root, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+        self.assertIn("state/ops.lock", tracked)
+        self.assertIn("state/capture-files-ops.json", tracked)
+        for attempt in (1, 2):
+            rc, out, err = run(["sync", "--no-push"], self.root)
+            self.assertEqual(rc, 0, out + err)
+            tracked = self._git("-C", self.root, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+            self.assertIn(".gitignore", tracked, attempt)
+            self.assertFalse([p for p in tracked if p.endswith(".lock")], tracked)
+            self.assertFalse([p for p in tracked if p.startswith("state/capture-files-")], tracked)
+            self.assertTrue(any(p.startswith("logs/ops/") for p in tracked), tracked)
+            self.assertIn("state/ops.json", tracked)
+            # untracked, not deleted
+            self.assertTrue(os.path.exists(lock))
+            self.assertTrue(os.path.exists(snap))
+        self.assertEqual(self.vis_calls, [])
+
     # ----------------------------------------------------------------------- I-12
     def test_unknown_visibility_github_refused(self):
         url = "https://github.com/someone/maybe-private.git"

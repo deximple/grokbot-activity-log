@@ -107,6 +107,35 @@ class ExtendedRedactionTest(unittest.TestCase):
         out = self.assertRedacted(outer, PW, ('"role": "tool"', "bob"))
         self.assertIn("password", out)
 
+    def test_json_keys_pwd_and_access_key(self):
+        # R-12: the JSON-key rules use the same word list as the documentation (pwd, access_key)
+        short = "s3cretPwd" + "99"
+        cases = [
+            ('{"SecretAccessKey": "%s", "n": 1}' % AWS_SECRET, AWS_SECRET, ('"SecretAccessKey"', '"n": 1')),
+            ('{"db_pwd": "%s", "user": "bob"}' % short, short, ('"db_pwd"', '"user": "bob"')),
+            ('{"aws_access_key":"%s"}' % AWS_SECRET, AWS_SECRET, ('"aws_access_key"',)),
+            ('{"access-key": "two words here", "n": 2}', "two words here", ('"access-key"', '"n": 2')),
+        ]
+        self._all(cases)
+        for text, _secret, _keep in cases:
+            with self.subTest(idempotent=text):
+                once = gblog.redact(text)
+                self.assertEqual(gblog.redact(once), once)
+        # the same keys inside a JSON string (escaped quotes), as tool output appears in a transcript
+        inner = json.dumps({"SecretAccessKey": AWS_SECRET, "db_pwd": short, "user": "bob"})
+        outer = json.dumps({"role": "tool", "text": inner})
+        self.assertIn('\\"SecretAccessKey\\"', outer)
+        self.assertIn('\\"db_pwd\\"', outer)
+        out = gblog.redact(outer)
+        for secret in (AWS_SECRET, short):
+            self.assertNotIn(secret, out)
+        self.assertIn("[REDACTED]", out)
+        self.assertIn('"role": "tool"', out)
+        self.assertIn("SecretAccessKey", out)
+        self.assertIn("db_pwd", out)
+        self.assertIn("bob", out)
+        self.assertEqual(gblog.redact(out), out)
+
     def test_cli_flags(self):
         self._all(FLAG_CASES)
 

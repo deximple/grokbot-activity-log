@@ -228,6 +228,66 @@ class TuneLoopTest(unittest.TestCase):
         self.assertEqual(self._one(self._proposals(other, days=60), "ops", "skill", key)["id"], pid)
         self.assertIn("--apply %s" % pid, self._markdown(other, days=60))
 
+    def test_rejected_stays_hidden_when_old_evidence_ages_out(self):
+        key = "fail:connector:quickbooks.sync"
+        self._seed_failures()  # three failures, six to four days ago
+        rc, _out, err = run(["tune", "--days", "28"], self.root)
+        self.assertEqual(rc, 0, err)
+        skill = self._one(self._proposals(), "ops", "skill", key)
+        pid = skill["id"]
+        self.assertEqual(skill["count"], 3)
+        rc, out, err = run(["tune", "--reject", pid, "--detail", "intended"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        decision = self.ledger.records("ops")[-1]
+        self.assertEqual((decision["type"], decision["outcome"], decision["target"]), ("tune", "skipped", pid))
+        self.assertEqual(decision["proposal"].get("count"), 3)  # the count at decision time is stored
+
+        def fail_again(times):
+            for _ in range(times):
+                self.ledger.append("ops", {"type": "action", "action": "connector", "target": "quickbooks.sync",
+                                           "outcome": "fail", "detail": "401 again"})
+
+        def current():
+            return self._one(self._proposals(days=3), "ops", "skill", key)
+
+        # A 3-day window no longer contains the evidence the rejection was based on. Two new failures
+        # are not "double": the reference is the stored count (3), not what is left in the window (0).
+        fail_again(2)
+        again = current()
+        self.assertEqual(again["id"], pid)
+        self.assertEqual(again["count"], 2)
+        self.assertEqual(again["status"], "rejected")
+        self.assertIs(again.get("hidden"), True)
+        md = self._markdown(days=3)
+        self.assertNotIn("--apply %s" % pid, md)
+        self.assertNotIn("**[%s]**" % pid, md)
+
+        fail_again(3)  # five is still short of twice three
+        again = current()
+        self.assertEqual(again["count"], 5)
+        self.assertIs(again.get("hidden"), True)
+        self.assertNotIn("--apply %s" % pid, self._markdown(days=3))
+
+        fail_again(1)  # six is double: it comes back
+        again = current()
+        self.assertEqual(again["count"], 6)
+        self.assertEqual(again["status"], "rejected")
+        self.assertIs(again.get("hidden"), False)
+        self.assertIn("--apply %s" % pid, self._markdown(days=3))
+        self.assertTrue(self.ledger.verify("ops")["ok"])
+
+    def test_already_applied_section_follows_a_blank_line(self):
+        self._seed_failures()
+        rc, _out, err = run(["tune", "--days", "28"], self.root)
+        self.assertEqual(rc, 0, err)
+        skill = self._one(self._proposals(), "ops", "skill", "fail:connector:quickbooks.sync")
+        rc, out, err = run(["tune", "--apply", skill["id"], "--detail", "added re-auth step to skill"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        lines = self._markdown().splitlines()
+        at = lines.index("### already applied")
+        self.assertGreater(at, 0)
+        self.assertEqual(lines[at - 1], "", lines[max(0, at - 3):at + 1])
+
     def test_bot_scoped_run_keeps_other_ids(self):
         self._seed_failures("ops", "quickbooks.sync")
         self._seed_failures("web", "stripe.charge")

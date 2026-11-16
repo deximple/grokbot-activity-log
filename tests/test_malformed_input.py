@@ -311,13 +311,18 @@ class MalformedArgsAndStateTest(MalformedBase):
                     rc, out, err = run(argv, self.root)
                     self.assertEqual(rc, 0, out + err)
                     self.assertNotIn("Traceback", err)
-                # an append either self-heals or is refused and spooled; it never crashes
+                # an unreadable state is treated like a missing one: the append adopts the log tail (R-07)
                 before = self.log_bytes(bot)
                 rc, out, err = run(["note", "--bot", bot, "--detail", "after bad state"], self.root)
-                self.assertIn(rc, (0, 4), out + err)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn("notice: state/%s.json was unreadable; adopted the log tail (seq 2)" % bot, err)
                 self.assertNotIn("Traceback", err)
                 self.assertTrue(self.log_bytes(bot).startswith(before))
+                self.assertEqual(sum(1 for _item in self.ledger.iter_records(bot)), 3)
+                self.assertEqual(self.spooled(bot), [])
                 # the supported repair works on an unreadable state
+                with open(self.state_path(bot), "w", encoding="utf-8") as fh:
+                    fh.write(content)
                 rc, out, err = run(["state", "rebuild", "--bot", bot], self.root)
                 self.assertEqual(rc, 0, out + err)
                 rc, out, err = run(["note", "--bot", bot, "--detail", "after rebuild"], self.root)
@@ -421,6 +426,281 @@ class MalformedArgsAndStateTest(MalformedBase):
         self.assertEqual(json.loads(first.decode("utf-8"))["seq"], 1)
         self.assertEqual(rc, 0, err)
         self.assertNotIn("Traceback", err)
+
+
+# --------------------------------------------------------------------------- round 2 (R-05, R-06, R-10)
+def run_cli(argv, root, encoding="utf-8"):
+    """Run the real CLI in a fresh process with a real stdout of the given encoding. Returns (rc, stdout, stderr) as text."""
+    env = dict(os.environ)
+    for key in ("GBLOG_TASK", "GBLOG_ROOT", "PYTHONUTF8"):
+        env.pop(key, None)
+    env["PYTHONIOENCODING"] = encoding
+    proc = subprocess.run([sys.executable, GBLOG_PY, "--root", root] + list(argv), stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=120)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+
+ALIASES_WARNING = ("warning: state/aliases.json is unreadable; names are not resolved and strict mode is off "
+                   "until it is restored")
+TEXT_FIELDS = ("type", "task_id", "task", "action", "target", "outcome", "detail", "source", "decision", "observed", "kind")
+
+
+class RemainingCrashPathsTest(MalformedBase):
+    def craft_chain(self, bot, prev_hash, overrides, first_seq=3):
+        """Append hash-valid records with odd field types straight to the log and move state to the last one."""
+        last = None
+        for i, over in enumerate(overrides):
+            fields = {"seq": first_seq + i, "ts": stamp(first_seq + i)}
+            fields.update(over)
+            raw = self.crafted(bot, prev_hash, **fields)
+            self.append_raw(bot, raw)
+            last = json.loads(raw.decode("utf-8"))
+            prev_hash = last["hash"]
+        self.ledger.write_state(bot, {"seq": last["seq"], "head": last["hash"], "updated": last["ts"]})
+        return last
+
+    def test_deeply_nested_line_fails_not_crash(self):
+        depth = 50000
+        cases = (
+            ("arrays", b"[" * depth + b"]" * depth),
+            ("objects", b'{"a":' * depth + b"1" + b"}" * depth),
+        )
+        for i, (label, raw) in enumerate(cases):
+            bot = "deep%d" % i
+            with self.subTest(case=label):
+                self.seed(bot)
+                self.append_raw(bot, raw)
+                self.assert_fail_not_crash(bot, line=3)
+                rc, out, err = run(["verify", "--bot", bot, "--strict"], self.root)
+                self.assertEqual(rc, 1, out[:2000] + err[-2000:])
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(len(self.ledger.records(bot)), 2)  # readers skip the line
+                rc, out, err = run(["report", "--date", DAY, "--stdout"], self.root)
+                self.assertEqual(rc, 0, err[-2000:])
+                self.assertNotIn("Traceback", err)
+                rc, out, err = run(["note", "--bot", bot, "--detail", "keep me"], self.root)
+                self.assertEqual(rc, 4, out + err[-2000:])
+                self.assertNotIn("Traceback", err)
+        rc, out, err = run(["verify", "--all"], self.root)
+        self.assertEqual(rc, 1, out[:2000] + err[-2000:])
+        self.assertNotIn("Traceback", err)
+
+    def test_corrupt_gzip_stream_fails_not_crash(self):
+        rec = gblog.archive_file(self.ledger, "ops", b"evidence that will be damaged\n", "e.txt", "artifact", ts=stamp(0))
+        full = os.path.join(self.root, rec["path"])
+        self.assertTrue(self.ledger.verify("ops")["ok"])
+        # a valid gzip header followed by bytes that are not a deflate stream (reserved block type): zlib.error on read
+        with open(full, "wb") as fh:
+            fh.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\xff" * 64)
+        res = self.ledger.verify("ops")  # must return, not raise
+        self.assertFalse(res["ok"], res)
+        self.assertTrue(any(p.startswith(rec["path"] + ": unreadable (") for p in res["problems"]), res["problems"])
+        rc, out, err = run(["verify", "--bot", "ops"], self.root)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("FAIL", out)
+        self.assertIn(rec["path"] + ": unreadable (", out)
+        self.assertNotIn("Traceback", err)
+        rc, out, err = run(["verify", "--all"], self.root)
+        self.assertEqual(rc, 1, out + err)
+        self.assertNotIn("Traceback", err)
+        rc, out, err = run(["verify", "--bot", "ops", "--skip-archives"], self.root)
+        self.assertEqual(rc, 0, out + err)
+
+    def test_status_survives_wrong_typed_state_fields(self):
+        good_sync = {"ts": "2024-06-01T11:00:00Z", "commit": "abc1234", "pushed": False}
+        cases = (
+            {"seq": "three", "head": 7, "updated": 5, "last_sync": "yesterday"},
+            {"seq": None, "head": None, "updated": ["x"], "last_sync": {"ts": 1, "commit": "abc1234"}},
+            {"seq": [1], "head": {"a": 1}, "updated": {"b": 2}, "last_sync": [1, 2]},
+            {"seq": {"n": 1}, "head": 12, "updated": 0, "last_sync": {"ts": "2024-06-01T11:00:00Z"}},
+        )
+        for i, state in enumerate(cases):
+            bot = "w%d" % i
+            self.seed(bot)
+            with open(self.state_path(bot), "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        self.seed("fine")
+        self.assertTrue(self.ledger.update_state("fine", {"last_sync": good_sync}))
+        for argv in (["status"], ["status", "--chains"], ["status", "--bot", "w0"], ["status", "--json", "--chains"]):
+            with self.subTest(argv=argv):
+                rc, out, err = run(argv, self.root)
+                self.assertEqual(rc, 0, out + err)
+                self.assertNotIn("Traceback", err)
+        rc, out, err = run(["status", "--json"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        rows = {r["bot"]: r for r in json.loads(out)["bots"]}
+        for i in range(len(cases)):
+            row = rows["w%d" % i]
+            self.assertEqual(row["seq"], 0, row)
+            self.assertEqual(row["head"], "genesis", row)
+            self.assertIsNone(row["updated"], row)
+            self.assertIsNone(row["last_sync"], row)
+        fine = rows["fine"]
+        self.assertEqual(fine["seq"], 2)
+        self.assertEqual(len(fine["head"]), 12)
+        self.assertEqual(fine["last_sync"], good_sync)
+
+    def test_surrogate_record_export_and_report(self):
+        recs = self.seed("ops")
+        line = json.dumps({"v": 1, "seq": 3, "ts": stamp(2), "bot": "ops", "type": "note", "detail": "lone \ud800 surrogate",
+                           "prev": recs[1]["hash"], "hash": "00" * 32}, sort_keys=True)  # ensure_ascii keeps it \ud800
+        self.assertIn("\\ud800", line)
+        self.append_raw("ops", line.encode("ascii"))
+        self.assertEqual(len(self.ledger.records("ops")), 3)
+        # a real stdout: the character that cannot be encoded is escaped, the command does not die
+        for encoding in ("utf-8", "ascii"):
+            for argv in (["export"], ["tail"], ["report", "--date", DAY, "--stdout"]):
+                with self.subTest(encoding=encoding, argv=argv):
+                    rc, out, err = run_cli(argv, self.root, encoding)
+                    self.assertEqual(rc, 0, err)
+                    self.assertNotIn("Traceback", err)
+                    self.assertIn("\\ud800", out)
+                    self.assertIn("valid 1", out)
+        # in-process, without --stdout: the report file itself must be writable
+        rc, out, err = run(["report", "--date", DAY], self.root)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Traceback", err)
+        with open(os.path.join(self.root, "reports", DAY + ".md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("lone \\ud800 surrogate", text)
+        self.assertIn("valid 1", text)
+
+    def test_non_ascii_label_on_ascii_stdout(self):
+        with redirect_stderr(io.StringIO()):
+            self.ledger.add_alias("chief", "B\u00fcro Chef", [])
+            self.ledger.append("chief", {"type": "note", "detail": "caf\u00e9 visit", "ts": stamp(0)})
+        for argv in (["status"], ["tail"], ["report", "--date", DAY, "--stdout"], ["alias", "list"], ["export"]):
+            with self.subTest(argv=argv):
+                rc, out, err = run_cli(argv, self.root, "ascii")
+                self.assertEqual(rc, 0, err)
+                self.assertNotIn("Traceback", err)
+        rc, out, err = run_cli(["status"], self.root, "ascii")
+        self.assertIn("B\\xfcro Chef(chief)", out)
+        rc, out, err = run_cli(["export"], self.root, "ascii")
+        self.assertIn("caf\\u00e9 visit", out)  # export stays valid JSON: ensure_ascii escaping
+
+    def test_non_string_text_fields_do_not_crash_readers(self):
+        recs = self.seed("ops")
+        odd = (
+            {"type": "task_start", "task": 123, "task_id": ["t", 1]},
+            {"type": "action", "action": "shell", "target": {"cmd": "ls"}, "detail": ["a", "b"], "outcome": "ok",
+             "task_id": ["t", 1]},
+            {"type": "action", "action": 9, "target": ["x"], "outcome": 1, "source": 3, "observed": 5, "detail": 7},
+            {"type": "approval", "target": 5, "decision": ["denied"], "outcome": "denied", "detail": {"k": "v"}},
+            {"type": "note", "detail": {"k": "v"}, "task_id": 77},
+            {"type": "task_end", "task_id": ["t", 1], "outcome": ["ok"]},
+            {"type": ["note"], "detail": "typed oddly", "kind": 4},
+        )
+        self.craft_chain("ops", recs[1]["hash"], odd)
+
+        # readers hand out text for the text fields (the JSON text of whatever was stored)
+        got = self.ledger.records("ops")
+        self.assertEqual(len(got), 2 + len(odd))
+        for rec in got:
+            for field in TEXT_FIELDS:
+                if field in rec:
+                    self.assertIsInstance(rec[field], str, "%s of #%s" % (field, rec.get("seq")))
+        by_seq = {r["seq"]: r for r in got}
+        self.assertEqual(json.loads(by_seq[3]["task"]), 123)
+        self.assertEqual(json.loads(by_seq[4]["detail"]), ["a", "b"])
+        self.assertEqual(json.loads(by_seq[4]["target"]), {"cmd": "ls"})
+        self.assertEqual(json.loads(by_seq[7]["task_id"]), 77)
+        self.assertEqual(by_seq[1]["detail"], "valid 1")  # ordinary records are untouched
+
+        commands = (
+            ["report", "--date", DAY, "--stdout"],
+            ["report", "--since", DAY, "--stdout"],
+            ["report", "--bot", "ops", "--date", DAY],
+            ["tail"],
+            ["tail", "--bot", "ops", "-n", "3"],
+            ["export"],
+            ["status"],
+            ["status", "--json"],
+            ["coverage", "--days", "36500"],
+            ["tune", "--days", "36500", "--stdout"],
+            ["tune", "--days", "36500", "--json", "--stdout"],
+        )
+        outputs = {}
+        for argv in commands:
+            with self.subTest(argv=argv):
+                rc, out, err = run(list(argv), self.root)
+                self.assertEqual(rc, 0, out[:2000] + err)
+                self.assertNotIn("Traceback", err)
+                outputs[" ".join(argv)] = out
+        rc, out, err = run(["verify", "--bot", "ops"], self.root)
+        self.assertIn(rc, (0, 1), out + err)
+        self.assertNotIn("Traceback", err)
+        # export stays a faithful dump of what is on disk
+        rows = {r["seq"]: r for r in (json.loads(line) for line in outputs.get("export", "").splitlines() if line.strip())}
+        self.assertEqual(rows[4]["detail"], ["a", "b"])
+        self.assertEqual(rows[4]["target"], {"cmd": "ls"})
+        self.assertEqual(rows[3]["task"], 123)
+
+    def test_skipped_lines_are_announced(self):
+        def build(root):
+            ledger = gblog.Ledger(root)
+            with redirect_stderr(io.StringIO()):
+                ledger.append("ops", {"type": "task_start", "task_id": "t1", "task": "Announced task", "ts": stamp(0)})
+                ledger.append("ops", {"type": "action", "task_id": "t1", "action": "shell", "target": "ls",
+                                      "outcome": "ok", "ts": stamp(1)})
+                ledger.append("ops", {"type": "task_end", "task_id": "t1", "outcome": "ok", "ts": stamp(2)})
+
+        build(self.root)
+        clean = os.path.join(self.base, "clean")
+        build(clean)
+        for raw in (b"{not json", b"[]"):
+            self.append_raw("ops", raw)
+        notice = "warning: skipped 2 unreadable line(s) in logs/ops; run gblog verify"
+        for argv in (["report", "--date", DAY, "--stdout"], ["export"], ["tail"]):
+            with self.subTest(argv=argv):
+                rc, out, err = run(list(argv), self.root)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(notice, err)
+                rc, clean_out, clean_err = run(list(argv), clean)
+                self.assertEqual(rc, 0, clean_out + clean_err)
+                self.assertEqual(out, clean_out)  # stdout is unchanged; only stderr speaks up
+                self.assertNotIn("unreadable line", clean_err)
+        pattern = r"warning: skipped \d+ unreadable line\(s\) in logs/%s; run gblog verify"
+        for argv in (["coverage", "--days", "36500"], ["tune", "--days", "36500", "--stdout"]):
+            with self.subTest(argv=argv):
+                rc, out, err = run(list(argv), self.root)
+                self.assertEqual(rc, 0, out + err)
+                self.assertRegex(err, pattern % "ops")
+        # status only reads the last 30 days, so it needs a damaged file from today
+        with redirect_stderr(io.StringIO()):
+            self.ledger.append("fresh", {"type": "note", "detail": "written just now"})
+        with open(self.ledger.log_files("fresh")[-1], "ab") as fh:
+            fh.write(b"{not json\n")
+        rc, out, err = run(["status"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertRegex(err, pattern % "fresh")
+        self.assertNotIn("Traceback", err)
+
+    def test_non_dict_aliases_warns_not_crashes(self):
+        self.seed("ops")
+        path = os.path.join(self.root, "state", "aliases.json")
+        for content in ("[]", '"x"', '{"bots": [], "strict": true}'):
+            with self.subTest(aliases=content):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+                count = sum(1 for _item in self.ledger.iter_records("ops"))
+                # a write still goes through (no event is lost) and the warning is printed once per process
+                rc, out, err = run_cli(["note", "--bot", "ops", "--detail", "still logged"], self.root)
+                self.assertEqual(rc, 0, out + err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(err.count(ALIASES_WARNING), 1, err)
+                self.assertEqual(sum(1 for _item in self.ledger.iter_records("ops")), count + 1)
+                for argv in (["status"], ["report", "--date", DAY, "--stdout"], ["verify", "--bot", "ops"]):
+                    rc, out, err = run_cli(argv, self.root)
+                    self.assertEqual(rc, 0, "%s: %s%s" % (argv, out, err))
+                    self.assertNotIn("Traceback", err)
+                # the damaged registry is never overwritten
+                for argv in (["alias", "add", "--slug", "new-bot", "--display", "New Bot"], ["alias", "strict", "on"]):
+                    rc, out, err = run_cli(argv, self.root)
+                    self.assertEqual(rc, 2, "%s: %s%s" % (argv, out, err))
+                    self.assertNotIn("Traceback", err)
+                    with open(path, encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), content)
 
 
 if __name__ == "__main__":
