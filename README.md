@@ -50,12 +50,17 @@ OK    ops                       5 records  head 3c4241c25eb5
     you pass to `gblog verify --bot <bot> --contains <hash>`. An emptied chain whose state file
     remains is FAIL. A whole chain deleted while its state file, anchor or anchor history remains is
     reported by `gblog verify --all`, and so is a directory under `logs/` whose name is not a valid
-    chain key.
+    chain key. A day-rollup entry under `anchors/days/` counts as such a witness too. A `*.jsonl`
+    entry that is not a regular file (a FIFO, a directory) is FAIL and is never opened. One damaged
+    chain never stops `verify --all` or `anchor` from reporting the others.
   - **Warned (`!` lines, exit code unchanged):** `state/<bot>.json` is missing, unreadable or reset to
     genesis. Truncation can then no longer be detected from state. Report these lines verbatim.
     Also warned: a last record dated in the future. Every later record is then stamped with that
-    time and lands in that day file, so daily reports stop showing the chain; `gblog status` prints
+    time and lands in that day file. `gblog report --date D` still lists such a record under the day
+    of its real wall-clock time (`clock_regressed`); `gblog status` prints
     a `CLOCK <chain>: last record dated <ts> (future)` line for it.
+    Also warned: every record that was appended while `state/<bot>.json` was missing or unreadable
+    (it carries `state_adopted`), so that warning does not disappear with the next append.
   - **Not detected:** truncation or a full rewrite by someone who also removes or rewrites state, the
     anchors and the git remote, when nobody kept a head off the computer. For that reason the daily
     routine posts every chain head in the conversation, and the backup remote should refuse
@@ -76,14 +81,17 @@ OK    ops                       5 records  head 3c4241c25eb5
     - JWTs;
     - `Bearer …` and `Authorization: Basic …`;
     - assignments whose name contains `token`, `secret`, `password`, `passwd`, `pwd`, `api_key`,
-      `access_key` or `private_key` (`password=…`, `DB_PASSWORD=…`, `AWS_SECRET_ACCESS_KEY=…`);
-    - JSON keys ending in those words (`"password": "…"`);
-    - flags such as `--password value` and `--token=…`;
+      `access_key` or `private_key` (`password=…`, `DB_PASSWORD=…`, `AWS_SECRET_ACCESS_KEY=…`),
+      also glued or in camelCase (`dbPassword=…`, `accessToken: …`, `PASSWORD2=…`);
+    - JSON keys ending in those words (`"password": "…"`), also in a Python dict repr
+      (`'password': '…'`);
+    - flags such as `--password value`, `--token=…` and `--db-password value`;
     - query parameters such as `?token=…`, `access_token`, `api_key`, `sig` and `code`;
     - `user:pass@` in URLs.
   - **Not covered:**
     - secrets with no recognisable name or shape (`mysql -phunter2`, "the password is hunter2");
     - names without a keyword (`CREDENTIAL=…`, `PASS=…`, cookies and session ids);
+    - JSON values that are not strings, and `curl -u user:pass`;
     - unquoted values shorter than 6 characters, or anything after the first space of an unquoted value;
     - vendor keys not listed above;
     - encoded or split secrets;
@@ -101,6 +109,11 @@ OK    ops                       5 records  head 3c4241c25eb5
   override with `--allow-public`). If the visibility of a github.com remote cannot be confirmed (rate limit, network
   error), the push is refused as well; override with `--allow-unknown-visibility`. Hosts other than GitHub cannot be
   checked and only warn. Each sync is itself logged (under bot `system` unless `--bot` is given).
+  A GitHub remote is recognised by its parsed host: `github.com`, `www.github.com`, `ssh.github.com`, any
+  `*.github.com`, on any port, and an ssh-config alias that resolves to one. `sync --remote` sets the first
+  `origin`; changing an existing one needs `--replace-remote` and is recorded in the ledger. `sync` commits
+  gblog's files even when a git ignore rule would hide them, runs no git hooks, and refuses to push when the
+  committed bytes differ from the files on disk (see [`SECURITY.md`](SECURITY.md)).
 - **Zero dependencies.** Grok Bot's docs warn that manually installed packages are replaceable;
   `gblog` is a single stdlib script and `install.sh` reinstalls it in seconds.
 
@@ -123,9 +136,15 @@ What capture does **not** see:
 
 - The shell hook is **interactive bash only; non-interactive tool shells and zsh are not captured**.
   It also skips a command identical to the one typed just before it.
+  The hook reads bash history, so a command that bash keeps out of history (a leading space with
+  `HISTCONTROL=ignorespace` or `ignoreboth`) is not captured. Only a plain `gblog …` command is skipped;
+  a command line that merely contains the word, or chains `gblog` with `;`, `&&` or `|`, is logged.
 - Browser capture stores **scheme://host/path and the page title** (first 120 characters, in `detail`).
   It stores no query string or fragment. After a missed run it resumes from its per-history marker.
   History files it could not read are reported as `, N unreadable`.
+- File capture compares against a snapshot in `state/capture-files-<bot>.json`. If that file is missing,
+  unreadable or was made for another `--path`, the run takes a new baseline and logs no changes. gblog says
+  so on its output line and on stderr; treat an unexpected new baseline as a gap in the evidence.
 - **On a shared computer, file and browser capture cannot attribute activity to one Bot.** All Bots
   share one browser profile and one `/workspace`, so every Bot that runs `capture browser` or
   `capture files` imports the same visits and file changes. Read per-Bot coverage for those two
@@ -195,9 +214,11 @@ gblog alias strict on       # refuse unknown names instead of warning
 - `alias add` also refuses a variant that is currently another Bot's alias (`'<variant>' is an alias of <other>; use --move`).
   Add `--move` to take it over on purpose; it is then removed from the other Bot. The comparison ignores letter case.
 - Reserved names cannot be used for a new chain or a new slug: `aliases`, anything starting with `capture-files-`,
-  and anything ending in `.alert`, `.lock` or `.tmp`. They would collide with gblog's own files under `state/`.
+  anything containing `.alert.resolved-`, and anything ending in `.alert`, `.lock` or `.tmp`. They would collide with gblog's own files under `state/`.
   `alias add` and every write command refuse them with exit 2 and write nothing. A chain that already exists
   under such a name keeps working.
+- Display names and variants may not contain control characters or line breaks (exit 2). They are printed
+  in reports and on terminals.
 - Name Bots by role, in English (`chief-of-staff`, `personal-assistant`, `editor`, …). The slug is the chain key
   and never changes; rename freely through `--display` and keep old names as `--alias`.
 - Unknown names log normally but warn on stderr (or are refused with `strict on`).
@@ -250,7 +271,7 @@ not run `state rebuild` or `spool replay` on its own; the operator decides.
 
 | `verify` flag | Effect |
 |---|---|
-| `--contains HASH` | Repeatable, needs `--bot`, full 64-hex. Exit 1 with `expected hash … not found in chain`. Pass yesterday's head to detect a rollback. |
+| `--contains HASH` | Repeatable, needs `--bot`, full 64-hex. Exit 1 with `expected hash … not found in chain`. Pass yesterday's head to detect a rollback. Chain-exact: only a record stored in the named chain and carrying its name counts, so a copy of the chain under another name does not satisfy the check. |
 | `--strict` | Also FAIL on a record whose `bot` differs from its chain, on a stray `*.jsonl` file name, and on any line that is not byte-for-byte the canonical serialisation (duplicate keys, reformatted). |
 | `--skip-archives` | Do not re-hash archived files; prints `(archives not checked)`. |
 | `--json` | Print the result objects (with `warnings`) as a JSON list. Exit codes are unchanged. |
@@ -267,6 +288,11 @@ no chain on disk prints `FAIL … no chain on disk for '<name>'` and exits 1. It
 - Routine runs pass `--source routine` to `task-start`, so they are not counted as manual repeats.
 - `report --date` accepts `today` and `yesterday`. Days are **UTC** days.
 - `--root` works before or after the subcommand. `status --bot NAME` filters.
+- `sync --remote URL` sets the backup remote the first time. To change an existing one, add `--replace-remote`;
+  without it gblog exits 2 and leaves `origin` alone.
+- Output meant for a terminal (`tail`, `status`, `spool list`, `alias list`, `verify` detail lines) never contains
+  raw control characters from records. An unexpected internal error is one `error:` line; set `GBLOG_DEBUG=1`
+  for the traceback.
 - Do not pass `--ts` unless you must. It has to be a real timestamp (`2026-11-16T09:30:00Z`), not earlier
   than the Bot's last record and not in the future; otherwise gblog exits 2 and writes nothing. Put a
   historical time in `--detail`.
@@ -311,8 +337,9 @@ Full field reference per record type: [`docs/DESIGN.md`](docs/DESIGN.md).
    Use a fine-grained token scoped to that one repo and enter it through the secure secret request, never in chat.
 5. Create the daily audit routine from `docs/routine-daily-audit.md` and the weekly tune routine from `docs/routine-weekly-tune.md`; save `skills/bot-tune/SKILL.md` as a skill too.
 6. Add Auto-review *Allow automatically* rules for `/workspace/activity-log` so routine runs don't stall on approvals. Use an allow-list, not one rule for every `gblog` command:
-   - **Allow automatically:** `gblog task-start`, `log`, `approval`, `note`, `task-end`, `archive`, `verify`, `anchor`, `report`, `status`, `tail`, `coverage`, `tune`, `capture`, and `sync` without any `--allow-*` flag.
-   - **Never allow automatically:** `gblog seal`, `gblog spool replay`, `gblog state rebuild`, `gblog alias`, and the `sync` override flags `--allow-public` and `--allow-unknown-visibility`. Each of these changes what the ledger means or where it may be pushed, and needs your explicit yes every time (see [`SECURITY.md`](SECURITY.md)).
+   - **Allow automatically:** `gblog task-start`, `log`, `approval`, `note`, `task-end`, `verify`, `anchor`, `report`, `status`, `tail`, `coverage`, `tune`, `capture browser` and `capture files`; `gblog archive --file` only for the transcript files the daily routine exports (scope the rule to that directory, for example `/workspace/transcripts`) and without `--no-redact`; `gblog sync` only without `--remote`, `--replace-remote` and any `--allow-*` flag.
+   - **Never allow automatically:** `gblog seal`, `gblog spool replay`, `gblog state rebuild`, `gblog alias`, `gblog capture shell-hook --install`, `gblog archive --no-redact`, `gblog archive --file` for any other path, and the `sync` flags `--remote`, `--replace-remote`, `--allow-public` and `--allow-unknown-visibility`. Each of these changes what the ledger means, what goes into it or where it may be pushed, and needs your explicit yes every time (see [`SECURITY.md`](SECURITY.md)).
+   - Why the list is narrow: an auto-allowed command needs no approval card, so a prompt-injected Bot can run it unseen. A blanket rule for `gblog` would let it archive any readable file verbatim and push the ledger to a remote of its choosing.
    - Everything else asks as usual. `gblog spool list` is read-only; add it if you want the daily routine to include its output without waiting for you.
 
 Run it anywhere else (laptop, CI, another agent) with `GBLOG_ROOT=/path ./bin/gblog …`.
@@ -349,7 +376,7 @@ gblog alias add --slug <slug> --display <name> --alias <old-variant> ...   # onc
 
 ### After upgrading from 0.5 or earlier
 
-Check these four things once. The operator does the last two; a Bot must not.
+Check these things once. The operator does items 3 to 6; a Bot must not.
 
 **1. Abbreviated flags.** New flags made some prefix abbreviations ambiguous, and argparse then exits 2.
 Spell the flag out in routines and scripts.
@@ -395,7 +422,7 @@ gblog spool replay --bot B        # nothing is left to replay; the alert becomes
 
 **4. Retired chains.** `gblog verify --all` FAILs for every name that has no `logs/<bot>` directory
 but still has a witness: `anchors/<bot>.json`, `anchors/<bot>.history.jsonl`, or (from 0.6.1) a
-`state/<bot>.json` that names a head. That is what the check is for, so a chain you removed on
+`state/<bot>.json` that names a head or an entry in a day rollup under `anchors/days/`. That is what the check is for, so a chain you removed on
 purpose keeps failing until you retire it explicitly.
 
 - The simplest way to retire a chain is to leave its logs in place. It keeps verifying and costs nothing.
@@ -405,6 +432,18 @@ purpose keeps failing until you retire it explicitly.
 cd "${GBLOG_ROOT:-/workspace/activity-log}"
 gblog note --bot ledger --detail "retired chain B: logs removed on <date>, last head <64-hex head from anchors/B.json>, reason: <why>"
 rm -f anchors/B.json anchors/B.history.jsonl state/B.json state/B.lock
+# from 0.6.1 the day rollups count as witnesses too: drop B from them
+python3 - B <<'PY'
+import glob, json, sys
+for path in glob.glob("anchors/days/*.json"):
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    kept = [c for c in doc.get("chains", []) if c.get("bot") != sys.argv[1]]
+    if len(kept) != len(doc.get("chains", [])):
+        doc["chains"] = kept
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+PY
 gblog verify --all
 gblog sync -m "retire chain B"
 ```
@@ -412,6 +451,18 @@ gblog sync -m "retire chain B"
 The note is then the only record of that chain on the computer, so put the full last head in it.
 Removing witnesses is also exactly what someone hiding a deletion would do; the heads posted by the
 daily routine and the git history of the backup remote are what let you tell the two apart.
+
+**5. Backup remote.** `gblog sync --remote <url>` no longer replaces an existing `origin`. A routine
+that passes the same `--remote` on every run keeps working. To move the backup, the operator runs
+`gblog sync --remote <new url> --replace-remote` once; the change is recorded in the ledger. If the
+remote is a GitHub repository written with a port, as `ssh.github.com` or through an ssh host alias,
+0.6.1 checks its visibility: a public or unconfirmed repository that 0.6.0 pushed to with a warning
+is now refused with exit 3.
+
+**6. Auto-review rule and shell hook.** Replace a blanket *Allow automatically* rule for `gblog`
+with the allow-list in setup step 6. An upgrade does not update the shell hook in `~/.bashrc`:
+remove the block between `# >>> gblog shell hook >>>` and `# <<< gblog shell hook <<<`, then run
+`gblog capture shell-hook --bot <slug> --install` again to get the stricter skip rule.
 
 ## Development
 

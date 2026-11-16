@@ -16,6 +16,11 @@ Implements the round-2 audit of 2026-11-16. The item ids in parentheses (R-01 �
 audit. The record format and the hash rule are unchanged. A healthy ledger prints the same
 `gblog verify --all` output as with 0.6.0.
 
+This release also implements the findings of two adversarial security reviews of that tree. Their
+ids are written `A:…` (review A) and `B:…` (review B). Findings that R-01 … R-15 had already closed
+are not repeated below: `A:H-1` and `B:H1` (R-01), `A:H-3` and `B:M6` (R-09), `A:M-5` (R-08),
+`B:L7` (R-06), and the crash paths of `A:M-3`, `B:M1` and `B:L1` covered by R-05, R-06 and R-10.
+
 ### Behaviour changes
 
 Read these before upgrading a routine or a script that branches on output or exit codes.
@@ -68,6 +73,85 @@ Read these before upgrading a routine or a script that branches on output or exi
   - `warning: ignoring logs/<dir> (invalid chain directory name); run gblog verify --all` (R-04);
   - `notice: state/<bot>.json was missing; adopted the log tail (seq <n>)` (R-07).
 - Tuning Markdown has an empty line before `### already applied` (R-11).
+- **`sync --remote` no longer replaces an existing `origin` (B:H3).** When `origin` already points
+  somewhere else, `gblog sync --remote <url>` exits 2 and changes nothing. Pass `--replace-remote`
+  to move the backup on purpose. Setting the first `origin`, or repeating the current URL, works as
+  before. Every change of `origin` is written to the ledger as a `sync` record with the old and the
+  new URL (credentials removed). In 0.6.0 any `gblog` caller could silently and permanently re-point
+  the backup to another host.
+- **More GitHub URLs are checked by the public-remote guard (A:H-2, B:H2).** A remote is classified
+  by its parsed host, not by a pattern over the URL text.
+  - `github.com`, `www.github.com`, `ssh.github.com` and any other `*.github.com` host count as
+    GitHub, on any port and with or without a trailing dot. An ssh host alias that `ssh -G`
+    resolves to such a host counts too. 0.6.0 pushed to `https://github.com:443/o/r.git` or
+    `ssh://git@ssh.github.com:443/o/r.git` after only a warning; these are now refused with exit 3
+    when the repository is public or its visibility cannot be confirmed.
+  - A GitHub URL that cannot be mapped to one repository (a gist, an unexpected path) counts as
+    unconfirmed visibility and is refused with exit 3.
+  - A URL that merely contains `github.com` in its path (`https://evil.example/x//github.com/o/r`)
+    is "another host". 0.6.0 looked up `o/r` on GitHub and could record the push as going to a
+    private repository.
+- **`sync` checks what it commits (B:M4).** gblog's own files are added even when a git ignore rule
+  would hide them, git hooks do not run, and after the commit the files under `logs/`, `anchors/`
+  and `archive/` are compared with the committed content. When they differ (a clean filter, an
+  index flag) `sync` reports an error, pushes nothing and exits 1. `sync` also creates
+  `<root>/.gitignore` when it is missing.
+- **`verify --contains` is chain-exact (B:M3).** A hash counts only when it belongs to a record
+  whose `bot` field equals the chain directory it is stored in. When `--bot` names a chain
+  directory, only that chain is searched. `verify --bot X` also FAILs when X itself left a witness
+  but `logs/X` is gone, even if an alias resolves the name to other chains. In 0.6.0 a copy of the
+  chain under another name, reached through `alias add`, satisfied the daily rollback check.
+- **A day rollup is a witness of a deleted chain (B:M2).** `verify --all` FAILs for a name that an
+  `anchors/days/*.json` rollup lists with more than zero records while `logs/<name>` is missing.
+  The README ("Upgrading") has the extra step for a chain that was retired on purpose.
+- **`anchor` no longer erases a witness (A:H-1).** For a chain directory without log files and
+  without a state file, `anchor` used to replace `anchors/<bot>.json` with a `records: 0` entry. An
+  existing anchor that recorded more than zero records is now left in place.
+- **`append` refuses values it used to store (A:M-2, B:L10).** A record whose text field (`type`,
+  `task_id`, `task`, `action`, `target`, `outcome`, `detail`, `source`, `decision`, `observed`,
+  `kind`, …) is not a string, or that contains `NaN` or `Infinity`, is refused before anything is
+  written (exit 2). `spool replay` leaves such a spooled event in place and lists it as skipped.
+  Records already on disk are unaffected.
+- **Symlinks are not followed on write (A:M-4, B:L8).** Day files, state, anchor, report, tuning,
+  snapshot, archive and lock files are opened without following a symlink at the final path
+  component, and temporary files get unique names. A planted symlink makes the command exit 2
+  instead of writing through it.
+- **A `*.jsonl` entry that is not a regular file is FAIL (B:L2).** A FIFO, directory or device in a
+  chain directory is reported by `verify` and never opened. It used to hang `append` (while holding
+  the lock) and `verify --all`.
+- **Archive records are checked more strictly (B:L4).** `verify` reports an `archive` record without
+  a `path` or a 64-hex `sha256`, and a path whose file name is not `<sha256>.gz`. Two records that
+  name the same path with different hashes are both checked. `archive` re-hashes an existing file
+  before it treats new content as "already stored", and rewrites it when it does not match.
+- `alias add` refuses a display name or variant that contains control characters or line breaks
+  (exit 2) (B:M7).
+- Bot names containing `.alert.resolved-` are reserved for new chains (A:L-5).
+- `spool replay` never appends a spooled event of type `break_ack`; the file is left in place and
+  listed as skipped (A:L-5).
+- `capture files` (A:L-2, B:L6):
+  - `--limit` below 1 exits 2;
+  - a run with more changes than `--limit` no longer forgets the changes it did not list;
+  - a new baseline (missing or unreadable snapshot, changed `--path`) is said on the output line
+    and on stderr instead of looking like "0 changes".
+- The shell hook skips only a plain `gblog …` command. A command line that merely contains the word
+  `gblog`, or chains it with `;`, `&`, `|` or a substitution, is logged. A command that starts with
+  `-` is logged instead of being dropped. A hook that is already installed is not updated; see
+  "Upgrading" in the README (A:L-2, B:L5).
+- `report --date D` also lists records whose `clock_regressed` value (the real wall-clock time)
+  falls on day D, so activity written after a future-dated record stays in the daily report
+  (A:M-6, B:L3).
+- A record that was appended while `state/<bot>.json` was missing or unreadable carries the new
+  field `state_adopted`, and `verify` warns about every such record. In 0.6.0 the "state missing"
+  warning disappeared with the first append (B:M8).
+- Terminal output (`tail`, `status`, `spool list`, `alias list`, `verify` problem and warning lines)
+  no longer contains raw control characters taken from records, file names or display names. Text
+  without control characters prints as before (A:L-1, B:M7).
+- New `!` warnings in `verify`: a non-string text field, a `ts` that is not in normalised form, a
+  non-standard number, a line with duplicate keys, a symlink among the chain's files, and a
+  `state_adopted` record. `--strict` turns all but the last into problems (A:M-2, A:M-4, A:L-5,
+  B:M7, B:M8, B:L10).
+- An unexpected internal error is printed as one `error:` line with a non-zero exit code. Set
+  `GBLOG_DEBUG=1` to see the traceback (A:M-3).
 
 ### Security
 
@@ -85,6 +169,39 @@ Read these before upgrading a routine or a script that branches on output or exi
   removed.
 - **Private files (R-14).** Lock files are created `0o600`; `state/` and `spool/<bot>/replayed/`
   are created `0o700`.
+- **Threat model (B, A:M-4).** `SECURITY.md` and `docs/DESIGN.md` now name two more adversary
+  positions: a prompt-injected Bot that can run only auto-approved `gblog` commands ("CLI-only"),
+  and the author of a backup tree that an auditor clones onto another computer. The README
+  allow-list for Auto-review is narrower: `sync --remote`, `--replace-remote`, `archive --no-redact`,
+  `archive --file` outside the transcript directory and `capture shell-hook --install` are never
+  auto-allowed.
+- **Backups cannot be redirected or blinded through `gblog` alone (B:H3, B:M4).** See "Behaviour
+  changes": `--replace-remote`, the recorded `origin` change, force-added files, disabled hooks and
+  the committed-content check.
+- **Public-remote guard (A:H-2, B:H2, A:L-5).** Besides the host parsing above: the `gh` lookup
+  always names github.com, so `GH_HOST` cannot redirect it, and an unexpected answer from the API
+  (a non-object body, a broken response) counts as unconfirmed visibility.
+- **One chain cannot hide the others (A:M-3, B:M1).** An unexpected error while one chain is
+  verified or anchored becomes a FAIL entry for that chain. `verify --all` and `anchor` continue
+  with the remaining chains.
+- **Redaction (A:M-1, B:M5, A:L-4, A:L-5, B:L9).** Added, with no pattern removed:
+  - names with a secret word glued in or in camelCase (`dbPassword=…`, `accessToken: …`,
+    `secretKey=…`, `PASSWORD2=…`, `APITOKEN=…`, `userpwd=…`);
+  - secret keys in a Python `dict` repr (`'password': '…'`);
+  - prefixed flags (`--db-password …`, `--client-secret …`, `--auth-token=…`);
+  - a PEM private-key block that was cut off before its `END` line. The PEM rule no longer takes
+    quadratic time on input with many `BEGIN` markers;
+  - the `sync -m` commit message;
+  - git error text and captured page titles are redacted before they are shortened, so a cut can
+    no longer leave part of a secret behind;
+  - archived text that is UTF-8 apart from stray invalid bytes is scanned, and those bytes are
+    stored unchanged. Content with a NUL byte is still stored unscanned (`scanned: false`).
+- **Untrusted text (A:L-1, B:M7).** Reports and tuning files also neutralise display names, chain
+  names and control characters (including ESC), not only `detail` and `target`.
+- `sync --remote` with a user name and password in an http(s) URL prints a warning: git stores the
+  URL in `.git/config` as written (B:L9).
+- `install.sh` no longer follows a redirect from an `https://` download URL to another scheme
+  (A:L-5).
 
 ### Added
 
@@ -93,6 +210,13 @@ Read these before upgrading a routine or a script that branches on output or exi
   whose logs are missing (`"missing": true`) (R-08).
 - `tune` records store `count` in the `proposal` snapshot (R-11).
 - In-memory record key `bot_field` (R-04).
+- `sync --replace-remote` (B:H3).
+- `capture files --record-baseline`: also append an `auto` note when a new baseline is taken
+  (A:L-2).
+- Record field `state_adopted` (`missing` or `unreadable`) (B:M8).
+- `GBLOG_DEBUG` environment variable (A:M-3).
+- `state/anchors.lock`, taken around the day-rollup merge of `gblog anchor` (A:L-3, B:L8).
+- `SECURITY.md`: "Auditing a clone of the backup" (A:M-4).
 
 ### Changed
 
@@ -106,6 +230,10 @@ Read these before upgrading a routine or a script that branches on output or exi
 - `task-end` looks for the matching `task-start` newest day first and stops at the first hit (R-13).
 - Atomic JSON writes use a per-process temporary file name (R-14).
 - Dead code and duplicate helpers were removed; behaviour is unchanged (R-15).
+- State, alias-registry, proposal, snapshot and archive writes use uniquely named temporary files
+  (A:L-3, B:L8).
+- `capture browser` saves its marker per history file and opens the copied database read-only
+  (A:L-2).
 
 ### Fixed
 
@@ -122,6 +250,18 @@ Read these before upgrading a routine or a script that branches on output or exi
   - an unusable browser-capture marker;
   - a `proposals.json` entry without `bot`.
 - Readers no longer skip unreadable lines without saying so (R-06).
+- Concurrency (A:L-3, B:L8, B:L11):
+  - two concurrent `seal` runs could both append a `break_ack`, a permanent FAIL. `seal` now checks
+    again under the bot lock immediately before the append;
+  - two concurrent `anchor` runs could lose each other's day-rollup entries;
+  - two concurrent `spool replay` runs could append the same spooled event twice;
+  - a write that fails part-way (for example `ENOSPC`) is rolled back to the size the file had
+    before the call, so it leaves no torn anchor-history line or log tail behind.
+- More crash paths (A:M-3, A:L-2, A:L-5). Each of these used to end in a traceback:
+  - a deeply nested `anchors/<bot>.json` or day rollup;
+  - a browser-history row with a non-text URL or title, or an out-of-range visit time. The same
+    rows were then imported again on every later run;
+  - an unexpected response body or a broken HTTP response during the visibility check.
 
 ### Documentation
 
@@ -129,6 +269,8 @@ Read these before upgrading a routine or a script that branches on output or exi
   were brought in line with the code (R-22 … R-25). In particular: exit 2 no longer claims that
   nothing was written, the Auto-review rule is an allow-list, and browser and file capture run in
   the weekly tune routine only.
+- Threat model, guarantees, non-guarantees, redaction lists and the private-remote policy were
+  updated for the security-review fixes above (`SECURITY.md`, `docs/DESIGN.md`, README).
 
 ## [0.6.0] - 2026-11-16
 
