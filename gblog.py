@@ -44,7 +44,7 @@ try:  # POSIX only; on other platforms we degrade to no locking.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 SCHEMA_VERSION = 1
 GENESIS = "genesis"
 
@@ -904,17 +904,6 @@ class Ledger:
         paths = (os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl"))
         return sorted(p for p in paths if os.path.isfile(p))
 
-    def irregular_logs(self, bot: str) -> List[str]:
-        """``*.jsonl`` entries of logs/<bot> that are not regular files, as root-relative paths.
-
-        They are never opened. ``verify`` reports each one as a problem."""
-        d = os.path.join(self.logs_dir, bot)
-        try:
-            names = sorted(f for f in os.listdir(d) if f.endswith(".jsonl"))
-        except OSError:
-            return []
-        return ["logs/%s/%s" % (bot, f) for f in names if not os.path.isfile(os.path.join(d, f))]
-
     def _state_path(self, bot: str) -> str:
         return os.path.join(self.state_dir, bot + ".json")
 
@@ -1592,14 +1581,16 @@ class Ledger:
             items.append((rel, lineno, rec))
         return items
 
-    def _chain_snapshot(self, bot: str, dup_lines: Optional[set] = None) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
+    def _chain_snapshot(self, bot: str, dup_lines: Optional[set] = None,
+                        paths: Optional[Iterable[str]] = None) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
         """Every non-blank log line of one chain as ``(rel, lineno, record, text)``, plus the log file names.
 
         ``text`` is the stripped line as written (None when it is not UTF-8). verify() calls this once,
         under the shared lock, and derives the walk, the layout findings and the hash set from it."""
         snap_lines: List[Tuple[str, int, Dict, Optional[str]]] = []
         log_names: List[str] = []
-        for path in self.log_files(bot):
+        # ``paths``: the regular log files verify() already found in its one directory scan
+        for path in (self.log_files(bot) if paths is None else paths):
             rel = os.path.relpath(path, self.root).replace(os.sep, "/")
             log_names.append(rel)
             with open(path, "rb") as fh:
@@ -1617,9 +1608,10 @@ class Ledger:
                     snap_lines.append((rel, lineno, rec, text))
         return snap_lines, log_names
 
-    def _file_findings(self, bot: str) -> Tuple[List[str], List[str]]:
-        """``(problems, warnings)`` about the kind of files one chain is made of.
+    def _file_findings(self, bot: str) -> Tuple[List[str], List[str], List[str]]:
+        """``(log paths, problems, warnings)`` from one ``os.scandir`` pass per directory of a chain.
 
+        Log paths: the regular ``*.jsonl`` files of logs/<bot>, sorted (the same list ``log_files`` returns).
         Problems: a ``*.jsonl`` entry under logs/<bot> that is not a regular file (FIFO, directory, device,
         dangling link). ``log_files`` leaves it out, so it is never opened.
         Warnings: symbolic links. gblog never creates one and refuses to write through one; in a ledger
@@ -1634,26 +1626,48 @@ class Ledger:
             if os.path.islink(path) and len(links) < _MAX_LAYOUT_FINDINGS:
                 links.append("%s: symbolic link (gblog does not write through one)" % rel(path))
 
-        def entries(d: str) -> List[str]:
+        def entries(d: str) -> List[Tuple[str, bool, bool]]:
+            # (name, is a symbolic link, is a regular file) of every entry of ``d``, sorted by name: one scandir pass
             try:
-                return sorted(os.listdir(d))
+                it = os.scandir(d)
             except OSError:
                 return []
+            found: List[Tuple[str, bool, bool]] = []
+            try:
+                for entry in it:
+                    try:
+                        found.append((entry.name, bool(entry.is_symlink()), bool(entry.is_file())))
+                    except OSError:
+                        found.append((entry.name, False, False))
+            except OSError:
+                pass
+            finally:
+                close = getattr(it, "close", None)
+                if close is not None:
+                    close()
+            return sorted(found)
 
         bot_dir = os.path.join(self.logs_dir, bot)
         link(bot_dir)
-        for name in entries(bot_dir):
+        paths: List[str] = []
+        for name, is_link, is_file in entries(bot_dir):
             path = os.path.join(bot_dir, name)
-            link(path)
-            if name.endswith(".jsonl") and not os.path.isfile(path) and len(problems) < _MAX_LAYOUT_FINDINGS:
+            if is_link and len(links) < _MAX_LAYOUT_FINDINGS:
+                links.append("%s: symbolic link (gblog does not write through one)" % rel(path))
+            if not name.endswith(".jsonl"):
+                continue
+            if is_file:
+                paths.append(path)
+            elif len(problems) < _MAX_LAYOUT_FINDINGS:
                 problems.append("%s: not a regular file" % rel(path))
         for path in (self._state_path(bot), self._anchor_file(bot), self._anchor_history_file(bot)):
             link(path)
         arch = os.path.join(self.archive_dir, bot)
         link(arch)
-        for name in entries(arch):
-            link(os.path.join(arch, name))
-        return problems, links
+        for name, is_link, _is_file in entries(arch):
+            if is_link and len(links) < _MAX_LAYOUT_FINDINGS:
+                links.append("%s: symbolic link (gblog does not write through one)" % rel(os.path.join(arch, name)))
+        return paths, problems, links
 
     # -- verify
     def verify(self, bot: str, strict: Optional[bool] = None, skip_archives: Optional[bool] = None) -> Dict:
@@ -1675,10 +1689,11 @@ class Ledger:
         # It is released before the walk, the archive re-hash and the return (seal_break appends right after verify).
         dup_lines: set = set()  # (file, line) of log lines in which a JSON object repeats a key
         with self.lock(bot, shared=True):
-            snap_lines, log_names = self._chain_snapshot(bot, dup_lines)
+            # One directory scan: the regular log files, the irregular entries and the symlink findings.
+            log_paths, odd_files, link_files = self._file_findings(bot)
+            snap_lines, log_names = self._chain_snapshot(bot, dup_lines, log_paths)
             raw_state_snapshot = self._load_state(bot)
             anchor_snapshot = self._anchor_snapshot(bot)
-            odd_files, link_files = self._file_findings(bot)
         items = [(rel, lineno, rec) for rel, lineno, rec, _text in snap_lines]
         problems: List[str] = []
         warnings: List[str] = []
@@ -2787,7 +2802,8 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
     Returns (warnings, strict_only_problems).
     Warnings: a record whose ``bot`` field is not the chain directory (swapped chains) and
     ``*.jsonl`` files that are not day files (they still take part in ordering).
-    Strict only: a raw line that is not exactly what gblog writes (duplicate keys, reformatting).
+    Strict only: a raw line that is not exactly what gblog writes (duplicate keys, reformatting), and a
+    ``ts`` string that is not in the normalised form ``YYYY-MM-DDTHH:MM:SSZ``.
     ``snap_lines`` are the ``(rel, lineno, record, text)`` tuples of ``Ledger._chain_snapshot``."""
     warnings: List[str] = []
     noncanonical: List[str] = []
@@ -2797,6 +2813,7 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
     mismatched = reformatted = 0
     mistyped = nonfinite = 0
     duplicated = 0
+    odd_ts = 0
     if not isinstance(dup_lines, (set, frozenset)):
         dup_lines = set(dup_lines)
     for rel, lineno, rec, text in snap_lines:
@@ -2837,6 +2854,12 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
                 reformatted += 1
                 if reformatted <= _MAX_LAYOUT_FINDINGS:
                     noncanonical.append("%s:%d: non-canonical line (duplicate keys or reformatted)" % (rel, lineno))
+            # Strict only: records written with a free-form --ts before 0.6 must not add lines to a default verify.
+            ts_value = rec.get("ts")
+            if isinstance(ts_value, str) and not _is_norm_ts(ts_value):
+                odd_ts += 1
+                if odd_ts <= _MAX_LAYOUT_FINDINGS:
+                    noncanonical.append("%s:%d: ts is not in normalised form" % (rel, lineno))
     if duplicated > _MAX_LAYOUT_FINDINGS:
         warnings.append("%d more line(s) with duplicate keys" % (duplicated - _MAX_LAYOUT_FINDINGS))
     if mistyped > _MAX_LAYOUT_FINDINGS:
@@ -2847,6 +2870,8 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
         warnings.append("%d more record(s) whose bot field does not match chain '%s'" % (mismatched - _MAX_LAYOUT_FINDINGS, bot))
     if reformatted > _MAX_LAYOUT_FINDINGS:
         noncanonical.append("%d more non-canonical line(s)" % (reformatted - _MAX_LAYOUT_FINDINGS))
+    if odd_ts > _MAX_LAYOUT_FINDINGS:
+        noncanonical.append("%d more record(s) whose ts is not in normalised form" % (odd_ts - _MAX_LAYOUT_FINDINGS))
     return warnings, noncanonical
 
 
@@ -3075,6 +3100,21 @@ def _sync_evidence(ledger: "Ledger") -> Tuple[List[str], Dict[str, Tuple[int, bo
     return forced, checked
 
 
+def _sync_ignored(root: str) -> Optional[set]:
+    """Untracked files under the ledger directories that a git ignore rule hides from ``git add -A``.
+
+    POSIX paths relative to the root. None when git cannot say; the caller then force-adds every
+    evidence file, as before. The committed-content check (``_sync_drift``) stays the backstop."""
+    try:
+        res = subprocess.run(["git", "-C", root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--",
+                              "logs", "anchors", "archive", "state", "spool", ".gitignore"], capture_output=True)
+    except OSError:
+        return None
+    if res.returncode != 0:
+        return None
+    return {raw.decode("utf-8", "replace") for raw in res.stdout.split(b"\0") if raw}
+
+
 def _git_blob_id(path: str, size: int, hexlen: int) -> Optional[str]:
     """git object id of the first ``size`` bytes of ``path`` stored as a blob (no filters). None if unreadable."""
     h = hashlib.sha256() if hexlen == 64 else hashlib.sha1()
@@ -3193,6 +3233,10 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     _git(root, "add", "-A", *add_paths)
     # Evidence files are also staged by name with -f, so an ignore rule cannot keep them out of the backup.
     # Failures here are not fatal: what did not reach the commit is found by _sync_drift below.
+    # Only what an ignore rule hides needs -f: `git add -A` above has staged everything else.
+    hidden = _sync_ignored(root)
+    if hidden is not None:
+        forced = [rel for rel in forced if rel in hidden]
     for start in range(0, len(forced), 200):
         _git(root, "add", "-f", "--", *forced[start:start + 200], check=False)
     # Lock files and file-capture snapshots are local scratch: untrack any that an older version committed.
@@ -3258,7 +3302,8 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
                 # redact first, then cut: a cut through `https://user:token@` would hide the secret from the rules
                 result["error"] = (redact((exc.stderr or exc.stdout or "").strip()) or "")[-400:]
     stamp = {"ts": now_iso(), "commit": sha, "pushed": result["pushed"]}
-    for b in ledger.bots():
+    # Valid chain directories only: an invalid one (logs/my bot) must not get a state or lock file of its own.
+    for b in ledger.valid_chains():
         # update_state never writes a genesis state over a chain whose state file is missing (that would brick appends).
         ledger.update_state(b, {"last_sync": dict(stamp)})
     return result
