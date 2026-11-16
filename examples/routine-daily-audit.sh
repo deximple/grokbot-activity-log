@@ -42,7 +42,7 @@ no_push="${GBLOG_AUDIT_NO_PUSH:-0}"
 audit_bot="${GBLOG_AUDIT_BOT:-}"
 
 # -- find gblog. A scheduler's PATH usually lacks ~/.local/bin, so that path is tried too.
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
+here="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
 gblog="${GBLOG_BIN:-}"
 if [ -z "$gblog" ]; then
   if command -v gblog >/dev/null 2>&1; then

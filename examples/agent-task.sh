@@ -111,7 +111,7 @@ esac
 [ -n "$title" ] || title="Run $name"
 
 home="${HOME:-}"
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
+here="$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || here=""
 gblog="${GBLOG_BIN:-}"
 if [ -z "$gblog" ]; then
   if command -v gblog >/dev/null 2>&1; then

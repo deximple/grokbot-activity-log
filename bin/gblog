@@ -5,12 +5,14 @@
 set -euo pipefail
 src="${BASH_SOURCE[0]}"
 while [ -L "$src" ]; do
-  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  dir="$(CDPATH='' cd -P -- "$(dirname "$src")" && pwd)"
   src="$(readlink "$src")"
   case "$src" in
     /*) ;;
     *) src="$dir/$src" ;;
   esac
 done
-repo="$(cd -P "$(dirname "$src")/.." && pwd)"
+# CDPATH is cleared for every `cd`: with an inherited CDPATH a relative path could resolve
+# to a same-named directory elsewhere, and `cd` would also print that directory.
+repo="$(CDPATH='' cd -P -- "$(dirname "$src")/.." && pwd)"
 exec python3 "$repo/gblog.py" "$@"

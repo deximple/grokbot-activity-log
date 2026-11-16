@@ -57,7 +57,22 @@ jobs:
           TZ: Asia/Seoul
           LC_ALL: C
           PYTHONIOENCODING: ascii
-        run: python -m unittest discover -s tests
+        # --durations (Python 3.12+) lists the 15 slowest tests, so a slow test shows up in the log.
+        run: python -m unittest discover -s tests --durations 15
+      - name: CHANGELOG has a section for the reported version
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          ver="$(./bin/gblog --version | cut -d' ' -f2)"
+          if [ -z "$ver" ]; then
+            echo "::error::could not read a version from ./bin/gblog --version"
+            exit 1
+          fi
+          if ! grep -q "^## \[${ver}\]" CHANGELOG.md; then
+            newest="$(grep -m 1 -o '^## \[[^]]*\]' CHANGELOG.md || true)"
+            echo "::error::gblog --version reports ${ver}, but CHANGELOG.md has no '## [${ver}]' section (its newest section is '${newest:-none}')"
+            exit 1
+          fi
+          echo "CHANGELOG.md has a section for gblog ${ver}"
       - name: Smoke test CLI
         env:
           GBLOG_ROOT: ${{ runner.temp }}/gblog-smoke
@@ -92,6 +107,20 @@ jobs:
           test -f "$GBLOG_ROOT/state/ci.json"
           ./bin/gblog verify --bot ci
           ./bin/gblog spool list
+          # archive, sync, file capture and tail on a second fresh root (the tamper check below keeps its own)
+          (
+            export GBLOG_ROOT="$RUNNER_TEMP/gblog-smoke-evidence"
+            printf 'evidence\n' | ./bin/gblog archive --bot ci --kind message --stdin --name smoke
+            ./bin/gblog verify --bot ci
+            ./bin/gblog sync --no-push
+            ./bin/gblog capture files --bot ci --path "$RUNNER_TEMP"
+            last="$(./bin/gblog tail -n 1 --bot ci)"
+            printf '%s\n' "$last"
+            case "$last" in
+              *" archive smoke"*) ;;
+              *) echo "tail -n 1 did not print the archive record"; exit 1 ;;
+            esac
+          )
           python3 - <<'PY'
           import glob, os
           f = glob.glob(os.environ["GBLOG_ROOT"] + "/logs/ci/*.jsonl")[0]
@@ -127,6 +156,24 @@ jobs:
           ln -s "../gblog-abs" "$T/sub/gblog-rel"
           "$T/gblog-abs" --version
           "$T/sub/gblog-rel" --version
+      - name: Launcher and installer ignore CDPATH
+        run: |
+          # /usr/bin and /usr/share exist, so an inherited CDPATH=/usr would send a relative `cd bin` or `cd share` there.
+          ( cd "$GITHUB_WORKSPACE" && CDPATH=/usr bin/gblog --version )
+          SRC="$PWD"
+          T="$(mktemp -d)"
+          mkdir -p "$T/home" "$T/work/bin" "$T/work/share"
+          # the launcher through a relative symlink, called by a relative path
+          ln -s "$SRC/bin/gblog" "$T/work/gblog-abs"
+          ln -s "../gblog-abs" "$T/work/bin/gblog-rel"
+          ( cd "$T/work" && CDPATH=/usr bin/gblog-rel --version )
+          # install.sh called by a relative path, with a relative prefix
+          cp "$SRC/install.sh" "$SRC/gblog.py" "$T/work/share/"
+          ( cd "$T/work" && HOME="$T/home" GBLOG_PREFIX=bin GBLOG_ROOT="$T/ledger" CDPATH=/usr bash share/install.sh ) > "$T/out.txt"
+          cat "$T/out.txt"
+          grep -qxF "installed $T/work/bin/gblog from local checkout" "$T/out.txt"
+          "$T/work/bin/gblog" --version
+          cmp "$SRC/gblog.py" "$T/work/bin/gblog"
       - name: Install from the checkout into a temp HOME
         run: |
           T="$(mktemp -d)"

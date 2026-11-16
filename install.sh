@@ -29,7 +29,8 @@ REPO_RAW="${REPO_RAW%/}"
 HERE=""
 SELF="${BASH_SOURCE[0]:-}"
 if [ -n "$SELF" ]; then
-  HERE="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" || HERE=""
+  # CDPATH is cleared so that a relative path cannot resolve to a same-named directory elsewhere.
+  HERE="$(CDPATH='' cd -- "$(dirname "$SELF")" 2>/dev/null && pwd)" || HERE=""
 fi
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
@@ -38,7 +39,7 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || {
   exit 1
 }
 mkdir -p "$PREFIX"
-PREFIX="$(cd "$PREFIX" && pwd)"
+PREFIX="$(CDPATH='' cd -- "$PREFIX" && pwd)"
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
