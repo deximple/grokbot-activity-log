@@ -263,6 +263,13 @@ def _future_ts(ts: object, now: Optional[str] = None) -> bool:
     return _ts_epoch(ts) - _ts_epoch(now or now_iso()) > _FUTURE_TAIL_SECONDS  # type: ignore[arg-type]
 
 
+def _past_ts_error(ts: str, bot: str, tail_ts: str) -> "TimestampError":
+    """The refusal for an explicit ``--ts`` that is earlier than the chain's last record (append and archive share it)."""
+    return TimestampError(
+        "--ts %s is earlier than the last record of %s (%s); omit --ts and put the original time in --detail"
+        % (ts, bot, tail_ts))
+
+
 def _die(message: str) -> None:
     """Usage/environment error: message on stderr, exit code 2 (callers still see SystemExit)."""
     sys.stderr.write("error: %s\n" % message)
@@ -321,9 +328,14 @@ def _safe_hash(record: Dict) -> Optional[str]:
         return None
 
 
+def _is_int(value: object) -> bool:
+    """True for a real int. ``bool`` is a subclass of int and does not count."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _fields_ok(rec: Dict, need_ts: bool = True) -> bool:
     seq = rec.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool):
+    if not _is_int(seq):
         return False
     if not isinstance(rec.get("hash"), str) or not isinstance(rec.get("prev"), str):
         return False
@@ -672,6 +684,11 @@ def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _days_ago(days: float, fmt: str = "%Y-%m-%d") -> str:
+    """The UTC time ``days`` days before now, formatted (default: the day, as in log file names)."""
+    return (_utcnow() - _dt.timedelta(days=days)).strftime(fmt)
+
+
 def _makedirs(path: str) -> None:
     """Create missing directories as 0o700, one level at a time. Existing ones are left as they are."""
     missing = []
@@ -844,60 +861,9 @@ def is_reserved(name: str) -> bool:
 
 
 # --------------------------------------------------------------------------- store
-class _ChainLines:
-    """The log lines of one chain for ``Ledger.verify``: bytes read under the bot lock, parsed on first use.
-
-    Iterating yields ``(rel, lineno, record, text)`` for every non-blank line, like ``Ledger._chain_snapshot``.
-    The bytes of a file are released as soon as that file is parsed. ``text`` (the stripped line as written)
-    is kept only with ``keep_text`` (verify --strict compares it with the canonical form); otherwise it is
-    None, so a default verify does not hold every line a second time."""
-
-    def __init__(self, raw_logs: List[Tuple[str, bytes]], dup_lines: Optional[set] = None, keep_text: bool = False):
-        self._raw: Optional[List[Tuple[str, bytes]]] = raw_logs
-        self._dup_lines = dup_lines
-        self._keep_text = keep_text
-        self._lines: Optional[List[Tuple[str, int, Dict, Optional[str]]]] = None
-
-    def __iter__(self):
-        if self._lines is None:
-            if self._raw is None:  # an earlier parse failed part-way: never hand out half a chain
-                raise RuntimeError("chain lines could not be parsed")
-            raw_logs, self._raw = self._raw, None
-            self._lines = self._parse(raw_logs)
-        return iter(self._lines)
-
-    def _parse(self, raw_logs: List[Tuple[str, bytes]]) -> List[Tuple[str, int, Dict, Optional[str]]]:
-        lines: List[Tuple[str, int, Dict, Optional[str]]] = []
-        repeated: List[bool] = []
-
-        def pairs(items):
-            obj = dict(items)
-            if len(obj) != len(items):
-                repeated.append(True)
-            return obj
-
-        for i in range(len(raw_logs)):
-            rel, data = raw_logs[i]
-            raw_logs[i] = (rel, b"")  # the bytes of a parsed file are not kept
-            # Split on LF only, exactly like iterating the file: line numbers and blank lines are the same.
-            for lineno, raw in enumerate(data.split(b"\n"), 1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                del repeated[:]
-                text: Optional[str] = None
-                try:
-                    text = raw.decode("utf-8")  # decoded once; a line that is not UTF-8 is a corrupt record
-                    rec = json.loads(text, object_pairs_hook=pairs)
-                except (ValueError, RecursionError):
-                    rec = None
-                if not isinstance(rec, dict):
-                    rec = {"_corrupt": True}
-                elif repeated and self._dup_lines is not None:
-                    self._dup_lines.add((rel, lineno))  # a JSON object in this line repeats a key
-                lines.append((rel, lineno, rec, text if self._keep_text else None))
-            del data
-        return lines
+# What gblog writes into <root>/.gitignore (``init`` and ``sync`` share it): lock files, temporary files and
+# file-capture snapshots are local scratch and are never committed.
+_GITIGNORE_BODY = "state/*.lock\n*.tmp\nstate/capture-files-*.json\n"
 
 
 class Ledger:
@@ -927,7 +893,7 @@ class Ledger:
         ignore = os.path.join(self.root, ".gitignore")
         if not os.path.exists(ignore):
             with _open_private(ignore, "w", encoding="utf-8") as fh:
-                fh.write("state/*.lock\n*.tmp\nstate/capture-files-*.json\n")
+                fh.write(_GITIGNORE_BODY)
 
     def ensure(self) -> None:
         if not all(os.path.isdir(d) for d in (self.logs_dir, self.state_dir, self.reports_dir, self.tuning_dir, self.archive_dir, self.anchors_dir, self.spool_dir)):
@@ -1000,7 +966,7 @@ class Ledger:
         if not (isinstance(last_sync, dict) and isinstance(last_sync.get("ts"), str) and isinstance(last_sync.get("commit"), str)):
             last_sync = None
         return {
-            "seq": seq if isinstance(seq, int) and not isinstance(seq, bool) else 0,
+            "seq": seq if _is_int(seq) else 0,
             "head": head if isinstance(head, str) else GENESIS,
             "updated": updated if isinstance(updated, str) else None,
             "last_sync": last_sync,
@@ -1612,9 +1578,7 @@ class Ledger:
             regressed = False
             if explicit_ts is not None:
                 if tail_ts and explicit_ts < tail_ts:
-                    raise TimestampError(
-                        "--ts %s is earlier than the last record of %s (%s); omit --ts and put the original time in --detail"
-                        % (explicit_ts, bot, tail_ts))
+                    raise _past_ts_error(explicit_ts, bot, tail_ts)
                 ts = explicit_ts
             else:
                 ts = wall
@@ -1659,22 +1623,6 @@ class Ledger:
                 state.pop("state_adopted", None)  # the record just written carries the marker now
             self.write_state(bot, state)
             return full
-
-    def _chain_lines(self, bot: str, dup_lines: Optional[set] = None,
-                     keep_text: bool = False) -> Tuple["_ChainLines", List[str]]:
-        """Read every log file of one chain as bytes: ``(lines, log file names)``.
-
-        verify() calls this under the shared bot lock, so the lock is held for the reads only. The lines
-        are parsed when ``lines`` is first iterated, which verify() does after it has released the lock.
-        ``dup_lines`` receives ``(file, line)`` of every line in which a JSON object repeats a key."""
-        raw_logs: List[Tuple[str, bytes]] = []
-        log_names: List[str] = []
-        for path in self.log_files(bot):
-            rel = os.path.relpath(path, self.root).replace(os.sep, "/")
-            log_names.append(rel)
-            with open(path, "rb") as fh:
-                raw_logs.append((rel, fh.read()))
-        return _ChainLines(raw_logs, dup_lines, keep_text), log_names
 
     def _chain_items(self, bot: str) -> List[Tuple[str, int, Dict]]:
         items = []
@@ -1956,7 +1904,7 @@ class Ledger:
             warnings.append(
                 "%s:%d: appended while state/%s.json was %s; truncation before seq %s cannot be ruled out from state"
                 % (rel, lineno, bot, how if how in ("missing", "unreadable") else "missing or unreadable",
-                   seq_n if isinstance(seq_n, int) and not isinstance(seq_n, bool) else "?"))
+                   seq_n if _is_int(seq_n) else "?"))
         if len(adopted_recs) > _MAX_ADOPTED_LINES:
             warnings.append("%d more record(s) appended while state/%s.json was missing or unreadable"
                             % (len(adopted_recs) - _MAX_ADOPTED_LINES, bot))
@@ -1966,7 +1914,7 @@ class Ledger:
             warnings.append(
                 "state/%s.json was re-created from the log tail at seq %s (it was %s): truncation before that record "
                 "cannot be ruled out from state"
-                % (bot, seq_n if isinstance(seq_n, int) and not isinstance(seq_n, bool) else "?",
+                % (bot, seq_n if _is_int(seq_n) else "?",
                    how if how in ("missing", "unreadable") else "missing or unreadable"))
         # Every head that was ever anchored must still be a record of this chain.
         hashes = {rec.get("hash") for _rel, _lineno, rec in items if isinstance(rec.get("hash"), str)}
@@ -2121,7 +2069,7 @@ class Ledger:
             if not data:
                 continue
             n = data.get("records")
-            if isinstance(n, int) and not isinstance(n, bool) and n > 0 \
+            if _is_int(n) and n > 0 \
                     and not os.path.isdir(os.path.join(self.logs_dir, bot)):
                 found.append((bot, str(data.get("ts"))))
         return found
@@ -2189,10 +2137,23 @@ class Ledger:
                         continue
                     name, n = c.get("bot"), c.get("records")
                     if (isinstance(name, str) and name and _chain_key(name) == name
-                            and isinstance(n, int) and not isinstance(n, bool) and n > 0 and gone(name)):
+                            and _is_int(n) and n > 0 and gone(name)):
                         rolled[name] = fname[:-5]
             for name in sorted(rolled):
                 found.append((name, "chain was anchored (day rollup %s) but logs/%s is missing" % (rolled[name], name)))
+        return found
+
+    def missing_chains(self) -> Dict[str, List[str]]:
+        """``{name: [problem lines]}`` for every chain whose logs/<name> directory is gone while a witness
+        survives: an anchor, an anchor history, a day rollup or a state head.
+
+        ``verify --all``, ``verify --bot`` and ``anchor`` all report from this one list: each name once,
+        the anchor line first, then the lines of ``orphan_witnesses``."""
+        found: Dict[str, List[str]] = {}
+        for name, anchored_ts in self.anchored_missing():
+            found.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
+        for name, text in self.orphan_witnesses():
+            found.setdefault(name, []).append(text)
         return found
 
     def missing_witnesses(self, name: str) -> List[str]:
@@ -2201,10 +2162,7 @@ class Ledger:
         Used by ``verify --bot NAME``: the chains an alias resolves NAME to cannot stand in for NAME itself."""
         if not name or _chain_key(name) != name or os.path.isdir(os.path.join(self.logs_dir, name)):
             return []
-        found = ["chain was anchored on %s but logs/%s is missing" % (ts, bot)
-                 for bot, ts in self.anchored_missing() if bot == name]
-        found.extend(text for bot, text in self.orphan_witnesses() if bot == name)
-        return found
+        return self.missing_chains().get(name, [])
 
     def seal_break(self, bot: str, descriptor: Dict, jay_approval_id: str, copy_fixture: bool = False) -> Dict:
         """Append one break_ack for an exact on-disk gap. Does not rewrite, quarantine, or rehash.
@@ -2485,7 +2443,7 @@ class Ledger:
                 # verify --all (anchored_missing) and the containment check can still use it.
                 kept_anchor = self.read_anchor(bot)
                 kept_records = kept_anchor.get("records") if kept_anchor else None
-                if not (isinstance(kept_records, int) and not isinstance(kept_records, bool) and kept_records > 0):
+                if not (_is_int(kept_records) and kept_records > 0):
                     self._atomic_json(self._anchor_file(bot), entry)
                 chains.append(entry)
                 continue
@@ -2540,21 +2498,14 @@ class Ledger:
         if bots is None:
             # A chain whose logs/<bot> directory is gone while a witness survives is reported, not skipped.
             # Its witness files (and its earlier rollup entries) are left exactly as they are.
-            lost: Dict[str, List[str]] = {}
-            for name, anchored_ts in self.anchored_missing():
-                lost.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
-            for name, text in self.orphan_witnesses():
-                lost.setdefault(name, []).append(text)
+            lost = self.missing_chains()
             if lost:
                 rollup["missing"] = [{"bot": name, "ok": False, "problems": lost[name]} for name in sorted(lost)]
         day = os.path.join(self.anchors_dir, "days", today() + ".json")
         # Merge by bot into today's rollup so `anchor --bot X` does not drop the other chains.
         merged = dict(rollup)
-        try:
-            with open(day, encoding="utf-8") as fh:
-                earlier = json.load(fh).get("chains")
-        except (OSError, ValueError, AttributeError, RecursionError):
-            earlier = None
+        day_doc = _read_json(day)  # None when missing, unparsable or not an object
+        earlier = day_doc.get("chains") if day_doc is not None else None
         if isinstance(earlier, list):
             mine = {c["bot"] for c in chains}
             kept = [c for c in earlier if isinstance(c, dict) and isinstance(c.get("bot"), str) and c["bot"] not in mine]
@@ -2890,9 +2841,7 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
         _tail_path, _tail = ledger._tail_record(bot)
         _tail_ts = _tail.get("ts") if _tail else None
         if _is_norm_ts(_tail_ts) and ts < _tail_ts:
-            raise TimestampError(
-                "--ts %s is earlier than the last record of %s (%s); omit --ts and put the original time in --detail"
-                % (ts, bot, _tail_ts))
+            raise _past_ts_error(ts, bot, _tail_ts)
     day = today(ts)
     rel = os.path.join("archive", bot, day, digest + ".gz")
     full = os.path.join(ledger.root, rel)
@@ -2984,7 +2933,7 @@ def verify_archives(ledger: "Ledger", records: Iterable[Dict], check: Optional[b
         # The record says how long the content is: reading stops one byte past that, so a file that
         # expands to far more (a gzip bomb) is a mismatch without being read to its end.
         size = r.get("bytes")
-        limit = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None
+        limit = size if _is_int(size) and size >= 0 else None
         try:
             found = _gunzip_sha256(full, limit)
         except (OSError, EOFError, zlib.error) as exc:  # zlib.error: corrupted deflate data inside a valid gzip header
@@ -3260,7 +3209,7 @@ def _sync_evidence(ledger: "Ledger") -> Tuple[List[str], Dict[str, Tuple[int, bo
     if not os.path.lexists(ignore):
         try:
             with _open_private(ignore, "w", encoding="utf-8") as fh:
-                fh.write("state/*.lock\n*.tmp\nstate/capture-files-*.json\n")
+                fh.write(_GITIGNORE_BODY)
         except OSError:
             pass
     forced: List[str] = []
@@ -3833,21 +3782,16 @@ def capture_files(ledger: "Ledger", bot: str, path: str, exclude: Iterable[str] 
     baseline_reason: Optional[str] = None  # why a new baseline is taken: first run / snapshot missing / unreadable / path changed
     if os.path.exists(snap_path):
         snap_rel = "state/" + os.path.basename(snap_path)
-        try:
-            with open(snap_path, encoding="utf-8") as fh:
-                snap = json.load(fh)
-            if not isinstance(snap, dict) or not isinstance(snap.get("files"), dict):
-                raise ValueError("not a snapshot")
-        except (OSError, ValueError, RecursionError):
+        snap = _read_json(snap_path)  # None when unreadable, unparsable or not an object
+        if snap is None or not isinstance(snap.get("files"), dict):
             baseline_reason = "snapshot unreadable"
             sys.stderr.write("notice: %s is unreadable; taking a new baseline (no changes logged this run)\n" % snap_rel)
+        elif snap.get("path") not in (None, path):
+            baseline_reason = "path changed"
+            sys.stderr.write("notice: capture path changed from %s to %s; taking a new baseline (no changes logged this run)\n"
+                             % (snap.get("path"), path))
         else:
-            if snap.get("path") not in (None, path):
-                baseline_reason = "path changed"
-                sys.stderr.write("notice: capture path changed from %s to %s; taking a new baseline (no changes logged this run)\n"
-                                 % (snap.get("path"), path))
-            else:
-                previous = snap["files"]
+            previous = snap["files"]
     if previous is None:
         if baseline_reason is None:
             # No snapshot although this chain already holds file-capture records: the snapshot was removed,
@@ -4144,8 +4088,8 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None,
     recent history: a change applied before it is left out of the effect table (and gets no
     ``revert`` proposal), because the records its metric needs are not all there."""
     now = now_iso()
-    since = (_utcnow() - _dt.timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    day_ago = (_utcnow() - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")  # a task open longer than this is stale
+    since = _days_ago(window_days, "%Y-%m-%dT%H:%M:%SZ")
+    day_ago = _days_ago(1, "%Y-%m-%dT%H:%M:%SZ")  # a task open longer than this is stale
     by_bot: Dict[str, List[Dict]] = {}
     for r in records:
         if r.get("type") in ("sync", "verify") or r.get("ts", "") < since:
@@ -4186,7 +4130,7 @@ def analyze(records: List[Dict], window_days: int, cov: Optional[Dict] = None,
                 recent = _ts_epoch(now) - _ts_epoch(status_ts) < _REJECT_HIDE_DAYS * 86400
                 snap = decision.get("proposal")
                 stored = snap.get("count") if isinstance(snap, dict) else None
-                if isinstance(stored, int) and not isinstance(stored, bool):
+                if _is_int(stored):
                     # The count recorded with the decision does not decay when old evidence leaves the window.
                     hidden = recent and len(evidence) < 2 * max(stored, 1)
                 else:
@@ -4479,7 +4423,7 @@ def tune_apply(ledger: "Ledger", pid: str, detail: Optional[str], reject: bool =
     if not isinstance(p.get("bot"), str) or not p["bot"].strip():
         raise ProposalsCorruptError("%s is corrupt" % os.path.relpath(path, ledger.root).replace(os.sep, "/"))
     keep = {k: p.get(k) for k in ("title", "category", "key", "metric", "baseline", "better", "window")}
-    if isinstance(p.get("count"), int) and not isinstance(p.get("count"), bool):
+    if _is_int(p.get("count")):
         keep["count"] = p["count"]  # evidence count at decision time (used to decide when a rejection resurfaces)
     return ledger.append(p["bot"], {"type": "tune", "action": "other", "target": pid, "outcome": "skipped" if reject else "ok",
                                     "detail": detail or ("rejected" if reject else "applied"), "proposal": keep})
@@ -4517,7 +4461,7 @@ def _source_field(args: argparse.Namespace) -> Optional[str]:
 
 def _task_start_seen(ledger: "Ledger", bot: str, task_id: str, ts: Optional[str] = None, days: int = 30) -> bool:
     """True if the Bot's chains hold a task_start for ``task_id`` within ``days`` before ``ts`` (default: now)."""
-    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    now = _utcnow().replace(tzinfo=None)
     try:
         base = min(now, _dt.datetime.strptime(str(ts or "")[:10], "%Y-%m-%d"))
     except ValueError:
@@ -4832,7 +4776,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.ts = parse_ts(ts)
         except ValueError:
             raise _UsageError("--ts must look like %s" % TS_HINT)
-        if _ts_epoch(args.ts) - _ts_epoch(now_iso()) > 300:
+        if _future_ts(args.ts):  # the same 300 s bound that verify and status use for a future-dated tail
             raise _UsageError("--ts %s is more than 300 seconds in the future" % args.ts)
     if args.cmd == "report" and args.date:
         if args.date == "today":
@@ -4981,10 +4925,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             invalid = ledger.invalid_chain_dirs()  # never handed to Ledger.verify: safe_name() would check another chain
             bots = [b for b in ledger.bots() if b not in invalid]
             # a chain that was anchored and then removed must not vanish silently
-            for name, anchored_ts in ledger.anchored_missing():
-                missing.setdefault(name, []).append("chain was anchored on %s but logs/%s is missing" % (anchored_ts, name))
-            for name, text in ledger.orphan_witnesses():
-                missing.setdefault(name, []).append(text)
+            missing = ledger.missing_chains()
             if not bots and not missing and not invalid:
                 if not as_json:
                     out.write("no bots logged yet under %s\n" % ledger.root)
@@ -5112,7 +5053,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         if getattr(args, "bot", None):
             want = ledger.canonical(args.bot)
             groups = {k: v for k, v in groups.items() if (ledger.canonical(k) if args.chains else k) == want}
-        month = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
+        month = _days_ago(30)
         today_day = today()  # evaluated once, not once per record
         for key, chains in groups.items():
             views = {c: ledger._state_view(c) for c in chains}  # one typed read of each chain's state
@@ -5312,7 +5253,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             return 0
 
     if args.cmd == "coverage":
-        since = (_utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
+        since = _days_ago(args.days)
         cov = coverage(ledger.canonicalize(ledger.records(ledger.canonical(args.bot) if args.bot else None, since=since)), args.window)
         if args.json:
             _write_json(out, {k: v for k, v in cov.items() if k != "unmatched"}, indent=2, ensure_ascii=True)
@@ -5333,11 +5274,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
             out.write("%s #%d tune %s %s\n" % (rec["hash"][:12], rec["seq"], rec["target"], rec["outcome"]))
             return 0
         bot = ledger.canonical(args.bot) if args.bot else None
-        since = (_utcnow() - _dt.timedelta(days=args.days)).strftime("%Y-%m-%d")
+        since = _days_ago(args.days)
         # Records are loaded from the start of the window or from 90 days ago, whichever is earlier.
         # Decisions count however old they are, so the `tune` records of older history are added
         # (found by a raw scan; only a line that contains "tune" is parsed).
-        start = min(since, (_utcnow() - _dt.timedelta(days=_TUNE_HISTORY_DAYS)).strftime("%Y-%m-%d"))
+        start = min(since, _days_ago(_TUNE_HISTORY_DAYS))
         loaded = ledger.records(bot, since=start)
         older = ledger.tune_history(bot, start)
         if older:
