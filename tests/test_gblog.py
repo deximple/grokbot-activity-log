@@ -13,11 +13,23 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 
+sys.path.insert(0, HERE)
+from _support import run as _support_run  # noqa: E402  (shared helper, round-3 W-20)
+
+
 def run(argv, root):
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        rc = gblog.main(["--root", root] + argv)
-    return rc, out.getvalue(), err.getvalue()
+    """Run the CLI in-process. SystemExit and every other exception propagate (tests here assert SystemExit)."""
+    return _support_run(argv, root, fold_exit=False)
+
+
+def _read_text(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _write_text(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 # Same git isolation as tests/test_capture_sync.py: no credential prompt, no user or system git config.
@@ -86,7 +98,7 @@ class LedgerTest(unittest.TestCase):
         path = self._log_path("ops")
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
-        open(path, "w", encoding="utf-8").write("\n".join([lines[0], lines[2]]) + "\n")
+        _write_text(path, "\n".join([lines[0], lines[2]]) + "\n")
         res = self.ledger.verify("ops")
         self.assertFalse(res["ok"])
         self.assertIn("broken chain", res["problems"][0])
@@ -187,8 +199,8 @@ class CliTest(unittest.TestCase):
         run(["note", "--bot", "ops", "--detail", "a"], self.root)
         run(["note", "--bot", "ops", "--detail", "b"], self.root)
         path = gblog.Ledger(self.root).log_files("ops")[0]
-        text = open(path, encoding="utf-8").read().replace('"detail":"a"', '"detail":"z"').replace('"detail": "a"', '"detail": "z"')
-        open(path, "w", encoding="utf-8").write(text)
+        text = _read_text(path).replace('"detail":"a"', '"detail":"z"').replace('"detail": "a"', '"detail": "z"')
+        _write_text(path, text)
         rc, out, _ = run(["verify", "--bot", "ops"], self.root)
         self.assertEqual(rc, 1)
         self.assertIn("FAIL", out)
@@ -241,14 +253,14 @@ class CaptureCoverageTuneTest(unittest.TestCase):
         rc = os.path.join(self.work, "bashrc")
         self.assertTrue(gblog.install_shell_hook("ops", rc))
         self.assertFalse(gblog.install_shell_hook("ops", rc))
-        self.assertEqual(open(rc).read().count(">>> gblog shell hook >>>"), 1)
+        self.assertEqual(_read_text(rc).count(">>> gblog shell hook >>>"), 1)
 
     def test_capture_files_diff(self):
-        open(os.path.join(self.work, "a.txt"), "w").write("1")
+        _write_text(os.path.join(self.work, "a.txt"), "1")
         res = gblog.capture_files(self.ledger, "ops", self.work)
         self.assertEqual(res["changes"], 0)
-        open(os.path.join(self.work, "a.txt"), "w").write("22")
-        open(os.path.join(self.work, "b.txt"), "w").write("x")
+        _write_text(os.path.join(self.work, "a.txt"), "22")
+        _write_text(os.path.join(self.work, "b.txt"), "x")
         res = gblog.capture_files(self.ledger, "ops", self.work)
         self.assertEqual(res["changes"], 2)
         recs = self.ledger.records("ops")
@@ -447,7 +459,8 @@ class AliasArchiveSyncTest(unittest.TestCase):
         full = os.path.join(self.root, rec["path"])
         self.assertTrue(os.path.exists(full))
         import gzip
-        stored = gzip.open(full, "rb").read()
+        with gzip.open(full, "rb") as fh:
+            stored = fh.read()
         self.assertNotIn(b"abcdef123456", stored)
         self.assertIn(b"[REDACTED]", stored)
         self.assertEqual(rec["sha256"], gblog.hashlib.sha256(stored).hexdigest())

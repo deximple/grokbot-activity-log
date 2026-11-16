@@ -23,11 +23,13 @@ _SPEC.loader.exec_module(_FIXTURE)
 COMMITTED = os.path.join(HERE, "fixtures", "kim-biseo-break")
 
 
+sys.path.insert(0, HERE)
+from _support import run as _support_run  # noqa: E402  (shared helper, round-3 W-20)
+
+
 def run(argv, root):
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        rc = gblog.main(["--root", root] + argv)
-    return rc, out.getvalue(), err.getvalue()
+    """Run the CLI in-process. SystemExit and every other exception propagate to the test."""
+    return _support_run(argv, root, fold_exit=False)
 
 
 def _copy_fixture(dest):

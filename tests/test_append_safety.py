@@ -30,29 +30,8 @@ import gblog  # noqa: E402
 TS_ERROR = "error: --ts must look like 2026-11-16T09:30:00Z"
 
 
-def run(argv, root):
-    """Run the CLI in-process. An uncaught exception is rendered like the real CLI would (traceback, exit 1)."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(["--root", root] + list(argv))
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-        except Exception:  # pragma: no cover - only on a regression
-            traceback.print_exc(file=err)
-            rc = 1
-    return rc, out.getvalue(), err.getvalue()
-
-
-def stamp(n, day="2024-06-01"):
-    return "%sT10:%02d:%02dZ" % (day, n // 60, n % 60)
+sys.path.insert(0, HERE)
+from _support import run, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
 
 
 def _utc_now():
@@ -135,10 +114,12 @@ class SafetyBase(unittest.TestCase):
 # --------------------------------------------------------------------------- I-04
 class TimestampTest(SafetyBase):
     def test_ts_traversal_rejected(self):
-        stray = "/tmp/x.jsonl"
+        # a per-run name: two test runs on one host never probe the same path
+        probe = os.path.join(tempfile.gettempdir(), "gblog-ts-probe-%d-%s" % (os.getpid(), os.urandom(4).hex()))
+        stray = probe + ".jsonl"
         stray_existed = os.path.exists(stray)
         try:
-            for bad in ("/tmp/x", "../../../a", "yesterday"):
+            for bad in (probe, "../../../a", "yesterday"):
                 with self.subTest(ts=bad):
                     rc, out, err = run(["note", "--bot", "ops", "--detail", "x", "--ts", bad], self.root)
                     self.assertEqual(rc, 2, out + err)

@@ -37,49 +37,11 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 GIT = shutil.which("git")
-GIT_ENV = {
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_ALLOW_PROTOCOL": "file",
-}
+sys.path.insert(0, HERE)
+from _support import GIT_ENV, run, run_raw, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
 DAY = "2024-06-01"
 # every chain of the Bot registered by CliBase.seed_variants()
 VARIANTS = ("ChiefOfStaff", "chief-of-staff", "cos", "cos-primary")
-
-
-def _invoke(argv):
-    """Run the CLI in-process. SystemExit is folded into the return code; a crash is rendered like the real CLI would."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(list(argv))
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-        except Exception:  # pragma: no cover - only on a regression
-            traceback.print_exc(file=err)
-            rc = 1
-    return rc, out.getvalue(), err.getvalue()
-
-
-def run(argv, root):
-    return _invoke(["--root", root] + list(argv))
-
-
-def run_raw(argv):
-    """Like run(), but without a leading --root (for the --root-after-the-subcommand tests)."""
-    return _invoke(argv)
-
-
-def stamp(n, day=DAY):
-    return "%sT10:%02d:%02dZ" % (day, n // 60, n % 60)
 
 
 def days_ago(days, hour=9, minute=0):
@@ -669,8 +631,108 @@ class AgentErgonomicsTest(CliBase):
         # an unknown bot is still exit 1 and still a JSON list
         rc, out, err = run(["verify", "--bot", "nosuchbot", "--json"], self.root)
         self.assertEqual(rc, 1, out + err)
-        self.assertIsInstance(json.loads(out), list)
         self.assertNotIn("Traceback", err)
+        entries = json.loads(out)
+        self.assertIsInstance(entries, list)
+        self.assertEqual(len(entries), 1, entries)
+        entry = entries[0]
+        self.assertEqual(entry["bot"], "nosuchbot")
+        self.assertIs(entry["ok"], False)
+        self.assertEqual(entry["records"], 0)
+        self.assertIsNone(entry["head"])
+        self.assertIs(entry["missing"], True)
+        self.assertEqual(entry["problems"], ["no chain on disk for 'nosuchbot'"])
+        self.assertEqual(entry["warnings"], [])
+
+
+# --------------------------------------------------------------------------- N-13 / R-16 (round-3 W-18)
+import subprocess  # noqa: E402  (only the sync abbreviation test needs it)
+
+
+class AbbreviationTest(CliBase):
+    """Prefix abbreviations of flags: the ambiguous ones exit 2 and write nothing; the documented short forms still work."""
+
+    def test_abbreviations(self):
+        elsewhere = os.path.join(self.base, "elsewhere")
+        cases = [
+            ["verify", "--bot", "ops", "--r"],                                   # --record / --root
+            ["sync", "--no-push", "--r", elsewhere],                             # --remote / --replace-remote / --root
+            ["sync", "--no-push", "--re", elsewhere],                            # --remote / --replace-remote
+            ["sync", "--no-push", "--a"],                                        # --allow-public / --allow-unknown-visibility
+            ["sync", "--no-push", "--al"],
+            ["sync", "--no-push", "--allow"],
+            ["tune", "--r", "abcd1234"],                                         # --reject / --root
+            ["tune", "--s"],                                                     # --stdout / --summary
+            ["capture", "shell-hook", "--bot", "ops", "--r", elsewhere],         # --rc / --root
+            ["archive", "--bot", "ops", "--s"],                                  # --stdin / --source / --summary
+            ["log", "--bot", "ops", "--action", "shell", "--target", "ls", "--s", "auto"],  # --source / --summary
+        ]
+        rc, helptext, err = run(["capture", "files", "--help"], self.root)
+        self.assertEqual(rc, 0, helptext + err)
+        if "--record-baseline" in helptext:
+            # once `capture files` has --record-baseline, --r no longer means --root there
+            cases.append(["capture", "files", "--bot", "ops", "--path", self.work, "--r", elsewhere])
+        for argv in cases:
+            with self.subTest(ambiguous=argv):
+                rc, out, err = run(argv, self.root)
+                self.assertEqual(rc, 2, out + err)
+                self.assertIn("ambiguous option", err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(out, "")
+        self.assertFalse(os.path.exists(self.root), "an ambiguous flag must not create the ledger")
+        self.assertFalse(os.path.exists(elsewhere))
+
+        # the documented short forms still parse as the flag they abbreviate
+        self.ledger.append("ops", {"type": "note", "detail": "one", "ts": stamp(0)})
+        rc, out, err = run(["verify", "--bot", "ops", "--rec"], self.root)  # --record
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual((self.last("ops")["type"], self.last("ops")["target"]), ("verify", "chain"))
+
+        rc, out, err = run(["log", "--bot", "ops", "--action", "shell", "--target", "ls", "--so", "auto"], self.root)
+        self.assertEqual(rc, 0, out + err)  # --source
+        self.assertEqual((self.last("ops")["type"], self.last("ops").get("source")), ("action", "auto"))
+
+        with mock.patch.object(sys, "stdin", mock.Mock(buffer=io.BytesIO(b"evidence from stdin\n"))):
+            rc, out, err = run(["archive", "--bot", "ops", "--std", "--name", "piped"], self.root)  # --stdin
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual((self.last("ops")["type"], self.last("ops")["target"]), ("archive", "piped"))
+
+        rc, out, err = run(["tune", "--days", "28", "--std"], self.root)  # --stdout
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("# Tuning proposals", out)
+        self.assertEqual(os.listdir(os.path.join(self.root, "tuning")), [])  # print only: nothing was written
+
+        rc, out, err = run(["tune", "--rej", "abcd1234", "--detail", "declined"], self.root)  # --reject
+        self.assertEqual(rc, 2, out + err)  # parsed; the refusal is about the missing proposals
+        self.assertNotIn("ambiguous option", err)
+        self.assertNotIn("unrecognized arguments", err)
+        self.assertIn("no proposals yet", err)
+        res = self.ledger.verify("ops")
+        self.assertTrue(res["ok"], res["problems"])
+
+    @unittest.skipUnless(GIT, "git not installed")
+    def test_abbreviations_sync_forms_still_accepted(self):
+        self.ledger.append("ops", {"type": "note", "detail": "something to back up", "ts": stamp(0)})
+        bare = os.path.join(self.base, "backup.git")
+        subprocess.run([GIT, "init", "--bare", "-q", bare], check=True, capture_output=True)
+
+        rc, out, err = run(["sync", "--no-push", "--rem", bare], self.root)  # --remote
+        self.assertEqual(rc, 0, out + err)
+        origin = subprocess.run([GIT, "-C", self.root, "remote", "get-url", "origin"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.assertEqual(origin, bare)
+
+        # --allow-p is --allow-public: a remote reported public is pushed to (a local bare repository, no network)
+        with mock.patch.object(gblog, "remote_visibility", return_value={"public": True, "reason": "test"}) as vis:
+            rc, out, err = run(["sync", "--allow-p"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(vis.called)
+        self.assertNotIn("refused", out + err)
+        self.assertNotIn("(not pushed)", out)
+        self.assertIn(" pushed", out)
+        pushed = subprocess.run([GIT, "--git-dir", bare, "rev-list", "--all", "--count"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.assertEqual(pushed, "2")
 
 
 # --------------------------------------------------------------------------- I-14
@@ -825,6 +887,23 @@ class AliasRegistryTest(CliBase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.ledger.aliases()["bots"]["two"]["aliases"], ["legacy"])
 
+        # the check ignores letter case, like name resolution does (round-2 R-10): `Legacy` is two's `legacy`
+        before = self.ledger.aliases()
+        self.assertEqual(self.ledger.resolve("Legacy"), ("two", True))
+        rc, out, err = run(["alias", "add", "--slug", "three", "--alias", "Legacy"], self.root)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("error: 'Legacy' is an alias of two; use --move", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.ledger.aliases(), before)  # nothing moved, `three` was not created
+
+        rc, out, err = run(["alias", "add", "--slug", "three", "--alias", "Legacy", "--move"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        bots = self.ledger.aliases()["bots"]
+        self.assertEqual(bots["three"]["aliases"], ["Legacy"])
+        self.assertEqual(bots["two"]["aliases"], [])  # the case variant was taken away from the other Bot
+        for name in ("legacy", "Legacy", "LEGACY"):
+            self.assertEqual(self.ledger.resolve(name), ("three", True), name)
+
     def test_strict_with_empty_registry_prints_note(self):
         rc, out, err = run(["alias", "strict", "on"], self.root)
         self.assertEqual(rc, 0, out + err)
@@ -861,11 +940,7 @@ class AliasRegistryTest(CliBase):
                 self.assertEqual(rc, 0, out + err)
         self.assertEqual(sorted(self.ledger.aliases()["bots"]), ["alert", "alias", "capture-files", "lock", "ops-alert", "tmp"])
 
-    # deviation: audit I-19 says `append` and `add_alias` both refuse a reserved name for a new chain
-    # (exit 2). Only `add_alias` does. `Ledger.append()` never applies the check, so
-    # `gblog note --bot aliases` exits 0, creates logs/aliases/ and writes the chain head into
-    # state/aliases.json (the alias registry file); `--bot capture-files-x` / `x.alert` / `x.lock` /
-    # `x.tmp` are accepted the same way.
+    # fixed: round-2 R-02 (`append` refuses a reserved name for a new chain, like `alias add` does)
     def test_reserved_bot_names_refused_on_append(self):
         for name in ("capture-files-ops", "ops.alert", "ops.lock", "ops.tmp", "aliases"):
             rc, out, err = run(["note", "--bot", name, "--detail", "must be refused"], self.root)
@@ -1042,10 +1117,11 @@ class ExitCodeTableTest(CliBase):
         self.assertEqual(len(self.chain("stuck")), 1)
         self.assertEqual(len(os.listdir(os.path.join(self.root, "spool", "stuck"))), 1)
 
+    @unittest.skipUnless(GIT, "git not installed")
+    def test_exit_code_3_sync_refusal(self):
         # 3 - policy refusal: sync will not push to a public GitHub repository.
         # remote_visibility is mocked and the push is refused before git contacts anything.
-        if GIT is None:
-            self.skipTest("git not installed: exit code 3 (sync refusal) not exercised; 0, 1, 2 and 4 passed")
+        self.ledger.append("ops", {"type": "note", "detail": "something to back up", "ts": stamp(0)})
         with mock.patch.object(gblog, "remote_visibility", return_value={"public": True, "reason": "test"}) as vis:
             rc, out, err = run(["sync", "--remote", "https://github.com/someone/public-repo.git"], self.root)
         self.assertEqual(rc, 3, out + err)

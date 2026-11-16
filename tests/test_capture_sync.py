@@ -24,30 +24,13 @@ sys.path.insert(0, os.path.dirname(HERE))
 import gblog  # noqa: E402
 
 GIT = shutil.which("git")
-GIT_ENV = {
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_ALLOW_PROTOCOL": "file",
-}
+sys.path.insert(0, HERE)
+from _support import GIT_ENV, run as _support_run  # noqa: E402  (shared helpers, round-3 W-20)
 
 
 def run(argv, root):
-    """Run the CLI in-process. A SystemExit is folded into the return code."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(["--root", root] + argv)
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-    return rc, out.getvalue(), err.getvalue()
+    """Run the CLI in-process. A SystemExit is folded into the return code; any other exception propagates."""
+    return _support_run(argv, root, catch=False)
 
 
 def _read(path):
@@ -245,6 +228,159 @@ class SyncTest(_Base):
         for dirpath, _dirs, files in os.walk(os.path.join(self.root, "logs")):
             for name in files:
                 self.assertNotIn(secret.encode("utf-8"), _read(os.path.join(dirpath, name)), name)
+
+
+# --------------------------------------------------------------------------- round-3 W-18
+from unittest import mock  # noqa: E402  (used by the tests below only)
+
+
+def _rewrite(path, data):
+    """Overwrite ``path`` with ``data`` and move its mtime forward, as a later edit of the file would."""
+    st = os.stat(path)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+
+
+@unittest.skipUnless(GIT, "git not installed")
+class RemoteChangeAndDriftTest(_Base):
+    def setUp(self):
+        super().setUp()
+        self.ledger.append("ops", {"type": "note", "detail": "something to back up", "ts": "2026-01-01T10:00:00Z"})
+
+    def _origin(self):
+        return self._git("-C", self.root, "remote", "get-url", "origin").strip()
+
+    def _remote_records(self):
+        return [r for r in self.ledger.records("system") if r.get("type") == "sync" and r.get("target") == "git remote"]
+
+    def test_replace_remote_changes_origin_and_records_it(self):
+        first, second = self._bare("first.git"), self._bare("second.git")
+        rc, out, err = run(["sync", "--no-push", "--remote", first], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self._origin(), first)
+
+        rc, out, err = run(["sync", "--no-push", "--remote", second, "--replace-remote"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self._origin(), second)
+        records = self._remote_records()
+        self.assertTrue(records)
+        last = records[-1]
+        expected = gblog.redact("origin %s -> %s" % (gblog._safe_url(first), gblog._safe_url(second)))
+        self.assertEqual(last["detail"], expected)
+        self.assertEqual((last["type"], last["target"], last["outcome"]), ("sync", "git remote", "ok"))
+
+        # repeating the current URL changes nothing and records nothing, with or without the flag
+        for extra in ([], ["--replace-remote"]):
+            rc, out, err = run(["sync", "--no-push", "--remote", second] + extra, self.root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertEqual(self._origin(), second)
+            self.assertEqual(len(self._remote_records()), len(records))
+        self.assertEqual(self.vis_calls, [])  # --no-push never asks about visibility
+        self.assertTrue(self.ledger.verify("system")["ok"])
+
+    def test_remote_change_without_flag_is_usage_error(self):
+        first, second = self._bare("first.git"), self._bare("second.git")
+        rc, out, err = run(["sync", "--no-push", "--remote", first], self.root)
+        self.assertEqual(rc, 0, out + err)
+        records = len(self._remote_records())
+        commits = self._commits(self.root)
+
+        rc, out, err = run(["sync", "--no-push", "--remote", second], self.root)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("error: origin is already", err)
+        self.assertIn("--replace-remote", err)
+        self.assertNotIn("Traceback", err)
+        # nothing changed: same origin, no record of a change, no commit, nothing in the other repository
+        self.assertEqual(self._origin(), first)
+        self.assertEqual(len(self._remote_records()), records)
+        self.assertEqual(self._commits(self.root), commits)
+        self.assertEqual(self._commits(second), 0)
+        self.assertEqual(self.vis_calls, [])
+
+    def test_sync_drift_detects_rewritten_file(self):
+        arch = gblog.archive_file(self.ledger, "ops", b"archived evidence\n", "e.txt", "artifact",
+                                  ts="2026-01-01T10:00:01Z")
+        rc, out, err = run(["sync", "--no-push"], self.root)
+        self.assertEqual(rc, 0, out + err)
+        day = "logs/ops/2026-01-01.jsonl"
+        _forced, checked = gblog._sync_evidence(self.ledger)
+        self.assertIn(day, checked)
+        self.assertIn(arch["path"], checked)
+        self.assertEqual(gblog._sync_drift(self.root, checked), [])  # the commit holds what is on disk
+
+        # a committed day file rewritten with other bytes of the same length is listed
+        full = os.path.join(self.root, *day.split("/"))
+        original = _read(full)
+        self.assertIn(b"something to back up", original)
+        _rewrite(full, original.replace(b"something to back up", b"SOMETHING TO BACK UP"))
+        self.assertEqual(os.path.getsize(full), len(original))
+        self.assertEqual(gblog._sync_drift(self.root, checked), [day])
+        _rewrite(full, original)
+        self.assertEqual(gblog._sync_drift(self.root, checked), [])
+
+        # a log that grew after it was staged is not drift: the committed blob is a prefix of the file
+        self.ledger.append("ops", {"type": "note", "detail": "written while sync was running",
+                                   "ts": "2026-01-01T10:00:05Z"})
+        self.assertGreater(os.path.getsize(full), checked[day][0])
+        self.assertEqual(gblog._sync_drift(self.root, checked), [])
+
+        # an archived file must match exactly
+        _rewrite(os.path.join(self.root, *arch["path"].split("/")), b"not the archived bytes")
+        self.assertEqual(gblog._sync_drift(self.root, checked), [arch["path"]])
+
+
+class SshAliasTest(unittest.TestCase):
+    """``_ssh_alias_target``: an ssh-config alias of GitHub is checked as the GitHub repository it points at."""
+
+    def _lookup(self, url, stdout="", returncode=0, error=None):
+        calls = []
+
+        def fake_ssh(argv, *args, **kwargs):
+            calls.append(list(argv))
+            if error is not None:
+                raise error
+            return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+        with mock.patch.object(gblog.subprocess, "run", side_effect=fake_ssh):
+            return gblog._ssh_alias_target(url), calls
+
+    def test_ssh_alias_of_github_is_checked_as_github(self):
+        for hostname in ("github.com", "ssh.github.com", "GitHub.com."):
+            config = "user git\nhostname %s\nport 22\n" % hostname
+            for url in ("git@gh-backup:o/r.git", "gh-backup:o/r.git", "ssh://git@gh-backup:2222/o/r.git"):
+                with self.subTest(hostname=hostname, url=url):
+                    self.assertFalse(gblog.github_remote(url)[0])  # as written, the URL does not look like GitHub
+                    target, calls = self._lookup(url, stdout=config)
+                    self.assertEqual(target, "https://github.com/o/r.git")
+                    self.assertEqual(calls, [["ssh", "-G", "gh-backup"]])  # a local lookup of exactly that alias
+                    self.assertEqual(gblog.github_remote(target), (True, "o", "r"))
+
+    def test_ssh_alias_lookup_failures_leave_the_url_unchanged(self):
+        url = "git@gh-backup:o/r.git"
+        cases = (
+            ("ssh -G failed", {"stdout": "", "returncode": 255}),
+            ("ssh is not installed", {"error": OSError("ssh not found")}),
+            ("ssh timed out", {"error": subprocess.TimeoutExpired(["ssh", "-G", "gh-backup"], 5)}),
+            ("another host", {"stdout": "user git\nhostname git.example.com\nport 22\n"}),
+            ("look-alike host", {"stdout": "hostname github.com.evil.example\n"}),
+            ("no hostname line", {"stdout": "user git\nport 22\n"}),
+        )
+        for label, answer in cases:
+            with self.subTest(case=label):
+                target, calls = self._lookup(url, **answer)
+                self.assertEqual(target, url)
+                self.assertEqual(calls, [["ssh", "-G", "gh-backup"]])
+                self.assertFalse(gblog.github_remote(target)[0])
+
+    def test_ssh_is_not_asked_about_literal_or_non_ssh_urls(self):
+        for url in ("git@github.com:o/r.git", "ssh://git@ssh.github.com:443/o/r.git", "https://gh-backup/o/r.git",
+                    "/srv/git/r.git", "file:///srv/git/r.git"):
+            with self.subTest(url=url):
+                target, calls = self._lookup(url, stdout="hostname github.com\n")
+                self.assertEqual(target, url)
+                self.assertEqual(calls, [])
 
 
 class RemoteRegexTest(unittest.TestCase):

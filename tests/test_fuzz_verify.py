@@ -78,25 +78,8 @@ class _FrozenDatetime(_dt.datetime):
 _FROZEN_DT = types.SimpleNamespace(datetime=_FrozenDatetime, timezone=_dt.timezone, timedelta=_dt.timedelta)
 
 
-def _run(argv, root):
-    """Run the CLI in-process. An uncaught exception is rendered like the real CLI would (traceback, exit 1)."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(["--root", root] + list(argv))
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-        except Exception:  # only on a regression
-            traceback.print_exc(file=err)
-            rc = 1
-    return rc, out.getvalue(), err.getvalue()
+sys.path.insert(0, HERE)
+from _support import run as _run  # noqa: E402  (shared helper, round-3 W-20)
 
 
 # --------------------------------------------------------------------------- byte helpers and the oracle

@@ -1,0 +1,2 @@
+# Tests that carry @unittest.expectedFailure, one "Class.test_name" per line.
+# Nothing is pending. tests/test_meta.py fails when this list and the markers in tests/test*.py differ.

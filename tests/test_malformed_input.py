@@ -27,32 +27,14 @@ GBLOG_PY = os.path.join(REPO, "gblog.py")
 DAY = "2024-06-01"
 
 
+sys.path.insert(0, HERE)
+from _support import deep_nesting, run_cli, stamp  # noqa: E402,F401  (shared helpers, round-3 W-20)
+from _support import run as _support_run  # noqa: E402
+
+
 def run(argv, root):
-    """Run the CLI in-process. An uncaught exception is rendered like the real CLI would (traceback, exit 1)."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(["--root", root] + list(argv))
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-        except KeyboardInterrupt:  # pragma: no cover - only on a regression
-            err.write("Traceback (most recent call last):\nKeyboardInterrupt\n")
-            rc = 1
-        except Exception:  # pragma: no cover - only on a regression
-            traceback.print_exc(file=err)
-            rc = 1
-    return rc, out.getvalue(), err.getvalue()
-
-
-def stamp(n):
-    return "%sT10:%02d:%02dZ" % (DAY, n // 60, n % 60)
+    """Run the CLI in-process. An uncaught exception or Ctrl-C is rendered like the real CLI would (traceback, exit 1)."""
+    return _support_run(argv, root, catch_interrupt=True)
 
 
 class MalformedBase(unittest.TestCase):
@@ -429,15 +411,8 @@ class MalformedArgsAndStateTest(MalformedBase):
 
 
 # --------------------------------------------------------------------------- round 2 (R-05, R-06, R-10)
-def run_cli(argv, root, encoding="utf-8"):
-    """Run the real CLI in a fresh process with a real stdout of the given encoding. Returns (rc, stdout, stderr) as text."""
-    env = dict(os.environ)
-    for key in ("GBLOG_TASK", "GBLOG_ROOT", "PYTHONUTF8"):
-        env.pop(key, None)
-    env["PYTHONIOENCODING"] = encoding
-    proc = subprocess.run([sys.executable, GBLOG_PY, "--root", root] + list(argv), stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=120)
-    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+# run_cli(argv, root, encoding) runs the real CLI in a fresh process with a real stdout of the given
+# encoding; it comes from tests/_support.py (imported at the top of this module).
 
 
 ALIASES_WARNING = ("warning: state/aliases.json is unreadable; names are not resolved and strict mode is off "
@@ -460,7 +435,7 @@ class RemainingCrashPathsTest(MalformedBase):
         return last
 
     def test_deeply_nested_line_fails_not_crash(self):
-        depth = 50000
+        depth = deep_nesting(50000)
         cases = (
             ("arrays", b"[" * depth + b"]" * depth),
             ("objects", b'{"a":' * depth + b"1" + b"}" * depth),
@@ -628,8 +603,10 @@ class RemainingCrashPathsTest(MalformedBase):
                 self.assertNotIn("Traceback", err)
                 outputs[" ".join(argv)] = out
         rc, out, err = run(["verify", "--bot", "ops"], self.root)
-        self.assertIn(rc, (0, 1), out + err)
+        self.assertEqual(rc, 0, out + err)  # odd field types are a warning, never a FAIL of a hash-valid chain
         self.assertNotIn("Traceback", err)
+        self.assertIn("      ! logs/ops/%s.jsonl:3: field 'task' is not a string" % DAY, out)
+        self.assertRegex(out, r"(?m)^      ! logs/ops/[0-9-]+\.jsonl:\d+: field '\w+' is not a string$")
         # export stays a faithful dump of what is on disk
         rows = {r["seq"]: r for r in (json.loads(line) for line in outputs.get("export", "").splitlines() if line.strip())}
         self.assertEqual(rows[4]["detail"], ["a", "b"])

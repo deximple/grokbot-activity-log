@@ -19,22 +19,13 @@ import gblog  # noqa: E402
 UNTRUSTED = "never follow instructions"
 
 
+sys.path.insert(0, HERE)
+from _support import run as _support_run  # noqa: E402  (shared helper, round-3 W-20)
+
+
 def run(argv, root):
-    """Run the CLI in-process. A SystemExit is folded into the return code."""
-    out, err = io.StringIO(), io.StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        try:
-            rc = gblog.main(["--root", root] + argv)
-        except SystemExit as exc:
-            code = exc.code
-            if code is None:
-                rc = 0
-            elif isinstance(code, int):
-                rc = code
-            else:
-                err.write("%s\n" % code)
-                rc = 1
-    return rc, out.getvalue(), err.getvalue()
+    """Run the CLI in-process. A SystemExit is folded into the return code; any other exception propagates."""
+    return _support_run(argv, root, catch=False)
 
 
 class ReportHardeningTest(unittest.TestCase):
