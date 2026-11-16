@@ -393,9 +393,7 @@ class RemoteGuardTest(Base):
         newest = os.path.basename(self.ledger.log_files("ops")[-1])
         self.assertIn("logs/ops/" + newest, listing.splitlines())
 
-    # pending: B-L9 (unredacted commit message, credentials in .git/config without a warning, no .gitignore for old ledgers)
     @unittest.skipUnless(GIT, "git not installed")
-    @unittest.expectedFailure
     def test_secrets_do_not_reach_git_unnoticed(self):
         self.seed("ops", 1)
         os.remove(self.path(".gitignore"))  # a ledger created before 0.6 has none
@@ -912,8 +910,6 @@ class CaptureTest(Base):
                   if cmd not in logged(cmd)]
         self.assertEqual(missed, [])
 
-    # pending: A-L-2 (a non-text title cell crashes capture after earlier rows were appended; they are re-imported forever)
-    @unittest.expectedFailure
     def test_browser_capture_survives_a_non_text_title(self):
         hist = chrome_history(os.path.join(self.base, "chrome"), [
             ("https://a.example/first", "First", 120),
@@ -1027,8 +1023,6 @@ class ConcurrencyTest(Base):
         acks = [r for _p, _n, r in ledger.iter_records("kim-biseo") if r.get("type") == "break_ack"]
         self.assertEqual(len(acks), 1)
 
-    # pending: A-L-3 (a failed write leaves a torn line behind, e.g. in anchors/<bot>.history.jsonl)
-    @unittest.expectedFailure
     def test_failed_append_leaves_no_torn_line(self):
         path = self.path("anchors", "ops.history.jsonl")
         self.ledger._append_line(path, '{"ok": true}\n')
@@ -1047,8 +1041,6 @@ class ConcurrencyTest(Base):
         with open(path, "rb") as fh:
             self.assertEqual(fh.read(), before)
 
-    # pending: B-L11 (spool replay does not hold the bot lock across its loop: two replays append an event twice)
-    @unittest.expectedFailure
     def test_concurrent_spool_replay_appends_each_event_once(self):
         self.seed("ops", 2)
         good = dict(self.ledger.read_state("ops"))
@@ -1108,8 +1100,6 @@ class MiscHardeningTest(Base):
         self.assertEqual(rc, 2, out + err)
         self.assertFalse(os.path.exists(self.path("state", name + ".json")))
 
-    # pending: A-L-5 (a line with a duplicate key is silent unless --strict is given)
-    @unittest.expectedFailure
     def test_duplicate_keys_warn_in_default_mode(self):
         self.seed("ops", 2)
         path = self.ledger.log_files("ops")[0]
@@ -1157,8 +1147,6 @@ class MiscHardeningTest(Base):
         self.assertTrue([w for w in res["warnings"] if "state" in w],
                         "the truncation evidence is gone after one append: %r" % (res["warnings"],))
 
-    # pending: B-L4 (archive records are deduplicated by path only; path-less records and planted blobs go unnoticed)
-    @unittest.expectedFailure
     def test_archive_records_are_checked_one_by_one(self):
         ledger, bad = self.ledger, []
         with redirect_stderr(io.StringIO()):

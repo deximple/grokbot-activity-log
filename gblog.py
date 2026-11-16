@@ -262,6 +262,30 @@ def _parse_line(raw: bytes) -> Dict:
     return rec if isinstance(rec, dict) else {"_corrupt": True}
 
 
+def _parse_line_dups(raw: bytes) -> Tuple[Dict, bool]:
+    """``_parse_line`` in one pass, plus whether any JSON object of the line repeats a key.
+
+    A repeated key parses to the same record as the line gblog would have written (the last value
+    wins), so the hash still matches; verify reports such a line because the shadowed value is
+    readable in the file while it is not part of the record."""
+    dup: List[bool] = []
+
+    def pairs(items):
+        obj = dict(items)
+        if len(obj) != len(items):
+            dup.append(True)
+        return obj
+
+    try:
+        text = raw.strip().decode("utf-8") if isinstance(raw, bytes) else str(raw).strip()
+        rec = json.loads(text, object_pairs_hook=pairs)
+    except (ValueError, RecursionError):
+        return {"_corrupt": True}, False
+    if not isinstance(rec, dict):
+        return {"_corrupt": True}, False
+    return rec, bool(dup)
+
+
 def _read_json(path: str) -> Optional[Dict]:
     """A JSON object from ``path``; None when missing, unparsable or not an object."""
     try:
@@ -1340,21 +1364,31 @@ class Ledger:
                 if os.read(fd, 1) != b"\n":
                     data = b"\n" + data  # tail without a final newline: never glue two records onto one line
             view = data
-            written = 0
             try:
                 while view:
                     wrote = os.write(fd, view)
                     if wrote <= 0:
                         raise OSError("short write appending %s" % path)
-                    written += wrote
                     view = view[wrote:]
             except BaseException:
                 # A failed write (full disk) must not leave a torn line behind. Only the bytes this call
                 # wrote are removed, and only while they are still the end of the file (no other writer
                 # appended in between); earlier bytes are never touched.
+                # A write can fail after part of the data reached the file without reporting how much.
+                # So the file itself is asked: whatever now follows the old end is removed only when it
+                # is a prefix of the data this call was writing.
                 try:
-                    if written and os.fstat(fd).st_size == size + written:
-                        os.ftruncate(fd, size)
+                    end = os.fstat(fd).st_size
+                    if size < end <= size + len(data):
+                        os.lseek(fd, size, os.SEEK_SET)
+                        torn = b""
+                        while len(torn) < end - size:
+                            chunk = os.read(fd, end - size - len(torn))
+                            if not chunk:
+                                break
+                            torn += chunk
+                        if len(torn) == end - size and data.startswith(torn):
+                            os.ftruncate(fd, size)
                 except OSError:
                     pass
                 raise
@@ -1542,7 +1576,7 @@ class Ledger:
             items.append((rel, lineno, rec))
         return items
 
-    def _chain_snapshot(self, bot: str) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
+    def _chain_snapshot(self, bot: str, dup_lines: Optional[set] = None) -> Tuple[List[Tuple[str, int, Dict, Optional[str]]], List[str]]:
         """Every non-blank log line of one chain as ``(rel, lineno, record, text)``, plus the log file names.
 
         ``text`` is the stripped line as written (None when it is not UTF-8). verify() calls this once,
@@ -1561,7 +1595,10 @@ class Ledger:
                         text: Optional[str] = raw.decode("utf-8")
                     except UnicodeDecodeError:
                         text = None
-                    snap_lines.append((rel, lineno, _parse_line(raw), text))
+                    rec, dup = _parse_line_dups(raw)
+                    if dup and dup_lines is not None:
+                        dup_lines.add((rel, lineno))  # a JSON object in this line repeats a key
+                    snap_lines.append((rel, lineno, rec, text))
         return snap_lines, log_names
 
     def _file_findings(self, bot: str) -> Tuple[List[str], List[str]]:
@@ -1620,12 +1657,12 @@ class Ledger:
         # Log lines, state and both anchor files are read in this one snapshot, so an anchor written for a
         # record appended later can never be compared with an older view of the chain.
         # It is released before the walk, the archive re-hash and the return (seal_break appends right after verify).
+        dup_lines: set = set()  # (file, line) of log lines in which a JSON object repeats a key
         with self.lock(bot, shared=True):
-            snap_lines, log_names = self._chain_snapshot(bot)
+            snap_lines, log_names = self._chain_snapshot(bot, dup_lines)
             raw_state_snapshot = self._load_state(bot)
             anchor_snapshot = self._anchor_snapshot(bot)
             odd_files, link_files = self._file_findings(bot)
-            irregular = self.irregular_logs(bot)
         items = [(rel, lineno, rec) for rel, lineno, rec, _text in snap_lines]
         problems: List[str] = []
         warnings: List[str] = []
@@ -1811,9 +1848,18 @@ class Ledger:
             archives = len(arch_recs)
             problems.extend(verify_archives(self, arch_recs, check=not skip_archives))
         # Layout findings come from the same snapshot as the walk (no second read, no second parser).
-        layout_warnings, noncanonical = _layout_findings(bot, snap_lines, log_names, strict)
-        # A *.jsonl entry that is not a regular file was not read at all: that is a FAIL in every mode.
-        problems.extend("%s: not a regular file" % rel for rel in irregular)
+        layout_warnings, noncanonical = _layout_findings(bot, snap_lines, log_names, strict, dup_lines)
+        problems.extend(odd_files)  # a FIFO, directory or device named *.jsonl: never opened, never OK
+        # An `archive` record that names neither a path nor a sha256 (a bare `gblog log --type archive`)
+        # addresses no file: it is a claim, and verify says so instead of counting it as checked evidence.
+        bare = [(rel, lineno) for rel, lineno, rec in items
+                if rec.get("type") == "archive" and not rec.get("path") and not rec.get("sha256")]
+        bare_archives = ["%s:%d: archive record without path and sha256: no archived file backs it" % item
+                         for item in bare[:_MAX_LAYOUT_FINDINGS]]
+        if len(bare) > _MAX_LAYOUT_FINDINGS:
+            bare_archives.append("%d more archive record(s) without path and sha256" % (len(bare) - _MAX_LAYOUT_FINDINGS))
+        # Symbolic links among the chain's files are layout findings as well (problems with --strict).
+        layout_warnings = layout_warnings + link_files + bare_archives
         if strict:
             problems.extend(layout_warnings + noncanonical)
         else:
@@ -2192,13 +2238,26 @@ class Ledger:
                     rec["original_ts"] = rec.pop("ts")
                 rec["spooled_at"] = payload.get("ts")
                 rec["spool_id"] = spool_id
+
+                def _still_pending(path: str = path, spool_id: str = spool_id) -> None:
+                    # Runs inside append, under the bot lock: a second `spool replay` running at the same
+                    # time finds the event already appended (or its file already moved) and skips it.
+                    _tp, last = self._tail_record(bot)
+                    if not os.path.exists(path) or (last and last.get("spool_id") == spool_id):
+                        raise _GuardSkip()
+
                 try:
-                    replayed.append(self.append(bot, rec))
+                    replayed.append(self.append(bot, rec, _guard=_still_pending))
+                except _GuardSkip:
+                    pass
                 except RecordError:
                     skipped.append(path)  # a planted or damaged event: left in place, like an unreadable file
                     continue
             _makedirs(done_dir)
-            os.replace(path, os.path.join(done_dir, os.path.basename(path)))
+            try:
+                os.replace(path, os.path.join(done_dir, os.path.basename(path)))
+            except FileNotFoundError:
+                pass  # the other replay moved it
         remaining = self.spool_files(bot)
         resolved = None
         alert_path = os.path.join(self.state_dir, bot + ".alert.json")
@@ -2518,6 +2577,20 @@ def _is_text(data: bytes) -> bool:
         return False
 
 
+def _archive_intact(full: str, digest: str) -> bool:
+    """True when ``full`` is a readable gzip file whose content has the sha256 ``digest``."""
+    import gzip
+    import zlib
+    h = hashlib.sha256()
+    try:
+        with gzip.open(full, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except (OSError, EOFError, zlib.error):
+        return False
+    return h.hexdigest() == digest
+
+
 def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str = "other", task_id: Optional[str] = None,
                  detail: Optional[str] = None, do_redact: bool = True, ts: Optional[str] = None) -> Dict:
     """Store ``data`` as archive/<bot>/<date>/<sha256>.gz and chain its hash.
@@ -2554,7 +2627,10 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     rel = os.path.join("archive", bot, day, digest + ".gz")
     full = os.path.join(ledger.root, rel)
     _makedirs(os.path.dirname(full))
-    existed = os.path.exists(full)
+    created = not os.path.lexists(full)  # nothing at the content address yet: this call creates the file
+    # "Already stored" only when the file at the content address really holds this content. A planted or
+    # damaged file (or a symbolic link) is rewritten instead of being chained as if it were the evidence.
+    existed = (not created) and os.path.isfile(full) and not os.path.islink(full) and _archive_intact(full, digest)
     if not existed:
         tmp = _tmp_name(full)
         with _open_private(tmp, "wb") as raw:
@@ -2563,7 +2639,14 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
                 gz.write(data)
             raw.flush()
             os.fsync(raw.fileno())
-        os.replace(tmp, full)
+        try:
+            os.replace(tmp, full)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
     # the file and its directory entry must be durable before the hash is chained
     _fsync_dir(os.path.dirname(full))
     rel_posix = rel.replace(os.sep, "/")
@@ -2577,7 +2660,7 @@ def archive_file(ledger: "Ledger", bot: str, data: bytes, name: str, kind: str =
     except TailMismatchError:
         raise  # the spooled event references the stored file; a later `spool replay` chains it
     except BaseException:
-        if not existed:
+        if created:
             # Remove the file this call created, unless the log line became durable before the failure
             # (for example ENOSPC while replacing state): then the chain references it and it must stay.
             try:
@@ -2605,9 +2688,15 @@ def verify_archives(ledger: "Ledger", records: Iterable[Dict], check: Optional[b
         return problems  # verify --skip-archives: records are counted, files are not re-hashed
     seen = set()
     for r in records:
-        if r.get("type") != "archive" or not r.get("path"):
+        if r.get("type") != "archive":
             continue
-        rel = r["path"]
+        rel, sha = r.get("path"), r.get("sha256")
+        if not rel and not sha:
+            continue  # a bare claim that addresses no file (`gblog log --type archive`); Ledger.verify warns about it
+        if not rel:
+            # a sha256 without a path: the record claims evidence that no archived file can back
+            problems.append("archive record seq %s: no path (its sha256 addresses no archived file)" % (r.get("seq"),))
+            continue
         if not isinstance(rel, str):
             problems.append("%r: invalid archive path" % (rel,))
             continue
@@ -2618,6 +2707,13 @@ def verify_archives(ledger: "Ledger", records: Iterable[Dict], check: Optional[b
         norm = rel.replace("\\", "/")
         if os.path.isabs(rel) or norm.startswith("/") or ".." in norm.split("/") or not norm.startswith("archive/"):
             problems.append("%s: invalid archive path" % rel)
+            continue
+        if not _is_full_hash(sha):
+            problems.append("%s: archive record has no 64-hex sha256" % rel)
+            continue
+        if norm.rsplit("/", 1)[-1] != sha + ".gz":
+            # content-addressed storage: a record may only point at the file named after its own hash
+            problems.append("%s: archive record is not addressed by its own sha256 (%s)" % (rel, sha[:12]))
             continue
         full = os.path.join(ledger.root, rel)
         if not os.path.exists(full):
@@ -2641,7 +2737,8 @@ _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 _MAX_LAYOUT_FINDINGS = 20
 
 
-def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[str], strict: bool) -> Tuple[List[str], List[str]]:
+def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[str], strict: bool,
+                     dup_lines: Iterable[Tuple[str, int]] = ()) -> Tuple[List[str], List[str]]:
     """Things the hash walk does not look at, computed from verify()'s own snapshot.
 
     Returns (warnings, strict_only_problems).
@@ -2656,9 +2753,18 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
             warnings.append("%s: unexpected log file name (not YYYY-MM-DD.jsonl)" % rel)
     mismatched = reformatted = 0
     mistyped = nonfinite = 0
+    duplicated = 0
+    if not isinstance(dup_lines, (set, frozenset)):
+        dup_lines = set(dup_lines)
     for rel, lineno, rec, text in snap_lines:
         if "_corrupt" in rec:
             continue  # unreadable lines are reported by the chain walk
+        if (rel, lineno) in dup_lines:
+            # The line parses to a hash-valid record, but it also holds a value that is not part of it.
+            duplicated += 1
+            if duplicated <= _MAX_LAYOUT_FINDINGS:
+                warnings.append("%s:%d: duplicate keys in line (only the last value of a repeated key counts)"
+                                % (rel, lineno))
         # A hash-valid record can still carry a value that readers have to coerce (a list where text is
         # expected) or that strict JSON cannot express (NaN, Infinity). Warnings; problems with --strict.
         odd = False
@@ -2688,6 +2794,8 @@ def _layout_findings(bot: str, snap_lines: Iterable[Tuple], log_names: Iterable[
                 reformatted += 1
                 if reformatted <= _MAX_LAYOUT_FINDINGS:
                     noncanonical.append("%s:%d: non-canonical line (duplicate keys or reformatted)" % (rel, lineno))
+    if duplicated > _MAX_LAYOUT_FINDINGS:
+        warnings.append("%d more line(s) with duplicate keys" % (duplicated - _MAX_LAYOUT_FINDINGS))
     if mistyped > _MAX_LAYOUT_FINDINGS:
         warnings.append("%d more text field(s) that are not strings" % (mistyped - _MAX_LAYOUT_FINDINGS))
     if nonfinite > _MAX_LAYOUT_FINDINGS:
@@ -2793,6 +2901,16 @@ def _ssh_alias_target(url: str) -> str:
 def _safe_url(url: str) -> str:
     """A remote URL fit for messages and records: http(s) userinfo dropped, then the usual secret scrub."""
     return redact(re.sub(r"(?i)\b(https?://)[^/@\s]+@", r"\1[REDACTED]@", url or "")) or ""
+
+
+def _has_url_password(url: Optional[str]) -> bool:
+    """True for an http(s) URL that carries ``user:password@``. git writes such a URL to .git/config as it stands."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit((url or "").strip())
+        return (parts.scheme or "").lower() in ("http", "https") and bool(parts.username) and bool(parts.password)
+    except ValueError:
+        return False
 
 
 def remote_visibility(remote: str, timeout: float = 6.0) -> Dict:
@@ -3012,6 +3130,10 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
             _git(root, "remote", "set-url", "origin", remote)
         else:
             _git(root, "remote", "add", "origin", remote)
+        if _has_url_password(remote):
+            # The secret itself is never echoed here.
+            sys.stderr.write("warning: the --remote URL contains a user name and password; git stores it in "
+                             ".git/config as written. Use a credential helper instead.\n")
         if remote not in current:
             _bookkeep({"type": "sync", "action": "other", "target": "git remote", "outcome": "ok",
                        "detail": "origin %s -> %s" % (_safe_url(current[0]) if current else "-", _safe_url(remote))})
@@ -3022,9 +3144,9 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
     # A pathspec that matches nothing makes `git add` fail, so README.md is listed only when present or tracked.
     if os.path.exists(os.path.join(root, "README.md")) or _git(root, "ls-files", "--", "README.md", check=False).stdout.strip():
         add_paths.append("README.md")
+    forced, checked = _sync_evidence(ledger)  # also writes <root>/.gitignore when it is missing
     if os.path.exists(os.path.join(root, ".gitignore")):
         add_paths.append(".gitignore")
-    forced, checked = _sync_evidence(ledger)
     _git(root, "add", "-A", *add_paths)
     # Evidence files are also staged by name with -f, so an ignore rule cannot keep them out of the backup.
     # Failures here are not fatal: what did not reach the commit is found by _sync_drift below.
@@ -3032,7 +3154,8 @@ def sync(ledger: Ledger, bot: str, remote: Optional[str], branch: Optional[str],
         _git(root, "add", "-f", "--", *forced[start:start + 200], check=False)
     # Lock files and file-capture snapshots are local scratch: untrack any that an older version committed.
     _git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", "state/*.lock", "state/capture-files-*.json", check=False)
-    commit_msg = message or "gblog sync %s" % now_iso()
+    # The commit message goes into git history (and to the remote): it is scrubbed like a record field.
+    commit_msg = redact(message) or ("gblog sync %s" % now_iso())
     env_ok = True
     try:
         _git(root, "-c", "user.name=gblog", "-c", "user.email=gblog@localhost", "commit", "-q", "--no-verify", "-m", commit_msg)
@@ -3263,20 +3386,30 @@ def capture_browser(ledger: "Ledger", bot: str, history_paths: Optional[List[str
         for visit_time, url, title in rows:
             try:
                 visit_time = int(visit_time)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue  # NULL or non-numeric visit time
+            target = _url_target(url) if isinstance(url, str) else None  # a BLOB or numeric url cell is not a visit
+            if target and target != last_target:
+                try:
+                    observed = _dt.datetime.fromtimestamp(to_epoch(visit_time), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (OverflowError, ValueError, OSError):
+                    continue  # a visit time no calendar can hold: skipped, and the marker does not move past it
+                # redact before cutting, so a token cut below a pattern's minimum length cannot slip through
+                page_title = (redact(title) or "")[:120] if isinstance(title, str) else ""
+                try:
+                    ledger.append(bot, {"type": "action", "action": "browser", "target": target, "outcome": "ok",
+                                        "detail": page_title, "source": "auto", "capture": "browser", "observed": observed,
+                                        "profile": os.path.basename(os.path.dirname(path))})
+                except BaseException:
+                    # The rows before this one are in the ledger: keep their marker, so the next run does
+                    # not import them a second time.
+                    if changed or newest != markers.get(path):
+                        markers[path] = newest
+                        save_markers(strict=False)
+                    raise
+                last_target = target
+                added += 1
             newest = max(newest, visit_time)
-            target = _url_target(url or "")
-            if not target or target == last_target:
-                continue
-            last_target = target
-            if isinstance(title, str):
-                title = redact(title)  # redact before the 120-character cut, so no token is cut below its pattern's minimum
-            observed = _dt.datetime.fromtimestamp(to_epoch(visit_time), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            ledger.append(bot, {"type": "action", "action": "browser", "target": target, "outcome": "ok",
-                                "detail": (title or "")[:120], "source": "auto", "capture": "browser", "observed": observed,
-                                "profile": os.path.basename(os.path.dirname(path))})
-            added += 1
         if newest != markers.get(path):
             markers[path] = newest
             changed = True
