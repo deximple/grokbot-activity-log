@@ -341,6 +341,9 @@ Open from these reviews: K9-06 … K9-08, K10-07 c (needs a maintainer decision)
 findings that are not listed as fixed under "Specialist reviews" above. The round-4 audit checked
 each line against `gblog.py`.
 
+- **Security review S3, High, not fixed in 0.6.1: anchor.** FAIL anchor runs launder the witnesses.
+- **Security review S3, High, not fixed in 0.6.1: sync.** The pushed branch is not pinned.
+- **Security review S3, High, not fixed in 0.6.1: sync.** "Private" is judged from the URL text, not the connection.
 - **verify / anchor.** A FIFO or device at
   `state/<bot>.json` is a `!` warning while a directory there, and any non-regular
   `anchors/<bot>.json`, is FAIL; a deleted `anchors/<bot>.json` is silent (Z-10; `docs/DESIGN.md`,
